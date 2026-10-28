@@ -344,3 +344,103 @@ fn a_checksum_fix_covers_the_overlay_and_the_certificate() {
     assert!(normalized.overlay().starts_with(b"OVERLAY"));
     assert_eq!(normalized.security().unwrap(), Some(security));
 }
+
+fn stored_checksum(raw: &[u8]) -> u32 {
+    let field = optional_offset(raw) + 64;
+    u32::from_le_bytes(raw[field..field + 4].try_into().unwrap())
+}
+
+#[test]
+fn a_valid_checksum_stays_valid() {
+    let mut raw = test_image().try_build().unwrap();
+    let optional = optional_offset(&raw);
+    // A new layout sets the section alignment to 0x1000.
+    put32(&mut raw, optional + 32, 0);
+    // The entry point refers to the checksum field. A checksum fix then changes bytes in use.
+    put32(
+        &mut raw,
+        optional + 16,
+        u32::try_from(optional + 64).unwrap(),
+    );
+    let checksum = compute_pe_checksum(&raw).unwrap();
+    put32(&mut raw, optional + 64, checksum);
+    assert_eq!(PeFile::parse(&raw).unwrap().try_build().unwrap(), raw);
+
+    let mut file = PeFile::parse(&raw).unwrap();
+    let result = file.normalize().unwrap();
+    assert_eq!(result.changes, []);
+    assert_eq!(result.kept, [NormalizeKept::Checksum]);
+    let output = file.try_build().unwrap();
+    assert_eq!(output, raw);
+    assert_eq!(Some(stored_checksum(&output)), compute_pe_checksum(&output));
+}
+
+#[test]
+fn a_checksum_fix_follows_a_new_layout() {
+    let mut raw = test_image().try_build().unwrap();
+    let text = PeHeaders::from_slice(&raw).unwrap().section_headers[0].pointer_to_raw_data;
+    let rdata = section_header_offset(&raw, 1);
+    put32(&mut raw, rdata + 20, text);
+    let field = optional_offset(&raw) + 64;
+    put32(&mut raw, field, 1);
+    assert_eq!(PeFile::parse(&raw).unwrap().try_build().unwrap(), raw);
+
+    let mut file = PeFile::parse(&raw).unwrap();
+    let result = file.normalize().unwrap();
+    let output = file.try_build().unwrap();
+    let stored = stored_checksum(&output);
+    assert_eq!(Some(stored), compute_pe_checksum(&output));
+    assert_eq!(
+        result.changes,
+        [
+            NormalizeChange::Checksum {
+                old: 1,
+                new: stored
+            },
+            NormalizeChange::Section { index: 1 },
+        ]
+    );
+    assert_eq!(result.kept, []);
+}
+
+/// Move the NT headers 1 byte later, so that the checksum field has an odd file offset.
+fn move_nt_headers_one_byte_later(raw: &mut [u8]) {
+    let old = usize::try_from(PeHeaders::from_slice(raw).unwrap().pe_offset).unwrap();
+    let count = PeHeaders::from_slice(raw).unwrap().section_headers.len();
+    let end = section_header_offset(raw, count);
+    raw.copy_within(old..end, old + 1);
+    raw[old] = 0;
+    put32(raw, 0x3c, u32::try_from(old + 1).unwrap());
+}
+
+#[test]
+fn an_odd_checksum_offset_gets_a_stable_checksum() {
+    let mut raw = test_image().try_build().unwrap();
+    move_nt_headers_one_byte_later(&mut raw);
+    let field = optional_offset(&raw) + 64;
+    assert_eq!(field % 2, 1);
+    put32(&mut raw, field, 1);
+    assert_eq!(PeFile::parse(&raw).unwrap().try_build().unwrap(), raw);
+
+    let mut file = PeFile::parse(&raw).unwrap();
+    let result = file.normalize().unwrap();
+    let output = file.try_build().unwrap();
+    // The NT headers stay at the odd offset.
+    assert_eq!(optional_offset(&output) + 64, field);
+    let stored = stored_checksum(&output);
+    assert_eq!(Some(stored), compute_pe_checksum(&output));
+    assert_eq!(
+        result.changes,
+        [NormalizeChange::Checksum {
+            old: 1,
+            new: stored
+        }]
+    );
+    assert_eq!(result.kept, []);
+
+    let mut file = PeFile::parse(&output).unwrap();
+    let result = file.normalize().unwrap();
+    assert_eq!(result.changes, []);
+    assert_eq!(result.kept, []);
+    assert_eq!(file.try_build().unwrap(), output);
+}

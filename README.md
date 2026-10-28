@@ -151,30 +151,43 @@ sections.
 - It gives each section its own aligned raw range, and calculates `SizeOfHeaders`,
   `SizeOfImage` and the size fields again. It corrects a wrong nonzero checksum.
 
-The loader view stays the same. Each section keeps its RVA, its virtual size, its
-characteristics and its bytes. The header bytes that the entry point or a data directory refers
-to do not change. The loader maps `SizeOfHeaders` header bytes, or the whole file when the
-alignment is low.
+The loader view stays the same. The loader view is:
 
-The method builds each fixed copy with `PeFile::try_build`, parses the output again, and
-compares it with the built original. It keeps the first copy that has the same loader view. If
-no copy passes, the fields and the layout of the file stay. It then corrects a wrong checksum
-with the same check. The method does not make a rejected fix. Instead, it names the reason in
-`Normalization::kept`:
+- the section RVAs, virtual sizes and characteristics;
+- the section bytes that the loader maps, from the loader raw offset up to the
+  `FileAlignment`-aligned raw end, limited to the aligned virtual size;
+- the aligned header size, which is `SizeOfHeaders` aligned to a valid `SectionAlignment`;
+- the header bytes at the entry point and at each data directory. A data directory range
+  starts at its RVA and ends at the first section, whatever its size;
+- the nonzero header bytes after the section table. An indirect RVA can point to them.
 
-- `HeaderBytesInUse`: the fix changes header bytes that the image refers to.
-- `SectionData`: the fix changes or drops section bytes.
-- `SectionAddresses`: the fix changes a section RVA, virtual size or characteristics.
+The loader maps `SizeOfHeaders` header bytes, or the whole file with a low `SectionAlignment`.
+
+The method builds each candidate with `PeFile::try_build`, parses the output again, and
+compares it with the built original. It keeps the first candidate that keeps the loader view.
+If no candidate does, the fields and the layout of the file stay. The checksum fix uses the
+same check. The method does not use a candidate that would make a valid checksum wrong. For
+each rejected fix, it names the reason in `Normalization::kept`:
+
+- `HeaderBytesInUse`: the candidate changes header bytes that the image refers to.
+- `SectionData`: the candidate changes or drops section bytes.
+- `SectionAddresses`: the candidate changes a section RVA, virtual size or characteristics,
+  or the aligned header size.
 - `LowAlignment`: `SectionAlignment` is smaller than a page, so the file layout stays.
-- `Alignment`: the alignments are invalid, and no valid `SectionAlignment` keeps all section
-  RVAs.
+- `Alignment`: `SectionAlignment` is invalid, and no valid value keeps all section RVAs.
 - `Layout(String)`: the method cannot make a new layout.
-- `Build(String)`: the fixed copy does not build or parse.
+- `Build(String)`: the candidate does not build or parse.
+- `Checksum`: the checksum fix would change the loader view, so a wrong checksum stays.
 
-After a new layout, the build rebases the debug `PointerToRawData` fields. `changes` reports
-this as `NormalizeChange::DebugPointers`. If the debug directory is in an executable section,
-the layout stays, and `kept` names `SectionData`. When the section table grows into a header
-tail, `changes` reports `NormalizeChange::HeaderTail`.
+After a new layout, the build rebases the `PointerToRawData` file offsets of the
+`IMAGE_DEBUG_DIRECTORY` entries. `changes` reports this as `NormalizeChange::DebugPointers`.
+The method uses a new layout only if each such field is in a section without
+`IMAGE_SCN_CNT_CODE` or `IMAGE_SCN_MEM_EXECUTE`. Each field must also be outside the other data
+directories. Otherwise, the layout stays, and `kept` names `SectionData`.
+
+`NormalizeChange::HeaderTail` means that the section table grows into the header bytes after
+it, and the build drops these bytes. The method allows this only for a bound import table. The
+`BoundImport` data directory entry then becomes zero.
 
 ```rust,no_run
 use portex::PeFile;

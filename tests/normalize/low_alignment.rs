@@ -2,7 +2,7 @@
 
 use super::{optional_offset, put32, section_header_offset};
 use portex::headers::{DataDirectoryType, MachineType};
-use portex::image::{NormalizeKept, PeBuilder, PeFile};
+use portex::image::{NormalizeKept, PeBuilder, PeFile, PeImage};
 use portex::section::characteristics;
 
 /// The RVA and the file offset of the section.
@@ -44,14 +44,41 @@ fn overlapping_file(section_alignment: u32, file_alignment: u32) -> Vec<u8> {
     raw
 }
 
-/// Return true if the reason tells that a header fix would change the section data.
-fn is_rejection(kept: &NormalizeKept) -> bool {
-    matches!(
-        kept,
-        NormalizeKept::SectionAddresses | NormalizeKept::SectionData | NormalizeKept::Build(_)
-    )
+/// Make a file with low alignments. The raw data of the `.text` section starts at 0x80, inside
+/// the headers, but its RVA 0x200 is after the headers.
+fn shifted_overlapping_file() -> Vec<u8> {
+    let mut raw = PeBuilder::new()
+        .machine(MachineType::Amd64)
+        .file_alignment(0x40)
+        .section_alignment(0x40)
+        .entry_point(0x200)
+        .add_section(
+            ".text",
+            vec![0xcc; usize::try_from(SECTION_SIZE).unwrap()],
+            characteristics::CODE | characteristics::EXECUTE | characteristics::READ,
+        )
+        .try_build()
+        .unwrap()
+        .try_build()
+        .unwrap();
+    let start = usize::try_from(SECTION_START).unwrap();
+    let end = start + usize::try_from(SECTION_SIZE).unwrap();
+    raw.resize(end, 0xcc);
+
+    let optional = optional_offset(&raw);
+    put32(&mut raw, optional + 56, 0x200 + SECTION_SIZE);
+    let section = section_header_offset(&raw, 0);
+    put32(&mut raw, section + 8, SECTION_SIZE);
+    put32(&mut raw, section + 12, 0x200);
+    put32(&mut raw, section + 16, SECTION_SIZE);
+    put32(&mut raw, section + 20, SECTION_START);
+    assert!(section + 40 < end);
+    raw
 }
 
+/// A header fix inside the raw data of a section makes the build move the section. The
+/// section then gets a new RVA (`SectionAddresses`), or the checksum fix is refused
+/// (`Checksum`). The file does not change.
 #[test]
 fn a_header_fix_inside_a_section_keeps_the_file() {
     let base = overlapping_file(0x40, 0x40);
@@ -59,11 +86,14 @@ fn a_header_fix_inside_a_section_keeps_the_file() {
 
     let optional = optional_offset(&base);
     let architecture = optional + 112 + DataDirectoryType::Architecture.as_index() * 8;
-    let variants: [&[(usize, u32)]; 2] = [
-        &[(optional + 64, 1)],
-        &[(architecture, 0x1234), (architecture + 4, 8)],
+    let variants: [(&[(usize, u32)], NormalizeKept); 2] = [
+        (&[(optional + 64, 1)], NormalizeKept::Checksum),
+        (
+            &[(architecture, 0x1234), (architecture + 4, 8)],
+            NormalizeKept::SectionAddresses,
+        ),
     ];
-    for fields in variants {
+    for (fields, reason) in variants {
         let mut raw = base.clone();
         for &(offset, value) in fields {
             put32(&mut raw, offset, value);
@@ -73,11 +103,47 @@ fn a_header_fix_inside_a_section_keeps_the_file() {
         let mut file = PeFile::parse(&raw).unwrap();
         let result = file.normalize().unwrap();
         assert_eq!(result.changes, []);
-        assert_eq!(result.kept.len(), 2, "{:?}", result.kept);
-        assert_eq!(result.kept[0], NormalizeKept::LowAlignment);
-        assert!(is_rejection(&result.kept[1]), "{:?}", result.kept);
+        assert_eq!(result.kept, [NormalizeKept::LowAlignment, reason]);
         assert_eq!(file.try_build().unwrap(), raw);
     }
+}
+
+/// A header fix that moves only the raw data of a low-alignment section changes the loader
+/// view. The RVA, the size and the bytes of the section stay, but the loader maps the file as
+/// it is.
+#[test]
+fn a_fix_that_moves_only_the_raw_data_keeps_the_file() {
+    let mut raw = shifted_overlapping_file();
+    assert_eq!(PeFile::parse(&raw).unwrap().try_build().unwrap(), raw);
+
+    let architecture = optional_offset(&raw) + 112 + DataDirectoryType::Architecture.as_index() * 8;
+    put32(&mut raw, architecture, 0x1234);
+    put32(&mut raw, architecture + 4, 8);
+    assert_eq!(PeFile::parse(&raw).unwrap().try_build().unwrap(), raw);
+
+    // The build of the fix moves only the raw data. The RVA, the size and the bytes stay.
+    let mut fixed = PeFile::parse(&raw).unwrap();
+    fixed.clear_data_directory(DataDirectoryType::Architecture);
+    let built = fixed.try_build().unwrap();
+    let image = PeImage::parse(&built).unwrap();
+    let header = &image.sections[0].header;
+    assert_eq!(header.virtual_address, 0x200);
+    assert_eq!(header.virtual_size, SECTION_SIZE);
+    assert_eq!(header.size_of_raw_data, SECTION_SIZE);
+    assert_ne!(header.pointer_to_raw_data, SECTION_START);
+    let start = usize::try_from(header.pointer_to_raw_data).unwrap();
+    let old = usize::try_from(SECTION_START).unwrap();
+    let size = usize::try_from(SECTION_SIZE).unwrap();
+    assert_eq!(built[start..start + size], raw[old..old + size]);
+
+    let mut file = PeFile::parse(&raw).unwrap();
+    let result = file.normalize().unwrap();
+    assert_eq!(result.changes, []);
+    assert_eq!(
+        result.kept,
+        [NormalizeKept::LowAlignment, NormalizeKept::SectionData]
+    );
+    assert_eq!(file.try_build().unwrap(), raw);
 }
 
 #[test]
@@ -90,12 +156,40 @@ fn an_invalid_low_alignment_keeps_a_buildable_file() {
     let mut file = PeFile::parse(&raw).unwrap();
     let result = file.normalize().unwrap();
     assert_eq!(result.changes, []);
-    assert!(result.kept.contains(&NormalizeKept::LowAlignment));
     assert_eq!(
-        result.kept.iter().filter(|kept| is_rejection(kept)).count(),
-        1,
-        "{:?}",
-        result.kept
+        result.kept,
+        [NormalizeKept::LowAlignment, NormalizeKept::Checksum]
+    );
+    assert_eq!(file.try_build().unwrap(), raw);
+}
+
+/// With a low alignment, the loader maps the whole file. The entry point can then refer to
+/// header bytes after `SizeOfHeaders`. Here these bytes are the checksum, so the checksum
+/// stays wrong.
+#[test]
+fn a_header_reference_after_size_of_headers_is_kept_with_a_low_alignment() {
+    let mut raw = PeBuilder::new()
+        .machine(MachineType::Amd64)
+        .file_alignment(0x200)
+        .section_alignment(0x200)
+        .add_section(".text", vec![0xcc; 0x180], characteristics::READ)
+        .try_build()
+        .unwrap()
+        .try_build()
+        .unwrap();
+    let optional = optional_offset(&raw);
+    let checksum = optional + 64;
+    put32(&mut raw, optional + 60, 0x80);
+    put32(&mut raw, optional + 16, u32::try_from(checksum).unwrap());
+    put32(&mut raw, checksum, 1);
+    assert_eq!(PeFile::parse(&raw).unwrap().try_build().unwrap(), raw);
+
+    let mut file = PeFile::parse(&raw).unwrap();
+    let result = file.normalize().unwrap();
+    assert_eq!(result.changes, []);
+    assert_eq!(
+        result.kept,
+        [NormalizeKept::LowAlignment, NormalizeKept::Checksum]
     );
     assert_eq!(file.try_build().unwrap(), raw);
 }

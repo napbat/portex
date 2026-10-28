@@ -490,13 +490,24 @@ impl PeFile {
     ///   fields again.
     /// - It corrects a wrong checksum. A checksum of 0 stays 0.
     ///
-    /// The method builds each fixed copy, parses it again, and keeps a fix only if the built
-    /// file keeps the loader view of the built original: the section RVAs, virtual sizes,
-    /// characteristics and bytes, and the header bytes that the entry point or a data directory
-    /// refers to. The loader maps `SizeOfHeaders` bytes of the headers, or the whole file with a
-    /// low alignment. The only accepted change to section bytes is the rebase of the debug
-    /// `PointerToRawData` fields in a section that is not executable.
+    /// The method builds each fixed copy, called a candidate, and parses it again. It keeps a
+    /// candidate only if the built file keeps the loader view of the built original. The loader
+    /// view covers these items:
+    ///
+    /// - the section RVAs, virtual sizes and characteristics;
+    /// - the section bytes that the loader maps, from the raw offset up to the
+    ///   `FileAlignment`-aligned raw end;
+    /// - the aligned size of the headers, if `SectionAlignment` is valid;
+    /// - the header bytes at the entry point and at each data directory;
+    /// - the nonzero header bytes after the section table.
+    ///
+    /// The only accepted change to section bytes is the rebase of the `PointerToRawData` file
+    /// offsets of the `IMAGE_DEBUG_DIRECTORY` entries. The entries must be in a section without
+    /// `IMAGE_SCN_CNT_CODE` or `IMAGE_SCN_MEM_EXECUTE`, and outside other data directories.
     /// [`Normalization::changes`] reports it as [`NormalizeChange::DebugPointers`].
+    ///
+    /// The method corrects a wrong nonzero checksum only if the fix keeps the loader view. It
+    /// does not use a candidate that would make a valid checksum wrong.
     /// [`Normalization::kept`] names the fixes that the method does not make. The overlay and
     /// the certificate table stay.
     ///
@@ -511,22 +522,39 @@ impl PeFile {
         let original_bytes = self.try_build()?;
         let original_view = LoaderView::parse(&original_bytes)?;
         let original = self.image.clone();
+        let stored = check_sum(&original.optional_header);
+        let valid_checksum = stored != 0
+            && checksum_field_offset(&original_bytes)
+                .is_some_and(|offset| calculate_checksum(&original_bytes, offset) == stored);
         let (candidates, mut kept) = original.normalize_candidates();
-        let mut accepted = None;
+        let mut moves_debug_offsets = !original_view.keeps_section_data(&original);
+        let mut accepted = false;
         for candidate in candidates {
-            match self.try_normalized(candidate, &original_view) {
-                Ok(result) => {
-                    accepted = Some(result);
-                    break;
+            let (bytes, moved) = match self.try_normalized(candidate, &original_view) {
+                Ok(result) => result,
+                Err(reason) => {
+                    add_kept(&mut kept, reason);
+                    continue;
                 }
-                Err(reason) => add_kept(&mut kept, reason),
+            };
+            if self.normalize_checksum(&bytes, &original_view).is_err() {
+                add_kept(&mut kept, NormalizeKept::Checksum);
+                if valid_checksum {
+                    self.image = original.clone();
+                    continue;
+                }
             }
+            moves_debug_offsets |= moved;
+            accepted = true;
+            break;
         }
-        let moves_debug_offsets = accepted.as_ref().is_some_and(|(_, moved)| *moved);
-        let bytes = accepted
-            .as_ref()
-            .map_or(original_bytes.as_slice(), |(bytes, _)| bytes.as_slice());
-        self.normalize_checksum(bytes, &original_view, &mut kept);
+        if !accepted
+            && self
+                .normalize_checksum(&original_bytes, &original_view)
+                .is_err()
+        {
+            add_kept(&mut kept, NormalizeKept::Checksum);
+        }
         let mut changes = normalize_changes(&original, &self.image);
         if moves_debug_offsets {
             changes.push(NormalizeChange::DebugPointers);
@@ -559,26 +587,23 @@ impl PeFile {
     }
 
     /// Correct a wrong nonzero checksum of the file `bytes`, if the fix keeps the loader view
-    /// of `original`. Otherwise add the reason to `kept`.
+    /// of `original`. Return the reason if the fix is not made. The image then does not change.
     fn normalize_checksum(
         &mut self,
         bytes: &[u8],
         original: &LoaderView<'_>,
-        kept: &mut Vec<NormalizeKept>,
-    ) {
+    ) -> core::result::Result<(), NormalizeKept> {
         let stored = check_sum(&self.image.optional_header);
         let Some(offset) = checksum_field_offset(bytes).filter(|_| stored != 0) else {
-            return;
+            return Ok(());
         };
         let computed = calculate_checksum(bytes, offset);
         if computed == stored {
-            return;
+            return Ok(());
         }
         let mut candidate = self.image.clone();
         set_check_sum(&mut candidate.optional_header, computed);
-        if let Err(reason) = self.try_normalized(candidate, original) {
-            add_kept(kept, reason);
-        }
+        self.try_normalized(candidate, original).map(|_| ())
     }
 
     /// Write the complete raw PE file to disk.

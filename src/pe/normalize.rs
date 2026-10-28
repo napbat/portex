@@ -23,7 +23,8 @@ const MAX_FILE_ALIGNMENT: u32 = 0x1_0000;
 pub struct Normalization {
     /// The field changes, in header order.
     pub changes: Vec<NormalizeChange>,
-    /// The problems that stay, because their fix would change how the loader maps the image.
+    /// The problems that `normalize` does not fix, because the fix changes the loader view or
+    /// cannot be built.
     pub kept: Vec<NormalizeKept>,
 }
 
@@ -85,7 +86,7 @@ pub enum NormalizeChange {
         /// The new value.
         new: u32,
     },
-    /// The stored checksum was wrong.
+    /// The stored nonzero checksum does not match the normalized file.
     Checksum {
         /// The old value.
         old: u32,
@@ -103,8 +104,7 @@ pub enum NormalizeChange {
     ///
     /// - The reserved entries `Architecture` and `Reserved` become zero, and the `GlobalPtr`
     ///   size becomes zero. The loader does not use these values.
-    /// - The `BoundImport` entry becomes zero if the section table grows into the bound import
-    ///   table. The loader then resolves the imports without it.
+    /// - `BoundImport` becomes zero if the dropped header tail holds the bound import table.
     DataDirectory(DataDirectoryType),
     /// A section header field changed:
     ///
@@ -115,38 +115,40 @@ pub enum NormalizeChange {
         /// The index of the section in the section table.
         index: usize,
     },
-    /// The header bytes after the section table were dropped, because the section table grows
-    /// into them. No entry point or data directory refers to them.
+    /// The section table grows into the header bytes after it, so the build drops them. This is
+    /// allowed only for a bound import table, which the loader can do without.
     HeaderTail,
-    /// The `PointerToRawData` fields of the debug directory entries follow the new file layout.
-    /// The loader does not read them.
+    /// The build rebased the `PointerToRawData` file offsets of the `IMAGE_DEBUG_DIRECTORY`
+    /// entries.
     DebugPointers,
 }
 
 /// A problem that [`PeFile::normalize`](crate::PeFile::normalize) does not fix, because the fix
-/// would change how the loader maps the image.
+/// changes the loader view or cannot be built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum NormalizeKept {
-    /// A fix changes the header bytes that the entry point or a data directory refers to. The
-    /// headers then hold code or data, so the header fields stay.
+    /// A fix changes header bytes that the loader view uses: the bytes at the entry point or
+    /// at a data directory, or a nonzero byte after the section table. The fix is not made.
     HeaderBytesInUse,
-    /// A fix changes the bytes that the loader maps for a section, or moves the raw data of a
-    /// low-alignment section.
+    /// A fix changes the section bytes that the loader maps.
     SectionData,
-    /// A new layout would move a section or change its virtual size. An example is a section
-    /// whose RVA is not aligned, or a section that starts inside the headers. The layout stays.
+    /// A fix changes a section RVA, virtual size or characteristics, or the aligned size of the
+    /// headers.
     SectionAddresses,
     /// `SectionAlignment` is smaller than a page, so the loader maps the file as it is. The
     /// file layout stays.
     LowAlignment,
-    /// The alignments are invalid, and no valid `SectionAlignment` keeps all section RVAs.
+    /// `SectionAlignment` is invalid, and no valid value keeps all section RVAs.
     Alignment,
     /// The layout update fails with this error message, for example on an overflow.
     Layout(String),
     /// The build of a fixed copy fails, or the built file does not parse. The value is the
     /// error message.
     Build(String),
+    /// The checksum fix would change the loader view. A wrong checksum then stays wrong. A
+    /// candidate that would make a valid checksum wrong is not used.
+    Checksum,
 }
 
 impl PeImage {

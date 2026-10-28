@@ -8,7 +8,7 @@
 /// `checksum_offset` is the file offset of the `CheckSum` field. The algorithm:
 ///
 /// 1. Add all 16-bit words. Use 32-bit arithmetic with an end-around carry.
-/// 2. Skip the 4-byte checksum field at `checksum_offset`.
+/// 2. Count the 4 bytes of the checksum field as zero.
 /// 3. Fold the result to 16 bits.
 /// 4. Add the file size (modulo 2^32).
 #[must_use]
@@ -18,20 +18,22 @@ pub fn calculate_checksum(data: &[u8], checksum_offset: usize) -> u32 {
     let mut sum: u32 = 0;
     let len = data.len();
 
-    // Process 16-bit words, each paired with its file offset.
-    let skip = checksum_offset..checksum_offset.saturating_add(4);
+    // Process 16-bit words, each paired with its file offset. A byte inside
+    // the checksum field counts as zero, also when the field offset is odd.
+    let field = checksum_offset..checksum_offset.saturating_add(4);
+    let byte_at = |offset: usize, byte: u8| {
+        if field.contains(&offset) { 0 } else { byte }
+    };
     let (words, tail) = data.as_chunks::<2>();
     for (offset, word) in (0..len).step_by(2).zip(words) {
-        // Skip the checksum field (4 bytes at checksum_offset).
-        if skip.contains(&offset) {
-            continue;
-        }
-        sum = fold_carry(sum + u32::from(u16::from_le_bytes(*word)));
+        let low = byte_at(offset, word[0]);
+        let high = byte_at(offset.saturating_add(1), word[1]);
+        sum = fold_carry(sum + u32::from(u16::from_le_bytes([low, high])));
     }
 
     // Add the odd byte at the end.
     if let [byte] = tail {
-        sum = fold_carry(sum + u32::from(*byte));
+        sum = fold_carry(sum + u32::from(byte_at(len.saturating_sub(1), *byte)));
     }
 
     // Add the file size. The algorithm uses only the low 32 bits.
@@ -81,7 +83,7 @@ pub fn compute_pe_checksum(data: &[u8]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prelude::vec;
+    use crate::prelude::{Vec, vec};
 
     #[test]
     fn test_checksum_field_offset() {
@@ -112,5 +114,52 @@ mod tests {
         // Sum of words: 0x0201 + 0x0403 + 0x0605 + 0x0807 = 0x1410
         // Plus file size: 0x1410 + 8 = 0x1418
         assert_eq!(checksum, 0x1418);
+    }
+
+    /// Make a fixed byte pattern of `len` bytes.
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| u8::try_from((i * 37 + 11) % 256).unwrap())
+            .collect()
+    }
+
+    /// Zero the 4 field bytes in a copy, then sum the words.
+    fn reference(data: &[u8], offset: usize) -> u32 {
+        let mut copy = data.to_vec();
+        for byte in copy.iter_mut().skip(offset).take(4) {
+            *byte = 0;
+        }
+        calculate_checksum(&copy, usize::MAX - 8)
+    }
+
+    #[test]
+    fn test_odd_offset_ignores_stored_value() {
+        for len in [64, 65] {
+            let mut data = pattern(len);
+            let offset = 0x11;
+            data[offset..offset + 4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+            let first = calculate_checksum(&data, offset);
+            data[offset..offset + 4].copy_from_slice(&0xA5C3_0FF1u32.to_le_bytes());
+            assert_eq!(calculate_checksum(&data, offset), first);
+            assert_eq!(reference(&data, offset), first);
+        }
+    }
+
+    #[test]
+    fn test_checksum_is_stable_after_write() {
+        for (len, offset) in [(64, 0x10), (64, 0x11), (65, 0x3D)] {
+            let mut data = pattern(len);
+            let value = calculate_checksum(&data, offset);
+            data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            assert_eq!(calculate_checksum(&data, offset), value);
+        }
+    }
+
+    #[test]
+    fn test_even_offset_matches_reference() {
+        for (len, offset) in [(64, 0x10), (65, 0x3C), (8, 4)] {
+            let data = pattern(len);
+            assert_eq!(calculate_checksum(&data, offset), reference(&data, offset));
+        }
     }
 }

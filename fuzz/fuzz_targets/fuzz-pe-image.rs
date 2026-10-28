@@ -1,8 +1,9 @@
 //! Fuzz target that parses arbitrary bytes as PE files, and then runs the directory accessors,
 //! the validation, the build paths and the normalization on the result.
 //!
-//! The target panics if `normalize` returns `Ok`, but the normalized file does not build, does
-//! not parse, or has different section RVAs or loader virtual sizes.
+//! The target panics if `normalize` returns `Ok`, but the normalized file does not build or does
+//! not parse. It also panics if the section RVAs and virtual sizes are different from those of
+//! the built original.
 
 #![no_main]
 
