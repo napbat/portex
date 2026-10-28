@@ -228,6 +228,8 @@ impl PeBuilder {
             sections,
             source_layout: crate::pe::SourceLayout::File,
             runtime_image_base: None,
+            header_tail: crate::pe::HeaderBytes::default(),
+            optional_padding: crate::pe::HeaderBytes::default(),
         };
 
         pe.try_update_layout()?;
@@ -371,12 +373,7 @@ impl PeBuilder {
                 let mut header = SectionHeader::default();
                 header.set_name(name);
                 header.characteristics = *characteristics;
-                Section {
-                    header,
-                    data: data.clone(),
-                    mapped_raw_size: None,
-                    mapped_data_len: 0,
-                }
+                Section::from_header_and_data(header, data.clone())
             })
             .collect()
     }

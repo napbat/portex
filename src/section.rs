@@ -291,6 +291,11 @@ pub struct Section {
     /// The original raw size of the section, if `data` came from a loader-mapped image.
     pub(crate) mapped_raw_size: Option<u32>,
     pub(crate) mapped_data_len: usize,
+    /// The loader maps zeros for the raw bytes after `data`, so RVA reads give zeros there.
+    /// This is the case if the raw range goes past the end of the source file, and `data` holds
+    /// the bytes up to that end. It is also the case if `PointerToRawData` is 0, and `data` is
+    /// empty.
+    pub(crate) raw_tail_is_zero: bool,
 }
 
 impl Section {
@@ -315,6 +320,7 @@ impl Section {
             data: Vec::new(),
             mapped_raw_size: None,
             mapped_data_len: 0,
+            raw_tail_is_zero: false,
         }
     }
 
@@ -326,6 +332,7 @@ impl Section {
             data,
             mapped_raw_size: None,
             mapped_data_len: 0,
+            raw_tail_is_zero: false,
         }
     }
 
@@ -335,6 +342,7 @@ impl Section {
         Self {
             mapped_raw_size: Some(header.size_of_raw_data),
             mapped_data_len,
+            raw_tail_is_zero: false,
             header,
             data,
         }

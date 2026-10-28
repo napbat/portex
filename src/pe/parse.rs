@@ -1,12 +1,19 @@
-use super::{MissingSectionData, ParseOptions, PeHeaders, PeImage, SourceLayout};
+use super::{HeaderBytes, MissingSectionData, ParseOptions, PeHeaders, PeImage, SourceLayout};
 use crate::dos::DosHeader;
+use crate::layout;
 use crate::prelude::*;
 use crate::reader::{ReadAt, SliceReader};
-use crate::section::Section;
+use crate::section::{Section, SectionHeader};
 use crate::{Error, Result};
 
 #[cfg(feature = "std")]
 use std::path::Path;
+
+/// The parser reads at most this many times the size of the source in section data.
+///
+/// Each section reads at most the complete source. Thus an image with the 96 sections that the
+/// loader of Windows XP accepts is always inside the limit.
+const SECTION_DATA_LIMIT: u64 = 96;
 
 impl PeImage {
     /// Create a [`PeBuilder`](crate::PeBuilder) that builds a new PE image from scratch.
@@ -80,7 +87,8 @@ impl PeImage {
         Self::read_from(&reader, 0, layout)
     }
 
-    /// Parse PE bytes with explicit [`ParseOptions`] for strictness and source layout.
+    /// Parse PE bytes with explicit [`ParseOptions`]: the source layout and the policy for
+    /// section bytes that cannot be read.
     ///
     /// # Errors
     ///
@@ -149,8 +157,6 @@ impl PeImage {
     /// Returns an error if:
     ///
     /// - [`PeHeaders::read_from`] fails.
-    /// - `e_lfanew` puts the PE header inside the DOS header.
-    /// - A section in the file layout has raw bytes but a zero `PointerToRawData`.
     /// - A source offset overflows.
     /// - The reader fails.
     /// - The DOS stub cannot be fully read.
@@ -162,16 +168,15 @@ impl PeImage {
         options: ParseOptions,
     ) -> Result<Self> {
         let headers = PeHeaders::read_from(reader, base_offset)?;
+        let header_tail = Self::read_header_tail(reader, base_offset, &headers, options.layout);
+        let optional_padding = Self::read_optional_padding(reader, base_offset, &headers);
 
-        // Read the DOS stub.
+        // Read the DOS stub. If the NT headers overlap the DOS header, there is no stub.
         let dos_stub_start = base_offset
             .checked_add(DosHeader::SIZE as u64)
             .ok_or_else(|| Error::invalid_section("DOS stub offset overflow"))?;
-        let dos_stub_size = headers
-            .pe_offset
-            .checked_sub(dos_stub_start)
-            .and_then(|size| usize::try_from(size).ok())
-            .ok_or_else(|| Error::invalid_section("PE header overlaps the DOS header"))?;
+        let dos_stub_size = usize::try_from(headers.pe_offset.saturating_sub(dos_stub_start))
+            .map_err(|_| Error::invalid_section("DOS stub size exceeds usize"))?;
         let dos_stub = if dos_stub_size > 0 {
             Self::read_source_bytes(
                 reader,
@@ -183,47 +188,13 @@ impl PeImage {
             Vec::new()
         };
 
-        // Read the section data.
-        let mut sections = Vec::with_capacity(headers.section_headers.len());
-        for header in headers.section_headers {
-            if options.layout == SourceLayout::File
-                && header.size_of_raw_data != 0
-                && header.pointer_to_raw_data == 0
-            {
-                return Err(Error::invalid_section(format!(
-                    "section '{}' has raw bytes but a zero file pointer",
-                    header.name_str()
-                )));
-            }
-            let source_range = match options.layout {
-                SourceLayout::File => (header.pointer_to_raw_data != 0
-                    && header.size_of_raw_data != 0)
-                    .then_some((header.pointer_to_raw_data, header.size_of_raw_data as usize)),
-                SourceLayout::Mapped => {
-                    let mapped_size = header.virtual_size.max(header.size_of_raw_data);
-                    (mapped_size != 0).then_some((header.virtual_address, mapped_size as usize))
-                }
-            };
-
-            let section_data = match source_range {
-                Some((relative_offset, size)) => {
-                    let source_offset = base_offset
-                        .checked_add(u64::from(relative_offset))
-                        .ok_or_else(|| Error::invalid_section("section source offset overflow"))?;
-                    Self::read_source_bytes(
-                        reader,
-                        source_offset,
-                        size,
-                        options.missing_section_data,
-                    )?
-                }
-                None => Vec::new(),
-            };
-            sections.push(match options.layout {
-                SourceLayout::File => Section::from_header_and_data(header, section_data),
-                SourceLayout::Mapped => Section::from_mapped_header_and_data(header, section_data),
-            });
-        }
+        let sections = Self::read_sections(
+            reader,
+            base_offset,
+            headers.section_headers,
+            headers.optional_header.file_alignment(),
+            options,
+        )?;
 
         Ok(Self {
             dos_header: headers.dos_header,
@@ -233,7 +204,218 @@ impl PeImage {
             sections,
             source_layout: options.layout,
             runtime_image_base: options.runtime_image_base,
+            header_tail,
+            optional_padding,
         })
+    }
+
+    /// Read the data of each section.
+    ///
+    /// In the file layout, the method reads the raw data at the offset where the loader reads
+    /// it (see [`layout::loader_raw_offset`]). The raw data can go past the end of the source.
+    /// The loader maps zeros for those bytes. Then the section keeps the bytes up to the end of
+    /// the source, and RVA reads give zeros for the rest.
+    ///
+    /// Sections can share source bytes, but each section owns a copy. To keep the memory use in
+    /// proportion to the source, the method reads at most [`SECTION_DATA_LIMIT`] times the size
+    /// of the source.
+    fn read_sections<R: ReadAt>(
+        reader: &R,
+        base_offset: u64,
+        headers: Vec<SectionHeader>,
+        file_alignment: u32,
+        options: ParseOptions,
+    ) -> Result<Vec<Section>> {
+        let source_size = reader.size().map(|size| size.saturating_sub(base_offset));
+        let mut budget = source_size.map(|size| size.saturating_mul(SECTION_DATA_LIMIT));
+        let mut sections = Vec::with_capacity(headers.len());
+        for header in headers {
+            let section = match options.layout {
+                SourceLayout::File => Self::read_file_section(
+                    reader,
+                    base_offset,
+                    source_size,
+                    header,
+                    file_alignment,
+                    options,
+                )?,
+                SourceLayout::Mapped => {
+                    let mapped_size = header.virtual_size.max(header.size_of_raw_data);
+                    let data = if mapped_size == 0 {
+                        Vec::new()
+                    } else {
+                        let source_offset = base_offset
+                            .checked_add(u64::from(header.virtual_address))
+                            .ok_or_else(|| {
+                                Error::invalid_section("section source offset overflow")
+                            })?;
+                        Self::read_source_bytes(
+                            reader,
+                            source_offset,
+                            mapped_size as usize,
+                            options.missing_section_data,
+                        )?
+                    };
+                    Section::from_mapped_header_and_data(header, data)
+                }
+            };
+            if let Some(budget) = &mut budget {
+                *budget = budget
+                    .checked_sub(section.data.len() as u64)
+                    .ok_or_else(|| {
+                        Error::invalid_section(format!(
+                            "the section data is more than {SECTION_DATA_LIMIT} times the size of the source"
+                        ))
+                    })?;
+            }
+            sections.push(section);
+        }
+        Ok(sections)
+    }
+
+    /// Read the raw data of one section from a raw file.
+    ///
+    /// `source_size` is the size of the source after `base_offset`, if the reader knows it.
+    fn read_file_section<R: ReadAt>(
+        reader: &R,
+        base_offset: u64,
+        source_size: Option<u64>,
+        header: SectionHeader,
+        file_alignment: u32,
+        options: ParseOptions,
+    ) -> Result<Section> {
+        let size = header.size_of_raw_data as usize;
+        if size == 0 {
+            return Ok(Section::from_header_and_data(header, Vec::new()));
+        }
+        if header.pointer_to_raw_data == 0 {
+            // The section declares raw data, but no file offset. It has no bytes in the file, so
+            // read it as zeros.
+            let mut section = Section::from_header_and_data(header, Vec::new());
+            section.raw_tail_is_zero = true;
+            return Ok(section);
+        }
+        let offset = u64::from(layout::loader_raw_offset(
+            header.pointer_to_raw_data,
+            file_alignment,
+        ));
+        // Read up to the end of the source. The loader maps zeros for the bytes after it.
+        let available = source_size.map_or(size, |source_size| {
+            usize::try_from(source_size.saturating_sub(offset)).map_or(size, |left| left.min(size))
+        });
+        let source_offset = base_offset
+            .checked_add(offset)
+            .ok_or_else(|| Error::invalid_section("section source offset overflow"))?;
+        let data = Self::read_source_bytes(
+            reader,
+            source_offset,
+            available,
+            options.missing_section_data,
+        )?;
+        let raw_tail_is_zero = available < size && data.len() == available;
+        let mut section = Section::from_header_and_data(header, data);
+        section.raw_tail_is_zero = raw_tail_is_zero;
+        Ok(section)
+    }
+
+    /// Read the raw header bytes after the section table.
+    ///
+    /// The bytes end at `SizeOfHeaders`, at the first section and at the end of the source. The
+    /// result is empty if the bytes are all zero or cannot be read. The tail is optional data, so
+    /// a read failure does not make the parse fail.
+    fn read_header_tail<R: ReadAt>(
+        reader: &R,
+        base_offset: u64,
+        headers: &PeHeaders,
+        source_layout: SourceLayout,
+    ) -> HeaderBytes {
+        let Some(table_end) = headers
+            .pe_offset
+            .checked_sub(base_offset)
+            .and_then(|pe_offset| usize::try_from(pe_offset).ok())
+            .and_then(|pe_offset| {
+                layout::nt_headers_end(
+                    pe_offset,
+                    headers.section_headers.len(),
+                    usize::from(headers.coff_header.size_of_optional_header),
+                    headers.optional_header.size(),
+                )
+            })
+        else {
+            return HeaderBytes::default();
+        };
+
+        let file_alignment = headers.optional_header.file_alignment();
+        let mut limit = u64::from(headers.optional_header.size_of_headers());
+        for header in &headers.section_headers {
+            let start = match source_layout {
+                SourceLayout::File => (header.pointer_to_raw_data != 0
+                    && header.size_of_raw_data != 0)
+                    .then(|| layout::loader_raw_offset(header.pointer_to_raw_data, file_alignment)),
+                SourceLayout::Mapped => (header.virtual_size.max(header.size_of_raw_data) != 0)
+                    .then_some(header.virtual_address),
+            };
+            if let Some(start) = start {
+                limit = limit.min(u64::from(start));
+            }
+        }
+        Self::read_header_bytes(reader, base_offset, table_end, limit)
+    }
+
+    /// Read the raw bytes between the optional header and the section table.
+    ///
+    /// These bytes exist if `SizeOfOptionalHeader` is larger than the optional header. The result
+    /// is empty if the bytes are all zero or cannot be read.
+    fn read_optional_padding<R: ReadAt>(
+        reader: &R,
+        base_offset: u64,
+        headers: &PeHeaders,
+    ) -> HeaderBytes {
+        let optional_offset = headers
+            .pe_offset
+            .checked_sub(base_offset)
+            .and_then(|pe_offset| usize::try_from(pe_offset).ok())
+            .and_then(|pe_offset| pe_offset.checked_add(4 + crate::coff::CoffHeader::SIZE));
+        let Some(optional_offset) = optional_offset else {
+            return HeaderBytes::default();
+        };
+        let start = optional_offset.saturating_add(headers.optional_header.size());
+        let end = optional_offset
+            .saturating_add(usize::from(headers.coff_header.size_of_optional_header));
+        Self::read_header_bytes(reader, base_offset, start, end as u64)
+    }
+
+    /// Read the raw header bytes from `start` to `limit`, but not past the end of the source.
+    ///
+    /// The result keeps the offset `start`, and has no trailing zeros. It is empty if the bytes
+    /// cannot be read: these bytes are optional data, so a read failure does not make the parse
+    /// fail.
+    fn read_header_bytes<R: ReadAt>(
+        reader: &R,
+        base_offset: u64,
+        start: usize,
+        mut limit: u64,
+    ) -> HeaderBytes {
+        if let Some(source_size) = reader.size() {
+            limit = limit.min(source_size.saturating_sub(base_offset));
+        }
+        let (Some(len), Some(source_offset)) = (
+            limit
+                .checked_sub(start as u64)
+                .filter(|len| *len != 0)
+                .and_then(|len| usize::try_from(len).ok()),
+            base_offset.checked_add(start as u64),
+        ) else {
+            return HeaderBytes::default();
+        };
+        let bytes = Self::read_source_bytes(reader, source_offset, len, MissingSectionData::Empty)
+            .unwrap_or_default();
+        let mut header_bytes = HeaderBytes {
+            offset: start,
+            bytes,
+        };
+        header_bytes.trim_trailing_zeros();
+        header_bytes
     }
 
     /// Read a source range and apply the selected [`MissingSectionData`] policy.

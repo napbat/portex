@@ -77,9 +77,13 @@ pub struct PackedExceptionDirectory {
 impl PackedExceptionDirectory {
     /// Parse an ARM-family `.pdata` table.
     ///
+    /// The function calls `read_at_rva` one time for the complete table. For this call, `len`
+    /// can be as large as `pdata_size`. The callback must return at least `len` bytes. Extra
+    /// bytes are ignored.
+    ///
     /// # Errors
     /// Returns an error if `pdata_size` is not a multiple of the record size
-    /// or an entry cannot be read.
+    /// or the table cannot be read.
     pub fn parse<F>(pdata_rva: u32, pdata_size: u32, read_at_rva: F) -> Result<Self>
     where
         F: Fn(u32, usize) -> Option<Vec<u8>>,
@@ -91,16 +95,16 @@ impl PackedExceptionDirectory {
                 PackedRuntimeFunction::SIZE
             )));
         }
-        // Do not reserve capacity from `pdata_size`. The size comes from the file, and each
-        // entry must be read before it uses memory.
+        let table = crate::parse_utils::read_record_table(
+            &read_at_rva,
+            pdata_rva,
+            pdata_size,
+            PackedRuntimeFunction::SIZE,
+            "exception table",
+        )?;
         let mut functions = Vec::new();
-        for relative in (0..pdata_size).step_by(PackedRuntimeFunction::SIZE) {
-            let rva = pdata_rva
-                .checked_add(relative)
-                .ok_or_else(|| Error::invalid_data_directory("exception table RVA overflow"))?;
-            let bytes = read_at_rva(rva, PackedRuntimeFunction::SIZE)
-                .ok_or_else(|| Error::invalid_rva(rva))?;
-            let function = PackedRuntimeFunction::parse(&bytes)?;
+        for bytes in table.as_chunks::<{ PackedRuntimeFunction::SIZE }>().0 {
+            let function = PackedRuntimeFunction::parse(bytes)?;
             if function.begin_address != 0 || function.unwind_data != 0 {
                 functions.push(function);
             }

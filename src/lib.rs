@@ -15,6 +15,10 @@
 //!   the full file, which helps when you read a remote process.
 //! - **Self-contained**: The crate defines all PE structures itself. It does not use the
 //!   Windows SDK.
+//! - **Normalization**: [`PeFile::normalize`] sets malformed header fields and the file layout
+//!   to normal values. It builds and parses each candidate again, and compares it with the
+//!   built original. It keeps the first candidate that keeps the loader view. The checksum fix
+//!   uses the same check. `Normalization::kept` names the reason for each rejected fix.
 //! - **`no_std` mode**: Disable the `std` feature for `no_std + alloc` builds. The full PE
 //!   API (parsers, builders, layout, validation and in-memory readers) stays available.
 //!   Only these items need `std`, and they compile out:
@@ -144,7 +148,10 @@ pub use loadconfig::{
     LoadConfigDirectory64,
 };
 pub use optional::{OptionalHeader, OptionalHeader32, OptionalHeader64, Subsystem};
-pub use pe::{MissingSectionData, ParseOptions, PeHeaders, PeImage, SourceLayout};
+pub use pe::{
+    MissingSectionData, Normalization, NormalizeChange, NormalizeKept, ParseOptions, PeHeaders,
+    PeImage, SourceLayout,
+};
 pub use pe_file::PeFile;
 #[cfg(feature = "std")]
 pub use reader::FileReader;

@@ -60,6 +60,17 @@ impl PeImage {
                 "DOS signature is not 'MZ'",
             ));
         }
+        // The parser reads an unknown magic with the layout of the machine type.
+        let magic = match &self.optional_header {
+            OptionalHeader::Pe32(header) => header.magic,
+            OptionalHeader::Pe32Plus(header) => header.magic,
+        };
+        if magic != crate::optional::PE32_MAGIC && magic != crate::optional::PE32PLUS_MAGIC {
+            result.push(ValidationIssue::error(
+                ValidationCode::InvalidOptionalMagic,
+                format!("optional-header magic {magic:#06x} is not PE32 or PE32+"),
+            ));
+        }
 
         // Check that sections exist.
         if self.sections.is_empty() {
@@ -90,31 +101,43 @@ impl PeImage {
             ));
         }
 
+        // The loader reads all fields of the optional header, also if the section table overlaps
+        // them. Thus this is valid, but unusual.
         let expected_optional_size = self.optional_header.size();
         if usize::from(self.coff_header.size_of_optional_header) < expected_optional_size {
-            result.push(ValidationIssue::error(
+            result.push(ValidationIssue::warning(
                 ValidationCode::InconsistentOptionalHeader,
                 format!(
-                    "COFF optional-header size is {}, but parsed fields require at least {} bytes",
+                    "COFF optional-header size is {}, but the optional header has {} bytes: the section table overlaps it",
                     self.coff_header.size_of_optional_header, expected_optional_size
                 ),
             ));
         }
-        let (directory_count, directory_len) = match &self.optional_header {
+        let (declared_count, directory_len) = match &self.optional_header {
             OptionalHeader::Pe32(header) => (
-                header.number_of_rva_and_sizes as usize,
+                header.number_of_rva_and_sizes,
                 header.data_directories.len(),
             ),
             OptionalHeader::Pe32Plus(header) => (
-                header.number_of_rva_and_sizes as usize,
+                header.number_of_rva_and_sizes,
                 header.data_directories.len(),
             ),
         };
-        if directory_count != directory_len {
+        let loaded_count = usize::try_from(declared_count)
+            .unwrap_or(usize::MAX)
+            .min(crate::data_dir::NUMBER_OF_DIRECTORY_ENTRIES);
+        if loaded_count != directory_len {
             result.push(ValidationIssue::error(
                 ValidationCode::InconsistentOptionalHeader,
                 format!(
-                    "NumberOfRvaAndSizes is {directory_count}, but {directory_len} directory entries are present"
+                    "NumberOfRvaAndSizes is {declared_count}, but {directory_len} directory entries are present"
+                ),
+            ));
+        } else if loaded_count < declared_count as usize {
+            result.push(ValidationIssue::warning(
+                ValidationCode::InconsistentOptionalHeader,
+                format!(
+                    "NumberOfRvaAndSizes is {declared_count}, but the loader reads only {loaded_count} entries"
                 ),
             ));
         }
@@ -170,21 +193,26 @@ impl PeImage {
 
     /// Check `e_lfanew` and `SizeOfHeaders` against the header table.
     fn validate_headers_size(&self, result: &mut ValidationResult, file_align: u32) {
-        if usize::try_from(self.dos_header.e_lfanew)
-            .ok()
-            .is_none_or(|pe_offset| pe_offset < DosHeader::SIZE)
-        {
-            result.push(ValidationIssue::error(
-                ValidationCode::InconsistentHeadersSize,
-                "e_lfanew places the PE header inside the DOS header",
-            ));
+        // The loader of executable images needs `e_lfanew` of 4 or more. The data-file loader
+        // also accepts 2 and 3.
+        match usize::try_from(self.dos_header.e_lfanew) {
+            Ok(pe_offset) if pe_offset >= DosHeader::SIZE => {}
+            Ok(pe_offset) if pe_offset >= 4 => {
+                result.push(ValidationIssue::warning(
+                    ValidationCode::InconsistentHeadersSize,
+                    "e_lfanew places the NT headers inside the DOS header",
+                ));
+            }
+            _ => {
+                result.push(ValidationIssue::error(
+                    ValidationCode::InconsistentHeadersSize,
+                    "e_lfanew is smaller than 4, the minimum for an executable image",
+                ));
+            }
         }
-        let minimum_headers_size = layout::headers_size_at(
-            usize::try_from(self.dos_header.e_lfanew).unwrap_or(0),
-            self.sections.len(),
-            self.optional_header.size(),
-        )
-        .and_then(|size| u32::try_from(size).ok());
+        let minimum_headers_size = self
+            .nt_headers_end()
+            .and_then(|size| u32::try_from(size).ok());
         if let Some(minimum) = minimum_headers_size
             && self.optional_header.size_of_headers() < minimum
         {
@@ -214,12 +242,9 @@ impl PeImage {
         }
 
         if file_align != 0 && file_align.is_power_of_two() {
-            let declared_optional_size = usize::from(self.coff_header.size_of_optional_header);
-            let expected_headers = usize::try_from(self.dos_header.e_lfanew)
-                .ok()
-                .and_then(|pe_offset| {
-                    layout::headers_size_at(pe_offset, self.sections.len(), declared_optional_size)
-                })
+            let expected_headers = self
+                .nt_headers_end()
+                .and_then(|table_end| self.header_data_end(table_end))
                 .and_then(|size| u32::try_from(size).ok())
                 .and_then(|size| layout::checked_align_up(size, file_align));
             if let Some(expected) = expected_headers
@@ -237,11 +262,15 @@ impl PeImage {
         }
     }
 
-    /// Check `SizeOfImage` against the section layout.
+    /// Check `SizeOfImage` against the header size and the section layout.
     fn validate_image_size(&self, result: &mut ValidationResult, section_align: u32) {
         if section_align != 0 && section_align.is_power_of_two() {
             let config = LayoutConfig::from_optional_header(&self.optional_header);
-            match layout::try_calculate_size_of_image(&self.sections, &config) {
+            match layout::try_calculate_size_of_image_with_headers(
+                &self.sections,
+                &config,
+                self.optional_header.size_of_headers(),
+            ) {
                 Ok(expected) if expected != self.optional_header.size_of_image() => {
                     result.push(ValidationIssue::error(
                         ValidationCode::InconsistentImageSize,
@@ -337,46 +366,55 @@ impl PeImage {
     }
 
     /// Check that the raw file ranges of the sections do not overlap.
+    ///
+    /// Each range starts where the loader reads the raw data (see
+    /// [`layout::loader_raw_offset`]).
     fn validate_section_file_overlaps(&self, result: &mut ValidationResult) {
-        // Check for overlapping sections (file offsets).
-        for (i, s1) in self.sections.iter().enumerate() {
-            if s1.header.pointer_to_raw_data == 0 || s1.header.size_of_raw_data == 0 {
-                continue;
-            }
-            let s1_end =
-                u64::from(s1.header.pointer_to_raw_data) + u64::from(s1.header.size_of_raw_data);
-            for s2 in self.sections.iter().skip(i + 1) {
-                if s2.header.pointer_to_raw_data == 0 || s2.header.size_of_raw_data == 0 {
-                    continue;
-                }
-                let s2_end = u64::from(s2.header.pointer_to_raw_data)
-                    + u64::from(s2.header.size_of_raw_data);
-                // Check for an overlap.
-                if u64::from(s1.header.pointer_to_raw_data) < s2_end
-                    && u64::from(s2.header.pointer_to_raw_data) < s1_end
-                {
-                    result.push(
-                        ValidationIssue::error(
-                            ValidationCode::OverlappingSections,
-                            format!(
-                                "Sections '{}' and '{}' overlap in file",
-                                s1.header.name_str(),
-                                s2.header.name_str()
-                            ),
-                        )
-                        .with_context(format!(
-                            "{}: {:#x}-{:#x}, {}: {:#x}-{:#x}",
-                            s1.header.name_str(),
-                            s1.header.pointer_to_raw_data,
-                            s1_end,
-                            s2.header.name_str(),
-                            s2.header.pointer_to_raw_data,
-                            s2_end
-                        )),
-                    );
-                }
-            }
+        let file_alignment = self.optional_header.file_alignment();
+        let ranges = self
+            .sections
+            .iter()
+            .enumerate()
+            .filter(|(_, section)| {
+                section.header.pointer_to_raw_data != 0 && section.header.size_of_raw_data != 0
+            })
+            .map(|(index, section)| {
+                let start = u64::from(layout::loader_raw_offset(
+                    section.header.pointer_to_raw_data,
+                    file_alignment,
+                ));
+                (
+                    start,
+                    start + u64::from(section.header.size_of_raw_data),
+                    index,
+                )
+            })
+            .collect();
+        for (earlier, later) in overlapping_ranges(ranges) {
+            self.push_overlap(result, "file", earlier, later);
         }
+    }
+
+    /// Report that the section ranges `earlier` and `later` overlap in `place`.
+    fn push_overlap(
+        &self,
+        result: &mut ValidationResult,
+        place: &str,
+        earlier: SectionRange,
+        later: SectionRange,
+    ) {
+        let first = self.sections[earlier.2].header.name_str();
+        let second = self.sections[later.2].header.name_str();
+        result.push(
+            ValidationIssue::error(
+                ValidationCode::OverlappingSections,
+                format!("Sections '{first}' and '{second}' overlap in {place}"),
+            )
+            .with_context(format!(
+                "{first}: {:#x}-{:#x}, {second}: {:#x}-{:#x}",
+                earlier.0, earlier.1, later.0, later.1
+            )),
+        );
     }
 
     /// Check the section alignment and the loaded raw data.
@@ -455,43 +493,28 @@ impl PeImage {
 
     /// Check that the virtual ranges of the sections do not overlap.
     fn validate_section_virtual_overlaps(&self, result: &mut ValidationResult) {
-        // Check for overlapping sections (RVAs).
-        for (i, s1) in self.sections.iter().enumerate() {
-            if s1.header.virtual_size.max(s1.header.size_of_raw_data) == 0 {
-                continue;
-            }
-            let s1_end = u64::from(s1.header.virtual_address)
-                + u64::from(s1.header.virtual_size.max(s1.header.size_of_raw_data));
-            for s2 in self.sections.iter().skip(i + 1) {
-                if s2.header.virtual_size.max(s2.header.size_of_raw_data) == 0 {
-                    continue;
-                }
-                let s2_end = u64::from(s2.header.virtual_address)
-                    + u64::from(s2.header.virtual_size.max(s2.header.size_of_raw_data));
-                if u64::from(s1.header.virtual_address) < s2_end
-                    && u64::from(s2.header.virtual_address) < s1_end
-                {
-                    result.push(
-                        ValidationIssue::error(
-                            ValidationCode::OverlappingSections,
-                            format!(
-                                "Sections '{}' and '{}' overlap in virtual memory",
-                                s1.header.name_str(),
-                                s2.header.name_str()
-                            ),
-                        )
-                        .with_context(format!(
-                            "{}: {:#x}-{:#x}, {}: {:#x}-{:#x}",
-                            s1.header.name_str(),
-                            s1.header.virtual_address,
-                            s1_end,
-                            s2.header.name_str(),
-                            s2.header.virtual_address,
-                            s2_end
-                        )),
-                    );
-                }
-            }
+        let ranges = self
+            .sections
+            .iter()
+            .enumerate()
+            .filter(|(_, section)| {
+                section
+                    .header
+                    .virtual_size
+                    .max(section.header.size_of_raw_data)
+                    != 0
+            })
+            .map(|(index, section)| {
+                let start = u64::from(section.header.virtual_address);
+                let size = section
+                    .header
+                    .virtual_size
+                    .max(section.header.size_of_raw_data);
+                (start, start + u64::from(size), index)
+            })
+            .collect();
+        for (earlier, later) in overlapping_ranges(ranges) {
+            self.push_overlap(result, "virtual memory", earlier, later);
         }
     }
 
@@ -575,9 +598,12 @@ impl PeImage {
             OptionalHeader::Pe32(h) => h.check_sum,
             OptionalHeader::Pe32Plus(h) => h.check_sum,
         };
-        if stored_checksum != 0 {
-            let computed = self.calculate_checksum();
-            if stored_checksum != computed {
+        if stored_checksum == 0 {
+            return;
+        }
+        // The checksum covers the serialized image. Malformed file data can stop the build.
+        match self.try_calculate_checksum() {
+            Ok(computed) if computed != stored_checksum => {
                 result.push(ValidationIssue::warning(
                     ValidationCode::InvalidChecksum,
                     format!(
@@ -585,6 +611,39 @@ impl PeImage {
                     ),
                 ));
             }
+            Ok(_) => {}
+            Err(error) => {
+                result.push(ValidationIssue::warning(
+                    ValidationCode::InvalidChecksum,
+                    format!("Checksum {stored_checksum:#x} cannot be verified: {error}"),
+                ));
+            }
         }
     }
+}
+
+/// The range of a section as `(start, end, section index)`.
+type SectionRange = (u64, u64, usize);
+
+/// Find the section ranges that overlap an earlier range.
+///
+/// The function sorts the ranges by their start. It reports each range that starts before the
+/// end of an earlier range, together with the earlier range that ends last. Thus the work is
+/// O(n log n) also for 65535 sections, and the result has fewer entries than `ranges`.
+fn overlapping_ranges(mut ranges: Vec<SectionRange>) -> Vec<(SectionRange, SectionRange)> {
+    ranges.sort_unstable();
+    let mut overlaps = Vec::new();
+    let mut widest: Option<SectionRange> = None;
+    for range in ranges {
+        if let Some(earlier) = widest {
+            if range.0 < earlier.1 {
+                overlaps.push((earlier, range));
+            }
+            if range.1 <= earlier.1 {
+                continue;
+            }
+        }
+        widest = Some(range);
+    }
+    overlaps
 }

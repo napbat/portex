@@ -60,19 +60,19 @@ fn read_from_blob(blob: &[u8], base_rva: u32, rva: u32, len: usize) -> Option<Ve
 }
 
 #[test]
-fn strict_and_lenient_raw_parsing_are_explicit() {
-    let raw = test_image().try_build().unwrap();
-    let header_size = PeHeaders::from_slice(&raw)
-        .unwrap()
-        .optional_header
-        .size_of_headers() as usize;
-    let truncated = &raw[..header_size];
+fn strict_and_lenient_mapped_parsing_are_explicit() {
+    let image = test_image();
+    let mapped = image.to_mapped_image().unwrap();
+    // A remote reader cannot read the pages of the sections.
+    let truncated = &mapped[..image.optional_header.size_of_headers() as usize];
 
-    assert!(PeImage::parse(truncated).is_err());
-    let parsed =
-        PeImage::parse_with_options(truncated, ParseOptions::file().allow_missing_section_data())
-            .unwrap();
-    assert_eq!(parsed.source_layout(), SourceLayout::File);
+    assert!(PeImage::parse_mapped(truncated).is_err());
+    let parsed = PeImage::parse_with_options(
+        truncated,
+        ParseOptions::mapped().allow_missing_section_data(),
+    )
+    .unwrap();
+    assert_eq!(parsed.source_layout(), SourceLayout::Mapped);
     assert!(
         parsed
             .sections
@@ -80,37 +80,9 @@ fn strict_and_lenient_raw_parsing_are_explicit() {
             .all(|section| section.data.is_empty())
     );
     assert_eq!(
-        ParseOptions::file().missing_section_data,
+        ParseOptions::mapped().missing_section_data,
         MissingSectionData::Error
     );
-}
-
-#[test]
-fn raw_section_with_bytes_and_zero_pointer_is_rejected() {
-    let mut raw = test_image().try_build().unwrap();
-    let headers = PeHeaders::from_slice(&raw).unwrap();
-    let first = section_table_offset(&headers);
-    raw[first + 20..first + 24].copy_from_slice(&0u32.to_le_bytes());
-    assert!(PeImage::parse(&raw).is_err());
-}
-
-#[test]
-fn optional_header_directory_count_cannot_consume_section_headers() {
-    let mut raw = test_image().try_build().unwrap();
-    let headers = PeHeaders::from_slice(&raw).unwrap();
-    let optional =
-        usize::try_from(headers.pe_offset).expect("PE offset fits usize") + 4 + CoffHeader::SIZE;
-    raw[optional + 108..optional + 112].copy_from_slice(&17u32.to_le_bytes());
-    assert!(PeImage::parse(&raw).is_err());
-}
-
-#[test]
-fn executable_image_section_limit_is_enforced() {
-    let mut raw = test_image().try_build().unwrap();
-    let pe_offset = usize::try_from(PeHeaders::from_slice(&raw).unwrap().pe_offset)
-        .expect("PE offset fits usize");
-    raw[pe_offset + 6..pe_offset + 8].copy_from_slice(&97u16.to_le_bytes());
-    assert!(PeImage::parse(&raw).is_err());
 }
 
 #[test]
@@ -232,7 +204,7 @@ fn certificates_preserve_unknown_values_and_other_overlay_bytes() {
 }
 
 #[test]
-fn misaligned_certificate_file_offset_is_rejected() {
+fn misaligned_certificate_file_offset_is_ignored_and_kept() {
     let mut file = PeFile::parse(&test_image().try_build().unwrap()).unwrap();
     file.set_security(&SecurityDirectory {
         certificates: vec![Certificate {
@@ -251,7 +223,20 @@ fn misaligned_certificate_file_offset_is_rejected() {
         usize::try_from(headers.pe_offset).expect("PE offset fits usize") + 4 + CoffHeader::SIZE;
     let entry = optional + portex::OptionalHeader64::BASE_SIZE + 4 * 8;
     raw[entry..entry + 4].copy_from_slice(&(security.virtual_address + 1).to_le_bytes());
-    assert!(PeFile::parse(&raw).is_err());
+
+    // The loader does not use the Security directory, so a bad entry does not stop the parse.
+    let mut file = PeFile::parse(&raw).unwrap();
+    assert_eq!(file.security().unwrap(), None);
+    assert_eq!(file.try_build().unwrap(), raw);
+
+    // An explicit clear removes the entry.
+    file.clear_security();
+    let cleared = PeImage::parse(&file.try_build().unwrap()).unwrap();
+    assert!(
+        !cleared
+            .data_directory(DataDirectoryType::Security)
+            .is_some_and(|directory| directory.is_present())
+    );
 }
 
 #[test]

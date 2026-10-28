@@ -125,6 +125,38 @@ pub trait ReadAt {
     }
 }
 
+/// Adapter that reads the bytes after the end of a source as zeros.
+///
+/// A PE file can end inside its headers, for example a tiny file or a data-file DLL. The header
+/// parser uses this adapter, so that it reads such headers as the Windows XP loader and the
+/// data-file loader do. The adapter knows the end only of a source that reports its size. For
+/// another source, it returns the result of the source as it is.
+pub(crate) struct ZeroPadded<'a, R> {
+    inner: &'a R,
+}
+
+impl<'a, R: ReadAt> ZeroPadded<'a, R> {
+    /// Wrap `inner`.
+    pub(crate) const fn new(inner: &'a R) -> Self {
+        Self { inner }
+    }
+}
+
+impl<R: ReadAt> ReadAt for ZeroPadded<'_, R> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let count = self.inner.read_at(offset, buf)?;
+        if count == 0 && self.inner.size().is_some_and(|size| offset >= size) {
+            buf.fill(0);
+            return Ok(buf.len());
+        }
+        Ok(count)
+    }
+
+    fn size(&self) -> Option<u64> {
+        self.inner.size()
+    }
+}
+
 /// Adapter that gives the [`ReadAt`] interface to a [`nostdio::Read`] + [`nostdio::Seek`] stream.
 ///
 /// A stream has a current position, and a read changes that position. [`ReadAt`] reads at an

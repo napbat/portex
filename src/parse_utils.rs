@@ -23,6 +23,46 @@ where
     Ok(data)
 }
 
+/// Read a table of records at an RVA in one read. Each record has `record_size` bytes.
+///
+/// The callback can return more than `size` bytes. Only the first `size` bytes are used. A
+/// shorter result is an error.
+///
+/// `size` comes from the file and can be very large. A read of each record takes time that
+/// grows with `size`. One read of the complete table takes time that grows only with the bytes
+/// that `read_at_rva` can return, because the RVA reader limits the zero bytes of one read.
+pub(crate) fn read_record_table<F>(
+    read_at_rva: &F,
+    rva: u32,
+    size: u32,
+    record_size: usize,
+    context: &str,
+) -> Result<Vec<u8>>
+where
+    F: Fn(u32, usize) -> Option<Vec<u8>>,
+{
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    // The RVA of the last record must not overflow.
+    u32::try_from(record_size)
+        .ok()
+        .and_then(|record_size| size.checked_sub(record_size))
+        .and_then(|last| rva.checked_add(last))
+        .ok_or_else(|| Error::invalid_data_directory(format!("{context} RVA overflow")))?;
+    let len = usize::try_from(size)
+        .map_err(|_| Error::invalid_data_directory(format!("{context} size overflow")))?;
+    let mut data = read_at_rva(rva, len).ok_or_else(|| Error::invalid_rva(rva))?;
+    if data.len() < len {
+        return Err(Error::invalid_data_directory(format!(
+            "{context} returned {} bytes, expected {len}",
+            data.len()
+        )));
+    }
+    data.truncate(len);
+    Ok(data)
+}
+
 /// Read a required null-terminated UTF-8 string at an RVA.
 ///
 /// `max_len` is a limit only: the image does not have to contain `max_len` bytes after the

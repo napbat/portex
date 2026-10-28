@@ -108,6 +108,52 @@ pub fn headers_size_at(
         .and_then(|size| size.checked_add(section_table_size))
 }
 
+/// Calculate the end of the NT headers for a PE signature at the file offset `pe_offset`.
+///
+/// `declared_optional_size` is `SizeOfOptionalHeader`: the distance from the start of the
+/// optional header to the section table. `optional_size` is the size of the optional header with
+/// its data directories. If `optional_size` is larger, the optional header overlaps the section
+/// table. The NT headers end after the section table or after the optional header, whichever is
+/// later.
+pub(crate) fn nt_headers_end(
+    pe_offset: usize,
+    num_sections: usize,
+    declared_optional_size: usize,
+    optional_size: usize,
+) -> Option<usize> {
+    let table_end = headers_size_at(pe_offset, num_sections, declared_optional_size)?;
+    let optional_end = headers_size_at(pe_offset, 0, optional_size)?;
+    Some(table_end.max(optional_end))
+}
+
+/// The unit to which the loader rounds down `PointerToRawData`.
+const LOADER_RAW_UNIT: u32 = 0x200;
+
+/// Return the file offset where the loader reads the raw data of a section.
+///
+/// If `FileAlignment` is 0x200 or more, the loader rounds `PointerToRawData` down to a multiple of
+/// 0x200. With a smaller (low) `FileAlignment`, the loader uses the value as it is.
+pub(crate) fn loader_raw_offset(pointer_to_raw_data: u32, file_alignment: u32) -> u32 {
+    if file_alignment >= LOADER_RAW_UNIT {
+        pointer_to_raw_data & !(LOADER_RAW_UNIT - 1)
+    } else {
+        pointer_to_raw_data
+    }
+}
+
+/// Convert an RVA in a section to the file offset where the loader reads the byte.
+///
+/// The result is `None` if the RVA is not in the raw data of the section.
+pub(crate) fn section_rva_to_file_offset(
+    header: &SectionHeader,
+    rva: u32,
+    file_alignment: u32,
+) -> Option<u32> {
+    let rounding =
+        header.pointer_to_raw_data - loader_raw_offset(header.pointer_to_raw_data, file_alignment);
+    header.rva_to_offset(rva)?.checked_sub(rounding)
+}
+
 /// Calculate the section layout again (RVAs and file offsets).
 ///
 /// Returns the total file size.
@@ -175,9 +221,11 @@ pub fn try_layout_sections(
 
         // `VirtualSize` does not include raw file padding. Keep the parsed value, unless the
         // data grew past the old raw extent. This also keeps BSS sections (`VirtualSize` > 0,
-        // no raw bytes) intact.
+        // no raw bytes) intact. A `VirtualSize` of 0 makes the old `SizeOfRawData` the virtual
+        // extent, so keep that extent also if the data is shorter, for example after the end of
+        // the file.
         let virtual_size = if section.header.virtual_size == 0 {
-            data_size
+            data_size.max(old_raw_size)
         } else if data_size > old_raw_size {
             section.header.virtual_size.max(data_size)
         } else {
@@ -281,6 +329,19 @@ pub fn try_calculate_size_of_image(sections: &[Section], config: &LayoutConfig) 
             })
         })
         .try_fold(0u32, |maximum, size| size.map(|size| maximum.max(size)))
+}
+
+/// Calculate `SizeOfImage` for sections that follow headers of `size_of_headers` bytes.
+///
+/// The image always maps the complete headers, also if no section follows them.
+pub(crate) fn try_calculate_size_of_image_with_headers(
+    sections: &[Section],
+    config: &LayoutConfig,
+    size_of_headers: u32,
+) -> Result<u32> {
+    let headers_end = checked_align_up(size_of_headers, config.section_alignment)
+        .ok_or_else(|| Error::invalid_section("SizeOfHeaders exceeds u32 after alignment"))?;
+    Ok(try_calculate_size_of_image(sections, config)?.max(headers_end))
 }
 
 #[cfg(test)]

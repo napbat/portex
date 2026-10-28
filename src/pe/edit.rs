@@ -287,15 +287,42 @@ impl PeImage {
     /// The update is atomic. If an address, a size or an aggregate overflows, the function does
     /// not change the image.
     ///
+    /// The update changes the header structures in these conditions:
+    ///
+    /// - `SizeOfOptionalHeader` grows to the size of the optional header, so that the section
+    ///   table follows the optional header.
+    /// - If the NT headers overlap the DOS header, and a new layout field changes the bytes of
+    ///   `e_lfanew`, the NT headers move to offset 64 (`e_lfanew` = 0x40).
+    ///
     /// # Errors
     ///
     /// Returns an error in these conditions:
     /// - The `SectionAlignment` or the `FileAlignment` of the optional header is invalid.
     /// - The image has more than [`MAX_NUMBER_OF_SECTIONS`] sections.
-    /// - The file offset `e_lfanew` puts the PE header inside the DOS header.
+    /// - `e_lfanew` is smaller than 2, so that the PE signature overlaps `e_magic`.
     /// - A header size, a section address, a section size or an aggregate size overflows its
     ///   field.
     pub fn try_update_layout(&mut self) -> Result<()> {
+        if usize::try_from(self.dos_header.e_lfanew)
+            .is_ok_and(|pe_offset| pe_offset < DosHeader::SIZE)
+        {
+            // NT headers that overlap the DOS header are rare, so a copy costs little here.
+            let mut updated = self.clone();
+            updated.update_layout_fields()?;
+            if !updated.nt_headers_keep_e_lfanew() {
+                updated.clone_from(self);
+                updated.dos_header.e_lfanew = DOS_HEADER_END;
+                updated.update_layout_fields()?;
+            }
+            *self = updated;
+            return Ok(());
+        }
+        self.update_layout_fields()
+    }
+
+    /// Recalculate the layout for the current `e_lfanew`. This is the atomic part of
+    /// [`Self::try_update_layout`].
+    fn update_layout_fields(&mut self) -> Result<()> {
         let config = LayoutConfig::from_optional_header(&self.optional_header);
         validate_layout_config(&config)?;
         if self.sections.len() > MAX_NUMBER_OF_SECTIONS {
@@ -308,20 +335,28 @@ impl PeImage {
         // Calculate the size of the headers.
         let pe_offset = usize::try_from(self.dos_header.e_lfanew)
             .map_err(|_| Error::invalid_section("e_lfanew is negative"))?;
-        if pe_offset < DosHeader::SIZE {
-            return Err(Error::invalid_section(
-                "e_lfanew places the PE header inside the DOS header",
-            ));
+        if pe_offset < DosHeader::MIN_PE_OFFSET {
+            return Err(Error::invalid_section(format!(
+                "e_lfanew {pe_offset:#x} is smaller than {:#x}: the PE signature overlaps e_magic",
+                DosHeader::MIN_PE_OFFSET
+            )));
         }
         let actual_optional_size = self.optional_header.size();
         let declared_optional_size = usize::from(self.coff_header.size_of_optional_header);
         let serialized_optional_size = actual_optional_size.max(declared_optional_size);
         let serialized_optional_size_u16 = u16::try_from(serialized_optional_size)
             .map_err(|_| Error::invalid_section("optional header exceeds u16"))?;
-        let headers_size =
+        let table_end =
             layout::headers_size_at(pe_offset, self.sections.len(), serialized_optional_size)
-                .and_then(|size| u32::try_from(size).ok())
                 .ok_or_else(|| Error::invalid_section("header table exceeds u32"))?;
+        // Keep the header tail at its offset: data directories refer to it by RVA. A section
+        // table that grows into the tail replaces the tail.
+        let drops_tail =
+            !self.header_tail.bytes.is_empty() && self.header_tail_after(table_end).is_none();
+        let headers_size = self
+            .header_data_end(table_end)
+            .and_then(|size| u32::try_from(size).ok())
+            .ok_or_else(|| Error::invalid_section("header table exceeds u32"))?;
         let size_of_headers = layout::checked_align_up(headers_size, config.file_alignment)
             .ok_or_else(|| Error::invalid_section("SizeOfHeaders exceeds u32"))?;
 
@@ -330,7 +365,8 @@ impl PeImage {
         layout::try_layout_sections(&mut sections, &config, headers_size)?;
 
         // Update `SizeOfImage`.
-        let size_of_image = layout::try_calculate_size_of_image(&sections, &config)?;
+        let size_of_image =
+            layout::try_calculate_size_of_image_with_headers(&sections, &config, size_of_headers)?;
         let aggregates = calculate_optional_layout_fields(&sections)?;
         let section_count = u16::try_from(sections.len())
             .map_err(|_| Error::invalid_section("section count exceeds u16"))?;
@@ -338,6 +374,9 @@ impl PeImage {
             .map_err(|_| Error::invalid_data_directory("data-directory count exceeds u32"))?;
 
         self.sections = sections;
+        if drops_tail {
+            self.drop_header_tail();
+        }
         self.set_size_of_headers(size_of_headers);
         self.set_size_of_image(size_of_image);
         self.apply_optional_layout_fields(aggregates, directory_count);
@@ -346,6 +385,23 @@ impl PeImage {
         self.coff_header.number_of_sections = section_count;
         self.coff_header.size_of_optional_header = serialized_optional_size_u16;
         Ok(())
+    }
+
+    /// Remove the header tail after the section table grows into it.
+    ///
+    /// The section table replaces the start of the tail. If the `BoundImport` directory points
+    /// into the tail, clear the directory. The loader then resolves the imports without the
+    /// bound import table.
+    fn drop_header_tail(&mut self) {
+        use crate::data_dir::DataDirectoryType;
+
+        let tail = core::mem::take(&mut self.header_tail);
+        if self
+            .data_directory(DataDirectoryType::BoundImport)
+            .is_some_and(|directory| tail.contains_rva(directory.virtual_address))
+        {
+            self.clear_data_directory(DataDirectoryType::BoundImport);
+        }
     }
 
     fn apply_optional_layout_fields(&mut self, fields: OptionalLayoutFields, count: u32) {
@@ -579,3 +635,6 @@ fn minimum_nonzero(current: u32, candidate: u32) -> u32 {
         current.min(candidate)
     }
 }
+
+/// The value of `e_lfanew` for NT headers directly after the DOS header.
+const DOS_HEADER_END: i32 = 0x40;

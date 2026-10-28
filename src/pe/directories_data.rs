@@ -34,7 +34,8 @@ impl PeImage {
     /// Update the bound imports.
     ///
     /// The function first tries to replace the data in place. If the data does not fit, the
-    /// function appends it to the target section.
+    /// function appends it to the target section. If the old table is in the header bytes after
+    /// the section table, the function also removes it from these bytes.
     ///
     /// Bound imports are a legacy optimization: the linker resolves the import addresses at link
     /// time. Returns the RVA of the written bound import data. Returns 0 if `directory` has no
@@ -107,6 +108,11 @@ impl PeImage {
         let append_rva = self.prepare_section_append(section_idx)?;
 
         self.commit_section_append(section_idx, append_rva, &data)?;
+        // The old table can be in the header bytes after the section table. Remove it there.
+        if let Some(dir) = existing_dir {
+            self.header_tail
+                .clear_rva_range(dir.virtual_address, dir.size);
+        }
         self.set_data_directory(DataDirectoryType::BoundImport, append_rva, encoded_size);
 
         Ok(append_rva)
@@ -148,7 +154,8 @@ impl PeImage {
         );
         match dir {
             Some(d) => {
-                let read_fn = |rva: u32, len: usize| -> Option<Vec<u8>> { self.read_rva(rva, len) };
+                let reader = self.rva_reader();
+                let read_fn = |rva: u32, len: usize| reader.read(rva, len);
                 crate::delay_import::DelayImportDirectory::parse_sized_with_image_base(
                     d.virtual_address,
                     d.size,
@@ -277,7 +284,8 @@ impl PeImage {
             .filter(|d| d.is_present());
         match dir {
             Some(d) => {
-                let read_fn = |rva: u32, len: usize| -> Option<Vec<u8>> { self.read_rva(rva, len) };
+                let reader = self.rva_reader();
+                let read_fn = |rva: u32, len: usize| reader.read(rva, len);
                 crate::resource::ResourceDirectory::parse(d.virtual_address, d.size, read_fn)
             }
             None => Ok(crate::resource::ResourceDirectory::default()),
@@ -301,7 +309,8 @@ impl PeImage {
             .filter(|d| d.is_present());
         match dir {
             Some(d) => {
-                let read_fn = |rva: u32, len: usize| -> Option<Vec<u8>> { self.read_rva(rva, len) };
+                let reader = self.rva_reader();
+                let read_fn = |rva: u32, len: usize| reader.read(rva, len);
                 crate::resource::ResourceDirectory::parse_with_data(
                     d.virtual_address,
                     d.size,

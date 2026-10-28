@@ -23,7 +23,11 @@ a different source offset.
 - Rich headers, the CLR/CLI header of the PE image, and the raw metadata blob.
 - Lossless round trips of raw files through `PeFile`. When the layout does not change, `PeFile`
   keeps noncanonical gaps, certificate bytes and overlays.
-- Strict checks for malformed input, fallible builders, and structural validation.
+- Parsing of malformed input for PE tooling: headers that end early, overlapping header
+  structures and garbage fields still parse, and `validate()` reports the problems. Fallible
+  builders, with no panics on file data.
+- Normalization of malformed files through `PeFile::normalize`, with no change to how the
+  loader maps the image.
 - Sequential I/O and positional I/O.
 - `no_std + alloc` support. Sequential I/O uses
   [`nostdio`](https://github.com/coconutbird/nostdio). Positional `ReadAt` access is also
@@ -39,17 +43,17 @@ Portex does not parse CLR metadata streams or tables. To parse them, give
 
 ```toml
 [dependencies]
-portex = "0.4"
+portex = "0.5"
 ```
 
 For `no_std + alloc`:
 
 ```toml
 [dependencies]
-portex = { version = "0.4", default-features = false }
+portex = { version = "0.5", default-features = false }
 ```
 
-Portex 0.4 requires Rust 1.88 or newer.
+Portex 0.5 requires Rust 1.88 or newer.
 
 The default `std` feature adds filesystem helpers and `FileReader`. It also enables the `std`
 feature of `nostdio`. Then the `nostdio` traits and `nostdio::IoError` are the `std::io` items,
@@ -135,6 +139,86 @@ PeImage::read_mapped_from(&reader, source_offset, runtime_image_base)
 
 `PeHeaders::rva_to_source_offset` does the same layout-aware translation. It does not read all
 sections.
+
+## Normalize a malformed file
+
+`PeFile::normalize` sets malformed header fields and the file layout to normal values:
+
+- It moves NT headers that overlap the DOS header, and a section table that overlaps the
+  optional header.
+- It sets an unknown `Magic`, invalid alignments, `NumberOfRvaAndSizes` and the reserved data
+  directories to valid values.
+- It gives each section its own aligned raw range, and calculates `SizeOfHeaders`,
+  `SizeOfImage` and the size fields again. It corrects a wrong nonzero checksum.
+
+The loader view stays the same. The loader view is:
+
+- the section RVAs, virtual sizes and characteristics;
+- the section bytes that the loader maps, from the loader raw offset up to the
+  `FileAlignment`-aligned raw end, limited to the aligned virtual size;
+- the aligned header size, which is `SizeOfHeaders` aligned to a valid `SectionAlignment`;
+- the header bytes at the entry point and at each data directory. A data directory range
+  starts at its RVA and ends at the first section, whatever its size;
+- the header bytes that the followed structures refer to;
+- the nonzero header bytes after the section table.
+
+The followed structures are the structures that the loader reads through RVAs:
+
+- the import descriptor array, up to and including the null descriptor;
+- for each import descriptor, the DLL name with its NUL, and the `OriginalFirstThunk` and
+  `FirstThunk` arrays, up to and including the null thunk;
+- each hint/name entry: 2 bytes, the name and the NUL;
+- the same items for the delay-import table;
+- the TLS callback array, up to and including the null entry.
+
+The method checks only these indirect references. If the import or delay-import table does not
+parse, the bytes from the RVA of that directory to the end of the address space are protected.
+
+The loader maps `SizeOfHeaders` header bytes, or the whole file with a low `SectionAlignment`.
+
+The method builds each candidate with `PeFile::try_build`, parses the output again, and
+compares it with the built original. It keeps the first candidate that keeps the loader view.
+If no candidate does, the fields and the layout of the file stay. The checksum fix uses the
+same check. The method does not use a candidate that would make a valid checksum wrong.
+`calculate_checksum` matches the Windows `CheckSumMappedFile` function, also when the checksum
+field is at an odd file offset. For each rejected fix, the method names the reason in
+`Normalization::kept`:
+
+- `HeaderBytesInUse`: the candidate changes header bytes that the image refers to.
+- `SectionData`: the candidate changes or drops section bytes.
+- `SectionAddresses`: the candidate changes a section RVA, virtual size or characteristics,
+  or the aligned header size.
+- `LowAlignment`: `SectionAlignment` is smaller than a page, so the file layout stays.
+- `Alignment`: `SectionAlignment` is invalid, and no valid value keeps all section RVAs.
+- `Layout(String)`: the method cannot make a new layout.
+- `Build(String)`: the candidate does not build or parse.
+- `Checksum`: the checksum fix changes the loader view or does not build. A wrong checksum
+  stays, or the method does not use the candidate that needs the fix.
+
+After a new layout, the build rebases the `PointerToRawData` file offsets of the
+`IMAGE_DEBUG_DIRECTORY` entries. `changes` reports this as `NormalizeChange::DebugPointers`.
+The method uses a new layout only if each such field is in a section without
+`IMAGE_SCN_CNT_CODE` or `IMAGE_SCN_MEM_EXECUTE`. Each field must also be outside the other data
+directories and outside the followed structures. Otherwise, the layout stays, and `kept` names
+`SectionData`.
+
+`NormalizeChange::HeaderTail` means that the section table grows into the header bytes after
+it, and the build drops these bytes. The method allows this only for a bound import table. The
+`BoundImport` data directory entry then becomes zero.
+
+```rust,no_run
+use portex::PeFile;
+
+# let damaged: &[u8] = &[];
+let mut file = PeFile::parse(damaged)?;
+let result = file.normalize()?;
+println!("changed: {:?}", result.changes);
+println!("kept: {:?}", result.kept);
+let normalized = file.try_build()?;
+# Ok::<(), portex::Error>(())
+```
+
+A change invalidates an Authenticode signature. The overlay and the certificate table stay.
 
 ## Sequential and positional I/O
 

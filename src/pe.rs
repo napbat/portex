@@ -81,15 +81,19 @@ pub enum SourceLayout {
 }
 
 /// The policy for section bytes that the parser cannot read from the source.
+///
+/// In the file layout, the end of a source that reports its size is not a read failure: raw
+/// data after it reads as zeros, as the loader maps it. The policy applies to the other read
+/// failures, and to the mapped layout.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MissingSectionData {
-    /// Reject section ranges that are truncated or that the parser cannot read.
+    /// Reject section ranges that the parser cannot read.
     #[default]
     Error,
     /// Keep the section header, and give the section empty data for the missing bytes.
     ///
     /// Use this for remote mapped images. In such images, the pages of discardable sections
-    /// can be decommitted.
+    /// can be decommitted. RVA reads do not read the missing bytes as zeros.
     Empty,
 }
 
@@ -105,7 +109,7 @@ pub struct ParseOptions {
 }
 
 impl ParseOptions {
-    /// Return options for strict parsing of a raw file.
+    /// Return the default options for a raw file.
     #[must_use]
     pub const fn file() -> Self {
         Self {
@@ -115,7 +119,7 @@ impl ParseOptions {
         }
     }
 
-    /// Return options for strict parsing of a loader-mapped image.
+    /// Return the default options for a loader-mapped image.
     #[must_use]
     pub const fn mapped() -> Self {
         Self {
@@ -147,7 +151,10 @@ impl Default for ParseOptions {
 }
 
 /// The maximum number of sections that the Windows image loader accepts.
-pub const MAX_NUMBER_OF_SECTIONS: usize = 96;
+///
+/// Windows Vista and later accept up to 65535 sections, the range of `NumberOfSections`. The
+/// loader of Windows XP accepts only 96.
+pub const MAX_NUMBER_OF_SECTIONS: usize = 65535;
 
 /// A parsed PE file that owns its section data.
 ///
@@ -166,6 +173,71 @@ pub struct PeImage {
     pub sections: Vec<Section>,
     pub(crate) source_layout: SourceLayout,
     pub(crate) runtime_image_base: Option<u64>,
+    /// The raw bytes after the section table.
+    ///
+    /// Linkers can put data there, for example the bound import table.
+    pub(crate) header_tail: HeaderBytes,
+    /// The raw bytes after the optional header and before the section table, if
+    /// `SizeOfOptionalHeader` is larger than the optional header.
+    ///
+    /// A file can put other data there, for example the raw data of a section.
+    pub(crate) optional_padding: HeaderBytes,
+}
+
+/// Raw header bytes that no header structure describes.
+///
+/// The bytes keep their offset, because data directories and section headers can refer to them.
+/// In the headers, a file offset and an RVA have the same value.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct HeaderBytes {
+    /// The offset of the first byte from the start of the image.
+    pub(crate) offset: usize,
+    /// The bytes, without trailing zeros.
+    pub(crate) bytes: Vec<u8>,
+}
+
+impl HeaderBytes {
+    /// Return the offset after the last byte, or `None` on overflow.
+    pub(crate) fn end(&self) -> Option<usize> {
+        self.offset.checked_add(self.bytes.len())
+    }
+
+    /// Return `true` if the RVA `rva` is in the tail bytes.
+    pub(crate) fn contains_rva(&self, rva: u32) -> bool {
+        usize::try_from(rva)
+            .ok()
+            .and_then(|rva| rva.checked_sub(self.offset))
+            .is_some_and(|index| index < self.bytes.len())
+    }
+
+    /// Set the tail bytes in an RVA range to zero.
+    ///
+    /// The part of the range outside the tail has no effect.
+    pub(crate) fn clear_rva_range(&mut self, rva: u32, size: u32) {
+        let Some(start) = usize::try_from(rva)
+            .ok()
+            .and_then(|rva| rva.checked_sub(self.offset))
+            .filter(|start| *start < self.bytes.len())
+        else {
+            return;
+        };
+        let end = usize::try_from(size)
+            .ok()
+            .and_then(|size| start.checked_add(size))
+            .map_or(self.bytes.len(), |end| end.min(self.bytes.len()));
+        self.bytes[start..end].fill(0);
+        self.trim_trailing_zeros();
+    }
+
+    /// Remove the zero bytes at the end. The build writes zeros there without the tail.
+    pub(crate) fn trim_trailing_zeros(&mut self) {
+        let used = self
+            .bytes
+            .iter()
+            .rposition(|byte| *byte != 0)
+            .map_or(0, |last| last + 1);
+        self.bytes.truncate(used);
+    }
 }
 
 /// The PE headers without the section data.
@@ -191,6 +263,10 @@ mod directories_runtime;
 mod edit;
 mod headers;
 mod inspect;
+mod normalize;
 mod parse;
 mod utilities;
 mod validate;
+
+pub(crate) use normalize::{LoaderView, check_sum, normalize_changes, set_check_sum};
+pub use normalize::{Normalization, NormalizeChange, NormalizeKept};
