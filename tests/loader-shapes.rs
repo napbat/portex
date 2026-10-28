@@ -608,7 +608,8 @@ fn a_directory_that_crosses_two_sections_parses() {
 
 /// Build a file with data directory `index` of `size` bytes at the start of `.rdata`.
 ///
-/// The `.rdata` section has 0x200 bytes of raw data, a `VirtualSize` of 0xFFFF0000, and a
+/// The builder gets 0x180 bytes of `.rdata` and aligns its raw data to 0x200 bytes. The section
+/// has a `VirtualSize` of 0xFFFF0000, and a
 /// `SizeOfImage` that covers it. Thus the loader fills almost 4 GiB of the section with zeros.
 fn zero_filled_directory(machine: MachineType, index: usize, size: u32) -> Vec<u8> {
     let mut raw = PeBuilder::new()
@@ -622,7 +623,6 @@ fn zero_filled_directory(machine: MachineType, index: usize, size: u32) -> Vec<u
     let headers = PeHeaders::from_slice(&raw).unwrap();
     let optional = optional_offset(&headers);
     let rdata = headers.section_headers[1].virtual_address;
-    put32(&mut raw, optional + 32, 0xffff_0000);
     put32(&mut raw, optional + 56, 0xffff_f000);
     put32(
         &mut raw,
@@ -636,7 +636,7 @@ fn zero_filled_directory(machine: MachineType, index: usize, size: u32) -> Vec<u
 }
 
 #[test]
-fn a_huge_zero_filled_exception_table_is_one_bounded_read() {
+fn a_huge_zero_filled_exception_table_is_an_invalid_data_directory() {
     // Before the fix, the parse read each 12-byte or 8-byte record separately. It made
     // hundreds of millions of reads for this size.
     let exception = DataDirectoryType::Exception as usize;
@@ -656,7 +656,7 @@ fn a_huge_zero_filled_exception_table_is_one_bounded_read() {
 }
 
 #[test]
-fn a_huge_zero_filled_debug_directory_is_one_bounded_read() {
+fn a_huge_zero_filled_debug_directory_is_an_invalid_data_directory() {
     // Before the fix, the parse read each 28-byte entry separately, and kept each zero entry.
     // It made about 153 million reads and entries for this size.
     let debug = DataDirectoryType::Debug as usize;

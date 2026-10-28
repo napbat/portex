@@ -302,10 +302,14 @@ impl DebugInfo {
     ///
     /// `debug_size` is the size of the directory in bytes. `read_at_rva` reads bytes at an RVA.
     ///
+    /// The function calls `read_at_rva` one time for the complete directory table. For this
+    /// call, `len` can be as large as `debug_size`. The callback must return at least `len`
+    /// bytes. Extra bytes are ignored.
+    ///
     /// # Errors
     /// Returns an error if one of these conditions occurs:
     /// - The directory size is not a multiple of 28.
-    /// - An entry cannot be read or is invalid.
+    /// - The table cannot be read, or an entry is invalid.
     /// - A payload length does not match.
     /// - A CodeView RSDS record is malformed.
     pub fn parse<F>(debug_rva: u32, debug_size: u32, read_at_rva: F) -> Result<Self>
@@ -329,7 +333,8 @@ impl DebugInfo {
     /// Parse the debug directory of a raw file at RVA `debug_rva`.
     ///
     /// If an entry has no mapped RVA, the function reads its payload at `PointerToRawData` (a
-    /// file offset) through `read_at_file_offset`.
+    /// file offset) through `read_at_file_offset`. The note about `read_at_rva` in
+    /// [`Self::parse`] applies also to this function.
     ///
     /// # Errors
     /// Returns an error for the same conditions as [`Self::parse`].

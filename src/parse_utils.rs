@@ -25,6 +25,9 @@ where
 
 /// Read a table of records at an RVA in one read. Each record has `record_size` bytes.
 ///
+/// The callback can return more than `size` bytes. Only the first `size` bytes are used. A
+/// shorter result is an error.
+///
 /// `size` comes from the file and can be very large. A read of each record takes time that
 /// grows with `size`. One read of the complete table takes time that grows only with the bytes
 /// that `read_at_rva` can return, because the RVA reader limits the zero bytes of one read.
@@ -47,7 +50,17 @@ where
         .and_then(|record_size| size.checked_sub(record_size))
         .and_then(|last| rva.checked_add(last))
         .ok_or_else(|| Error::invalid_data_directory(format!("{context} RVA overflow")))?;
-    read_exact_rva(read_at_rva, rva, size as usize, context)
+    let len = usize::try_from(size)
+        .map_err(|_| Error::invalid_data_directory(format!("{context} size overflow")))?;
+    let mut data = read_at_rva(rva, len).ok_or_else(|| Error::invalid_rva(rva))?;
+    if data.len() < len {
+        return Err(Error::invalid_data_directory(format!(
+            "{context} returned {} bytes, expected {len}",
+            data.len()
+        )));
+    }
+    data.truncate(len);
+    Ok(data)
 }
 
 /// Read a required null-terminated UTF-8 string at an RVA.

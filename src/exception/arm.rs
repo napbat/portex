@@ -77,6 +77,10 @@ pub struct PackedExceptionDirectory {
 impl PackedExceptionDirectory {
     /// Parse an ARM-family `.pdata` table.
     ///
+    /// The function calls `read_at_rva` one time for the complete table. For this call, `len`
+    /// can be as large as `pdata_size`. The callback must return at least `len` bytes. Extra
+    /// bytes are ignored.
+    ///
     /// # Errors
     /// Returns an error if `pdata_size` is not a multiple of the record size
     /// or the table cannot be read.

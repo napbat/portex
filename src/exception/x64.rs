@@ -75,6 +75,10 @@ impl ExceptionDirectory {
     ///
     /// `pdata_rva` is the RVA of the table. `read_at_rva` reads bytes at an RVA.
     ///
+    /// The function calls `read_at_rva` one time for the complete table. For this call, `len`
+    /// can be as large as `pdata_size`. The callback must return at least `len` bytes. Extra
+    /// bytes are ignored.
+    ///
     /// # Errors
     /// Returns an error in these conditions:
     /// - `pdata_size` is not a multiple of the record size.
@@ -279,5 +283,39 @@ mod tests {
         let size = u32::MAX - u32::MAX % 12;
         let result = ExceptionDirectory::parse(0x1000, size, |_, _| None);
         assert!(result.is_err());
+    }
+
+    fn two_function_table() -> Vec<u8> {
+        let mut dir = ExceptionDirectory::default();
+        dir.add_function(0x1000, 0x1100, 0x2000);
+        dir.add_function(0x1200, 0x1300, 0x2100);
+        dir.to_bytes()
+    }
+
+    /// Parse the table with a callback that returns `len` bytes changed by `extra`.
+    fn parse_with_length_change(bytes: &[u8], extra: isize) -> Result<ExceptionDirectory> {
+        let mut padded = bytes.to_vec();
+        padded.resize(bytes.len() + 16, 0xcc);
+        let size = u32::try_from(bytes.len()).unwrap();
+        ExceptionDirectory::parse(0, size, |rva, len| {
+            let start = usize::try_from(rva).ok()?;
+            let end = start.checked_add(len.checked_add_signed(extra)?)?;
+            padded.get(start..end).map(<[u8]>::to_vec)
+        })
+    }
+
+    #[test]
+    fn a_longer_callback_result_is_truncated_to_the_table_size() {
+        let bytes = two_function_table();
+        let exact = parse_with_length_change(&bytes, 0).unwrap();
+        let longer = parse_with_length_change(&bytes, 7).unwrap();
+        assert_eq!(longer, exact);
+        assert_eq!(longer.len(), 2);
+    }
+
+    #[test]
+    fn a_shorter_callback_result_is_an_error() {
+        let bytes = two_function_table();
+        assert!(parse_with_length_change(&bytes, -1).is_err());
     }
 }
