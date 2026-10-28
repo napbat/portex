@@ -131,6 +131,38 @@ fn a_directory_size_does_not_limit_the_referenced_header_bytes() {
 }
 
 #[test]
+fn an_import_name_in_the_headers_keeps_its_bytes() {
+    let mut raw = test_image().try_build().unwrap();
+    let optional = optional_offset(&raw);
+    // The DLL name is in the Architecture entry. The NUL is the first byte of GlobalPtr.
+    let architecture = optional + 112 + 7 * 8;
+    let name = b"evil.dll\0";
+    raw[architecture..architecture + name.len()].copy_from_slice(name);
+    // One import descriptor at the start of `.rdata`, then the null descriptor. The FirstThunk
+    // array has one ordinal import and the null thunk.
+    let rdata = section_header_offset(&raw, 1);
+    let rva = get32(&raw, rdata + 12);
+    let start = usize::try_from(get32(&raw, rdata + 20)).unwrap();
+    raw[start..start + 0x50].fill(0);
+    put32(&mut raw, start + 12, u32::try_from(architecture).unwrap());
+    put32(&mut raw, start + 16, rva + 0x40);
+    put32(&mut raw, start + 0x40, 1);
+    put32(&mut raw, start + 0x44, 0x8000_0000);
+    let import = optional + 112 + 8;
+    put32(&mut raw, import, rva);
+    put32(&mut raw, import + 4, 0x28);
+    put32(&mut raw, optional + 64, 0);
+    assert_eq!(PeFile::parse(&raw).unwrap().try_build().unwrap(), raw);
+
+    // The fields-only candidate would make the Architecture entry zero, and so the DLL name.
+    let mut file = PeFile::parse(&raw).unwrap();
+    let result = file.normalize().unwrap();
+    assert_eq!(result.changes, []);
+    assert_eq!(result.kept, [NormalizeKept::HeaderBytesInUse]);
+    assert_eq!(file.try_build().unwrap(), raw);
+}
+
+#[test]
 fn nonzero_bytes_after_the_section_table_keep_the_headers() {
     let mut raw = test_image().try_build().unwrap();
     move_nt_headers_into_the_dos_header(&mut raw);

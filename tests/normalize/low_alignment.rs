@@ -193,3 +193,51 @@ fn a_header_reference_after_size_of_headers_is_kept_with_a_low_alignment() {
     );
     assert_eq!(file.try_build().unwrap(), raw);
 }
+
+/// A section without raw bytes does not end the header bytes. Here the only section has RVA 0
+/// and `PointerToRawData` 0, so the loader maps the headers over the whole file. The entry point
+/// is code in the Architecture entry.
+#[test]
+fn a_section_without_raw_bytes_does_not_end_the_headers() {
+    let mut raw = PeBuilder::new()
+        .machine(MachineType::Amd64)
+        .file_alignment(0x200)
+        .section_alignment(0x200)
+        .add_section(".text", vec![0xcc; 0x180], characteristics::READ)
+        .try_build()
+        .unwrap()
+        .try_build()
+        .unwrap();
+    let size = u32::try_from(raw.len()).unwrap();
+    let optional = optional_offset(&raw);
+    let architecture = optional + 112 + DataDirectoryType::Architecture.as_index() * 8;
+    raw[architecture..architecture + 4].copy_from_slice(&[0x90, 0x90, 0x90, 0xc3]);
+    put32(
+        &mut raw,
+        optional + 16,
+        u32::try_from(architecture).unwrap(),
+    );
+    put32(&mut raw, optional + 56, size);
+    put32(&mut raw, optional + 64, 0);
+    let section = section_header_offset(&raw, 0);
+    put32(&mut raw, section + 8, size);
+    put32(&mut raw, section + 12, 0);
+    put32(&mut raw, section + 16, size);
+    put32(&mut raw, section + 20, 0);
+    assert_eq!(PeFile::parse(&raw).unwrap().try_build().unwrap(), raw);
+
+    // The fields-only candidate would make the entry bytes zero.
+    let mut file = PeFile::parse(&raw).unwrap();
+    let result = file.normalize().unwrap();
+    assert_eq!(result.changes, []);
+    assert_eq!(
+        result.kept,
+        [NormalizeKept::LowAlignment, NormalizeKept::HeaderBytesInUse]
+    );
+    let normalized = file.try_build().unwrap();
+    assert_eq!(normalized, raw);
+    assert_eq!(
+        normalized[architecture..architecture + 4],
+        [0x90, 0x90, 0x90, 0xc3]
+    );
+}

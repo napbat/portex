@@ -496,18 +496,33 @@ impl PeFile {
     ///
     /// - the section RVAs, virtual sizes and characteristics;
     /// - the section bytes that the loader maps, from the raw offset up to the
-    ///   `FileAlignment`-aligned raw end;
+    ///   `FileAlignment`-aligned raw end, limited to the aligned virtual size;
     /// - the aligned size of the headers, if `SectionAlignment` is valid;
     /// - the header bytes at the entry point and at each data directory;
+    /// - the header bytes that the followed structures refer to;
     /// - the nonzero header bytes after the section table.
+    ///
+    /// The followed structures are the structures that the loader reads through RVAs:
+    ///
+    /// - the import descriptor array, up to and including the null descriptor;
+    /// - for each import descriptor, the DLL name with its NUL, and the `OriginalFirstThunk`
+    ///   and `FirstThunk` arrays, up to and including the null thunk;
+    /// - each hint/name entry: 2 bytes, the name and the NUL;
+    /// - the same items for the delay-import table;
+    /// - the TLS callback array, up to and including the null entry.
+    ///
+    /// The method checks only these indirect references. If the import or delay-import table
+    /// does not parse, the bytes from the RVA of that directory to the end of the address
+    /// space are protected.
     ///
     /// The only accepted change to section bytes is the rebase of the `PointerToRawData` file
     /// offsets of the `IMAGE_DEBUG_DIRECTORY` entries. The entries must be in a section without
-    /// `IMAGE_SCN_CNT_CODE` or `IMAGE_SCN_MEM_EXECUTE`, and outside other data directories.
+    /// `IMAGE_SCN_CNT_CODE` or `IMAGE_SCN_MEM_EXECUTE`, outside other data directories, and
+    /// outside the followed structures.
     /// [`Normalization::changes`] reports it as [`NormalizeChange::DebugPointers`].
     ///
-    /// The method corrects a wrong nonzero checksum only if the fix keeps the loader view. It
-    /// does not use a candidate that would make a valid checksum wrong.
+    /// The method corrects a wrong nonzero checksum only if the fix keeps the loader view and
+    /// builds. It does not use a candidate that would make a valid checksum wrong.
     /// [`Normalization::kept`] names the fixes that the method does not make. The overlay and
     /// the certificate table stay.
     ///

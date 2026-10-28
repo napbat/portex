@@ -7,6 +7,8 @@
 use super::{NormalizeKept, PAGE_SIZE, loader_virtual_size};
 use crate::data_dir::{DataDirectory, DataDirectoryType};
 use crate::debug::DebugDirectory;
+use crate::delay_import::{DelayImportDirectory, DelayImportThunk, DelayLoadDescriptor};
+use crate::import::{ImportDescriptor, ImportTable, ImportThunk};
 use crate::layout::{checked_align_up, loader_raw_offset};
 use crate::optional::OptionalHeader;
 use crate::pe::PeImage;
@@ -37,6 +39,9 @@ pub(crate) struct LoaderView<'a> {
     /// The number of file bytes that the loader maps at RVA 0. The header bytes after this
     /// length are zero.
     header_len: usize,
+    /// The RVA ranges of the structures that the loader follows from the `Import`,
+    /// `DelayImport` and `Tls` directories, sorted and merged. See [`followed_ranges`].
+    followed: Vec<Range<usize>>,
 }
 
 impl<'a> LoaderView<'a> {
@@ -47,6 +52,7 @@ impl<'a> LoaderView<'a> {
     /// Return an error if [`PeImage::parse`] fails.
     pub(crate) fn parse(bytes: &'a [u8]) -> crate::Result<Self> {
         let image = PeImage::parse(bytes)?;
+        let followed = followed_ranges(&image);
         // Without a known table end, protect all header bytes.
         let table_end = image.nt_headers_end().unwrap_or(0);
         let is_dll = image.coff_header.is_dll();
@@ -70,6 +76,7 @@ impl<'a> LoaderView<'a> {
             sections,
             table_end,
             header_len,
+            followed,
         })
     }
 
@@ -84,12 +91,18 @@ impl<'a> LoaderView<'a> {
     /// Return the reason if `new` changes the loader view:
     ///
     /// - [`NormalizeKept::SectionAddresses`] if the section count, a section RVA, virtual
-    ///   size or set of characteristics changes. Without a low alignment, a change of
-    ///   `SizeOfHeaders` aligned up to `SectionAlignment` is also an address change.
+    ///   size or set of characteristics changes. If the old `SectionAlignment` is a power of
+    ///   two and not smaller than a page, a change of `SizeOfHeaders` aligned up to
+    ///   `SectionAlignment` is also an address change.
     /// - [`NormalizeKept::SectionData`] if the mapped file bytes of a section change. With a
     ///   low alignment, a change of the raw layout of a section is also a data change.
-    /// - [`NormalizeKept::HeaderBytesInUse`] if header bytes that the entry point, a data
-    ///   directory or an indirect RVA can refer to change.
+    /// - [`NormalizeKept::HeaderBytesInUse`] if header bytes change that the entry point, a
+    ///   data directory or a followed range refers to, or if nonzero header bytes after the
+    ///   section table change.
+    ///
+    /// The check covers the indirect references in the followed ranges of
+    /// [`followed_ranges`] only. Other indirect references can point to header bytes before
+    /// the end of the section table, and the check does not find them.
     pub(crate) fn check(&self, new: &LoaderView<'_>) -> Result<bool, NormalizeKept> {
         let (old_sections, new_sections) = (&self.sections, &new.sections);
         if old_sections.len() != new_sections.len() {
@@ -212,12 +225,14 @@ impl<'a> LoaderView<'a> {
             })
     }
 
-    /// Return the RVA ranges of the data directories that the debug exception must not touch.
+    /// Return the RVA ranges that the debug exception must not touch, sorted and merged: the
+    /// data directories and the followed ranges.
     ///
-    /// The method skips `Debug`, `Security`, `Architecture`, `GlobalPtr`, `Reserved` and
-    /// unknown entries. A size of 0 gives a range to the end of the address space.
+    /// The method skips the `Debug`, `Security`, `Architecture`, `GlobalPtr`, `Reserved` and
+    /// unknown data directory entries. A size of 0 gives a range to the end of the address
+    /// space.
     fn protected_ranges(&self) -> Vec<Range<usize>> {
-        let mut ranges = Vec::new();
+        let mut ranges = self.followed.clone();
         for (index, directory) in self.optional_header.data_directories().iter().enumerate() {
             let skipped = matches!(
                 DataDirectoryType::from_index(index),
@@ -240,11 +255,11 @@ impl<'a> LoaderView<'a> {
             };
             ranges.push(start..end);
         }
-        ranges
+        merge_ranges(ranges)
     }
 
-    /// Check that `new` has the header bytes that the entry point and the data directories of
-    /// this view refer to.
+    /// Check that `new` has the header bytes that the entry point, the data directories and
+    /// the followed ranges of this view refer to.
     ///
     /// For the bytes after the section table, check only the nonzero old bytes. A zero old
     /// byte can change, because the new section table can grow into zero padding.
@@ -286,23 +301,26 @@ impl<'a> LoaderView<'a> {
     }
 
     /// Return the RVA where the header bytes end: the RVA of the first section that the
-    /// loader maps, or `usize::MAX` if there is no such section.
+    /// loader maps from the file, or `usize::MAX` if there is no such section. A section
+    /// without raw bytes (`PointerToRawData` or `SizeOfRawData` is 0) does not end the header
+    /// bytes.
     fn header_end(&self) -> usize {
         self.sections
             .iter()
-            .filter(|header| loader_virtual_size(header) != 0)
+            .filter(|header| header.pointer_to_raw_data != 0 && header.size_of_raw_data != 0)
             .map(|header| header.virtual_address as usize)
             .min()
             .unwrap_or(usize::MAX)
     }
 
-    /// Return the ranges of header bytes that the entry point and the data directories refer
-    /// to.
+    /// Return the ranges of header bytes that the entry point, the data directories and the
+    /// followed ranges refer to.
     ///
     /// The method skips the entries that the loader does not read: `Security` (a file offset),
     /// the reserved entries, and entries with an RVA of 0. It skips `BoundImport` if
     /// `cleared_bound_imports` holds it. A directory uses the rest of the headers, because the
-    /// loader ignores the size of some directories.
+    /// loader ignores the size of some directories. A followed range that starts in the
+    /// headers uses its own length.
     fn header_references(&self, cleared_bound_imports: Option<DataDirectory>) -> Vec<Range<usize>> {
         let header_end = self.header_end();
         let mut ranges = Vec::new();
@@ -328,12 +346,17 @@ impl<'a> LoaderView<'a> {
                 ranges.push(start..header_end);
             }
         }
+        for range in &self.followed {
+            if range.start < header_end {
+                ranges.push(range.start..range.end.min(header_end));
+            }
+        }
         ranges
     }
 
-    /// Return the ranges of header bytes after the section table. An import name or another
-    /// indirect RVA can point there. The ranges exclude the cleared `BoundImport` data in
-    /// `cleared_bound_imports`.
+    /// Return the ranges of header bytes after the section table. An indirect RVA that the
+    /// followed ranges do not cover can point there. The ranges exclude the cleared
+    /// `BoundImport` data in `cleared_bound_imports`.
     fn table_end_references(
         &self,
         cleared_bound_imports: Option<DataDirectory>,
@@ -362,8 +385,8 @@ impl<'a> LoaderView<'a> {
 ///
 /// Return `Ok(true)` if only bytes of `PointerToRawData` fields of `IMAGE_DEBUG_DIRECTORY`
 /// entries changed. The exception applies only to a section without `IMAGE_SCN_CNT_CODE` or
-/// `IMAGE_SCN_MEM_EXECUTE`, and only outside the `protected` RVA ranges. Return
-/// `Err(SectionData)` for any other difference.
+/// `IMAGE_SCN_MEM_EXECUTE`, and only outside the `protected` RVA ranges. These ranges must be
+/// sorted and merged. Return `Err(SectionData)` for any other difference.
 fn check_section_data(
     old: &SectionHeader,
     old_data: &[u8],
@@ -385,9 +408,9 @@ fn check_section_data(
         if old_byte == new_byte {
             continue;
         }
-        let allowed = base.checked_add(offset).is_some_and(|rva| {
-            is_debug_pointer(rva, debug) && !protected.iter().any(|range| range.contains(&rva))
-        });
+        let allowed = base
+            .checked_add(offset)
+            .is_some_and(|rva| is_debug_pointer(rva, debug) && !ranges_contain(protected, rva));
         if !allowed {
             return Err(NormalizeKept::SectionData);
         }
@@ -439,4 +462,207 @@ fn keeps_nonzero_bytes(old: &[u8], new: &[u8]) -> bool {
     old.iter()
         .enumerate()
         .all(|(index, byte)| *byte == 0 || new.get(index) == Some(byte))
+}
+
+/// Return `true` if one of the sorted and merged `ranges` contains `rva`.
+fn ranges_contain(ranges: &[Range<usize>], rva: usize) -> bool {
+    let after = ranges.partition_point(|range| range.start <= rva);
+    after
+        .checked_sub(1)
+        .and_then(|index| ranges.get(index))
+        .is_some_and(|range| rva < range.end)
+}
+
+/// Sort `ranges` and merge the ranges that overlap or touch. Remove empty ranges.
+fn merge_ranges(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    ranges.retain(|range| range.start < range.end);
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match merged.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => merged.push(range),
+        }
+    }
+    merged
+}
+
+/// Return the range of `len` bytes at `rva`. The range ends at `usize::MAX` on overflow.
+fn range_at(rva: u32, len: usize) -> Range<usize> {
+    let start = rva as usize;
+    start..start.saturating_add(len)
+}
+
+/// Return the RVA ranges of the structures that the loader follows, sorted and merged.
+///
+/// The ranges are:
+///
+/// - the `Import` descriptor array, up to and including the null descriptor;
+/// - for each import descriptor, the DLL name with its NUL, and the `OriginalFirstThunk` and
+///   `FirstThunk` arrays up to and including the null thunk;
+/// - each hint/name entry: the 2-byte hint, the name and its NUL;
+/// - the same items for `DelayImport`;
+/// - the TLS callback array, up to and including the null entry.
+///
+/// The walk ignores the directory sizes, because the loader reads up to the null entries. The
+/// parsers of the crate give the limits of the walk: 65,536 descriptors, 1,048,576 thunks per
+/// array, and 65,536 TLS callbacks. If the `Import` or `DelayImport` parse fails, the range
+/// from the directory RVA to the end of the address space is followed. A failed TLS parse gives
+/// no range.
+fn followed_ranges(image: &PeImage) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let is_64bit = image.is_64bit();
+    let thunk_size = if is_64bit { 8 } else { 4 };
+    let reader = image.rva_reader();
+    let read = |rva: u32, len: usize| reader.read(rva, len);
+    let directory_rva = |kind| {
+        image
+            .data_directory(kind)
+            .map(|directory: &DataDirectory| directory.virtual_address)
+            .filter(|rva| *rva != 0)
+    };
+    if let Some(rva) = directory_rva(DataDirectoryType::Import) {
+        let walked = ImportTable::parse(rva, is_64bit, read)
+            .ok()
+            .and_then(|table| push_import_ranges(&mut ranges, &read, rva, &table, thunk_size));
+        if walked.is_none() {
+            ranges.push(rva as usize..usize::MAX);
+        }
+    }
+    if let Some(rva) = directory_rva(DataDirectoryType::DelayImport) {
+        let image_base = image.runtime_image_base();
+        let walked = DelayImportDirectory::parse_with_image_base(rva, image_base, is_64bit, read)
+            .ok()
+            .and_then(|table| {
+                push_delay_import_ranges(&mut ranges, &read, rva, &table, thunk_size)
+            });
+        if walked.is_none() {
+            ranges.push(rva as usize..usize::MAX);
+        }
+    }
+    if let Ok(Some(tls)) = image.tls()
+        && let Some(directory) = tls.directory.as_ref().filter(|tls| tls.has_callbacks())
+        && let Some(array) = directory
+            .callbacks_va()
+            .checked_sub(tls.image_base)
+            .and_then(|rva| u32::try_from(rva).ok())
+    {
+        let len = tls
+            .callback_rvas
+            .len()
+            .saturating_add(1)
+            .saturating_mul(thunk_size);
+        ranges.push(range_at(array, len));
+    }
+    merge_ranges(ranges)
+}
+
+/// Add the followed ranges of the import table `table` at `rva` to `ranges`. Return `None`
+/// if a thunk array cannot be read again.
+fn push_import_ranges(
+    ranges: &mut Vec<Range<usize>>,
+    read: &impl Fn(u32, usize) -> Option<Vec<u8>>,
+    rva: u32,
+    table: &ImportTable,
+    thunk_size: usize,
+) -> Option<()> {
+    let count = table.dlls.len().checked_add(1)?;
+    ranges.push(range_at(rva, count.checked_mul(ImportDescriptor::SIZE)?));
+    for dll in &table.dlls {
+        let descriptor = &dll.descriptor;
+        ranges.push(range_at(
+            descriptor.name_rva,
+            dll.name.len().checked_add(1)?,
+        ));
+        // The parser reads the names from `OriginalFirstThunk`, or from `FirstThunk` if
+        // `OriginalFirstThunk` is 0.
+        let name_table = if descriptor.original_first_thunk == 0 {
+            descriptor.first_thunk
+        } else {
+            descriptor.original_first_thunk
+        };
+        let names = dll.imports.iter().map(|thunk| match thunk {
+            ImportThunk::Name { name, .. } => Some(name.len()),
+            ImportThunk::Ordinal(_) => None,
+        });
+        push_thunk_ranges(
+            ranges,
+            read,
+            [name_table, descriptor.first_thunk],
+            thunk_size,
+            names,
+        )?;
+    }
+    Some(())
+}
+
+/// Add the followed ranges of the delay-load import table `table` at `rva` to `ranges`.
+/// Return `None` if a thunk array cannot be read again.
+fn push_delay_import_ranges(
+    ranges: &mut Vec<Range<usize>>,
+    read: &impl Fn(u32, usize) -> Option<Vec<u8>>,
+    rva: u32,
+    table: &DelayImportDirectory,
+    thunk_size: usize,
+) -> Option<()> {
+    let count = table.dlls.len().checked_add(1)?;
+    ranges.push(range_at(rva, count.checked_mul(DelayLoadDescriptor::SIZE)?));
+    for dll in &table.dlls {
+        // The parser converts the VAs of a legacy descriptor to RVAs.
+        let descriptor = &dll.descriptor;
+        ranges.push(range_at(
+            descriptor.dll_name_rva,
+            dll.name.len().checked_add(1)?,
+        ));
+        let names = dll.imports.iter().map(|thunk| match thunk {
+            DelayImportThunk::Name { name, .. } => Some(name.len()),
+            DelayImportThunk::Ordinal(_) => None,
+        });
+        push_thunk_ranges(
+            ranges,
+            read,
+            [
+                descriptor.import_name_table_rva,
+                descriptor.import_address_table_rva,
+            ],
+            thunk_size,
+            names,
+        )?;
+    }
+    Some(())
+}
+
+/// Add the ranges of the thunk arrays `tables` and of their hint/name entries to `ranges`.
+///
+/// `tables` holds the RVA of the name table, from which the parser read `names`, and the RVA
+/// of the address table. Each array has one thunk of `thunk_size` bytes for each item of
+/// `names`, and the null thunk. An RVA of 0 has no array. `names` holds the name length of
+/// each import by name, and `None` for each import by ordinal. Return `None` if the name table
+/// cannot be read again.
+fn push_thunk_ranges(
+    ranges: &mut Vec<Range<usize>>,
+    read: &impl Fn(u32, usize) -> Option<Vec<u8>>,
+    tables: [u32; 2],
+    thunk_size: usize,
+    names: impl ExactSizeIterator<Item = Option<usize>>,
+) -> Option<()> {
+    let count = names.len();
+    let array_len = count.checked_add(1)?.checked_mul(thunk_size)?;
+    for table in tables.into_iter().filter(|table| *table != 0) {
+        ranges.push(range_at(table, array_len));
+    }
+    if count == 0 {
+        return Some(());
+    }
+    let values = read(tables[0], count.checked_mul(thunk_size)?)?;
+    for (value, name_len) in values.chunks_exact(thunk_size).zip(names) {
+        let Some(name_len) = name_len else {
+            continue;
+        };
+        // The thunk of an import by name holds the RVA of the entry. The parser checks that
+        // the value fits 31 bits (PE32) or 32 bits (PE32+), so the low 4 bytes hold it.
+        let hint_rva = u32::from_le_bytes(*value.first_chunk::<4>()?);
+        ranges.push(range_at(hint_rva, name_len.checked_add(3)?));
+    }
+    Some(())
 }

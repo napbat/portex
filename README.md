@@ -159,15 +159,30 @@ The loader view stays the same. The loader view is:
 - the aligned header size, which is `SizeOfHeaders` aligned to a valid `SectionAlignment`;
 - the header bytes at the entry point and at each data directory. A data directory range
   starts at its RVA and ends at the first section, whatever its size;
-- the nonzero header bytes after the section table. An indirect RVA can point to them.
+- the header bytes that the followed structures refer to;
+- the nonzero header bytes after the section table.
+
+The followed structures are the structures that the loader reads through RVAs:
+
+- the import descriptor array, up to and including the null descriptor;
+- for each import descriptor, the DLL name with its NUL, and the `OriginalFirstThunk` and
+  `FirstThunk` arrays, up to and including the null thunk;
+- each hint/name entry: 2 bytes, the name and the NUL;
+- the same items for the delay-import table;
+- the TLS callback array, up to and including the null entry.
+
+The method checks only these indirect references. If the import or delay-import table does not
+parse, the bytes from the RVA of that directory to the end of the address space are protected.
 
 The loader maps `SizeOfHeaders` header bytes, or the whole file with a low `SectionAlignment`.
 
 The method builds each candidate with `PeFile::try_build`, parses the output again, and
 compares it with the built original. It keeps the first candidate that keeps the loader view.
 If no candidate does, the fields and the layout of the file stay. The checksum fix uses the
-same check. The method does not use a candidate that would make a valid checksum wrong. For
-each rejected fix, it names the reason in `Normalization::kept`:
+same check. The method does not use a candidate that would make a valid checksum wrong.
+`calculate_checksum` matches the Windows `CheckSumMappedFile` function, also when the checksum
+field is at an odd file offset. For each rejected fix, the method names the reason in
+`Normalization::kept`:
 
 - `HeaderBytesInUse`: the candidate changes header bytes that the image refers to.
 - `SectionData`: the candidate changes or drops section bytes.
@@ -177,13 +192,15 @@ each rejected fix, it names the reason in `Normalization::kept`:
 - `Alignment`: `SectionAlignment` is invalid, and no valid value keeps all section RVAs.
 - `Layout(String)`: the method cannot make a new layout.
 - `Build(String)`: the candidate does not build or parse.
-- `Checksum`: the checksum fix would change the loader view, so a wrong checksum stays.
+- `Checksum`: the checksum fix changes the loader view or does not build. A wrong checksum
+  stays, or the method does not use the candidate that needs the fix.
 
 After a new layout, the build rebases the `PointerToRawData` file offsets of the
 `IMAGE_DEBUG_DIRECTORY` entries. `changes` reports this as `NormalizeChange::DebugPointers`.
 The method uses a new layout only if each such field is in a section without
 `IMAGE_SCN_CNT_CODE` or `IMAGE_SCN_MEM_EXECUTE`. Each field must also be outside the other data
-directories. Otherwise, the layout stays, and `kept` names `SectionData`.
+directories and outside the followed structures. Otherwise, the layout stays, and `kept` names
+`SectionData`.
 
 `NormalizeChange::HeaderTail` means that the section table grows into the header bytes after
 it, and the build drops these bytes. The method allows this only for a bound import table. The

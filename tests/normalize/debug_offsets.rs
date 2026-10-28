@@ -175,6 +175,125 @@ fn a_debug_field_inside_another_directory_keeps_the_layout() {
     assert_the_layout_stays(&raw);
 }
 
+/// The index of the Import data directory.
+const IMPORT: usize = 1;
+
+/// The file offset of the raw data of `.text` and `.rdata` in
+/// [`padded_shared_raw_data_with_an_entry_at`]. It is also the RVA of `.text`.
+const SHARED_START: u32 = 0x1000;
+
+/// Make a file where `.rdata` maps the raw data of `.text`, as in
+/// [`shared_raw_data_with_a_debug_entry`]. Zero padding moves this raw data to the file offset
+/// [`SHARED_START`]. The first 0x180 bytes of `.rdata` are zero, and the debug entry is at
+/// `entry`. `AddressOfRawData` is `address`. Each value is an offset from the start of `.rdata`.
+///
+/// The `PointerToRawData` field then is the RVA of the same byte in `.text`, which holds the
+/// same byte as `address`. Thus a name at `address` is also a name at that RVA.
+///
+/// Return the file and the RVA of `.rdata`.
+fn padded_shared_raw_data_with_an_entry_at(entry: u32, address: u32) -> (Vec<u8>, u32) {
+    let built = test_image().try_build().unwrap();
+    let headers = PeHeaders::from_slice(&built).unwrap();
+    let size = usize::try_from(headers.optional_header.size_of_headers()).unwrap();
+    let start = usize::try_from(SHARED_START).unwrap();
+    let mut raw = built[..size].to_vec();
+    raw.resize(start, 0);
+    raw.extend_from_slice(&built[size..]);
+    assert_eq!(headers.section_headers[0].virtual_address, SHARED_START);
+    for index in 0..2 {
+        let field = section_header_offset(&raw, index) + 20;
+        put32(&mut raw, field, SHARED_START);
+    }
+    let rva = headers.section_headers[1].virtual_address;
+    raw[start..start + 0x180].fill(0);
+    let pointer = SHARED_START + address;
+    put_bytes(&mut raw, entry, &debug_entry(rva + address, pointer));
+    put_directory(&mut raw, DEBUG, rva + entry, DEBUG_ENTRY_SIZE);
+    (raw, rva)
+}
+
+/// Write `bytes` at `offset` bytes after the start of the shared raw data.
+fn put_bytes(raw: &mut [u8], offset: u32, bytes: &[u8]) {
+    let offset = usize::try_from(SHARED_START + offset).unwrap();
+    raw[offset..offset + bytes.len()].copy_from_slice(bytes);
+}
+
+/// Write a 32-bit value at `offset` bytes after the start of the shared raw data.
+fn put_shared32(raw: &mut [u8], offset: u32, value: u32) {
+    put_bytes(raw, offset, &value.to_le_bytes());
+}
+
+/// Write a PE32+ thunk with an ordinal import at `offset` bytes after the start of the shared
+/// raw data. The null thunk must follow.
+fn put_ordinal_thunk(raw: &mut [u8], offset: u32) {
+    put_bytes(raw, offset, &0x8000_0000_0000_0001u64.to_le_bytes());
+}
+
+fn get_shared32(raw: &[u8], offset: u32) -> u32 {
+    let offset = usize::try_from(SHARED_START + offset).unwrap();
+    u32::from_le_bytes(raw[offset..offset + 4].try_into().unwrap())
+}
+
+#[test]
+fn a_debug_field_in_an_import_descriptor_after_the_directory_size_keeps_the_layout() {
+    // The descriptors are at 0x80 and 0x94 in `.rdata`, and the null descriptor is at 0xa8. The
+    // debug entry at 0x88 shares the last 12 bytes of the first descriptor and the first 16
+    // bytes of the second one. Its PointerToRawData field is the Name field of the second one.
+    let (mut raw, rva) = padded_shared_raw_data_with_an_entry_at(0x88, 0xe0);
+    // TimeDateStamp is the Name field of the first descriptor. MajorVersion and MinorVersion
+    // are its FirstThunk field. Type 0 is the OriginalFirstThunk field of the second one.
+    put_shared32(&mut raw, 0x88 + 4, rva + 0xc0);
+    put_shared32(&mut raw, 0x88 + 8, rva + 0xd0);
+    put_shared32(&mut raw, 0x88 + 12, 0);
+    // The FirstThunk field of the second descriptor follows the debug entry.
+    put_shared32(&mut raw, 0x88 + 28, rva + 0xf0);
+    put_bytes(&mut raw, 0xc0, b"a.dll\0");
+    put_ordinal_thunk(&mut raw, 0xd0);
+    put_bytes(&mut raw, 0xe0, b"b.dll\0");
+    put_ordinal_thunk(&mut raw, 0xf0);
+    // The directory size covers only the first descriptor. The loader reads up to the null
+    // descriptor.
+    put_directory(&mut raw, IMPORT, rva + 0x80, 0x14);
+    assert_eq!(get_shared32(&raw, 0x94 + 12), SHARED_START + 0xe0);
+    // The loader view of the file has both descriptors and their names.
+    let image = PeImage::parse(&raw).unwrap();
+    let read = |rva, len| image.read_rva(rva, len);
+    let table = portex::ImportTable::parse(rva + 0x80, true, read).unwrap();
+    let names: Vec<_> = table.dlls.iter().map(|dll| dll.name.as_str()).collect();
+    assert_eq!(names, ["a.dll", "b.dll"]);
+    assert_the_layout_stays(&raw);
+}
+
+#[test]
+fn a_debug_field_in_an_import_name_table_keeps_the_layout() {
+    // The PointerToRawData field of the debug entry at 0x100 in `.rdata` is the first entry of
+    // the OriginalFirstThunk array at 0x118. The null thunk is at 0x120.
+    let (mut raw, rva) = padded_shared_raw_data_with_an_entry_at(0x100, 0x140);
+    // One descriptor at 0x80, then the null descriptor.
+    put_shared32(&mut raw, 0x80, rva + 0x118);
+    put_shared32(&mut raw, 0x80 + 12, rva + 0xc0);
+    put_shared32(&mut raw, 0x80 + 16, rva + 0xd0);
+    put_bytes(&mut raw, 0xc0, b"a.dll\0");
+    put_ordinal_thunk(&mut raw, 0xd0);
+    // The hint/name entry.
+    put_bytes(&mut raw, 0x140, b"\0\0Foo\0");
+    // The file has no IAT directory.
+    put_directory(&mut raw, IMPORT, rva + 0x80, 0x28);
+    assert_eq!(get_shared32(&raw, 0x118), SHARED_START + 0x140);
+    // The loader view of the file has the hint/name entry.
+    let image = PeImage::parse(&raw).unwrap();
+    let read = |rva, len| image.read_rva(rva, len);
+    let table = portex::ImportTable::parse(rva + 0x80, true, read).unwrap();
+    assert_eq!(
+        table.dlls[0].imports,
+        [portex::ImportThunk::Name {
+            hint: 0,
+            name: "Foo".to_string()
+        }]
+    );
+    assert_the_layout_stays(&raw);
+}
+
 #[test]
 fn a_stale_debug_offset_is_reported() {
     let mut raw = test_image().try_build().unwrap();

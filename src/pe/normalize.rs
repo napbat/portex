@@ -146,8 +146,8 @@ pub enum NormalizeKept {
     /// The build of a fixed copy fails, or the built file does not parse. The value is the
     /// error message.
     Build(String),
-    /// The checksum fix would change the loader view. A wrong checksum then stays wrong. A
-    /// candidate that would make a valid checksum wrong is not used.
+    /// The checksum fix fails the check: it changes the loader view, or it does not build. A
+    /// wrong checksum then stays wrong, or the candidate that needs the fix is not used.
     Checksum,
 }
 
