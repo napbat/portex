@@ -35,7 +35,8 @@ impl PeImage {
             .filter(|d| d.is_present());
         match dir {
             Some(d) => {
-                let read_fn = |rva: u32, len: usize| -> Option<Vec<u8>> { self.read_rva(rva, len) };
+                let reader = self.rva_reader();
+                let read_fn = |rva: u32, len: usize| reader.read(rva, len);
                 Ok(Some(crate::tls::TlsInfo::parse(
                     d.virtual_address,
                     d.size,
@@ -121,7 +122,8 @@ impl PeImage {
             .filter(|d| d.is_present());
         match dir {
             Some(d) => {
-                let read_fn = |rva: u32, len: usize| -> Option<Vec<u8>> { self.read_rva(rva, len) };
+                let reader = self.rva_reader();
+                let read_fn = |rva: u32, len: usize| reader.read(rva, len);
                 Ok(Some(crate::debug::DebugInfo::parse(
                     d.virtual_address,
                     d.size,
@@ -349,7 +351,8 @@ impl PeImage {
         else {
             return Ok(None);
         };
-        let read = |rva: u32, len: usize| self.read_rva(rva, len);
+        let reader = self.rva_reader();
+        let read = |rva: u32, len: usize| reader.read(rva, len);
         crate::exception::ExceptionTable::parse(
             self.coff_header.machine,
             directory.virtual_address,

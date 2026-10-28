@@ -6,7 +6,7 @@
 use libfuzzer_sys::fuzz_target;
 use portex::{PeFile, PeImage};
 
-/// The largest `SizeOfImage` for which the target makes a mapped image.
+/// The largest mapped image that the target makes, in bytes.
 ///
 /// A mapped image needs `SizeOfImage` bytes, and libFuzzer stops at 2 GiB of memory.
 const MAX_MAPPED_IMAGE_SIZE: u32 = 64 << 20;
@@ -14,7 +14,7 @@ const MAX_MAPPED_IMAGE_SIZE: u32 = 64 << 20;
 fuzz_target!(|data: &[u8]| {
     if let Ok(image) = PeImage::parse(data) {
         exercise(&image);
-        if image.optional_header.size_of_image() <= MAX_MAPPED_IMAGE_SIZE
+        if mapped_image_size(&image) <= MAX_MAPPED_IMAGE_SIZE
             && let Ok(mapped) = image.to_mapped_image()
             && let Ok(mapped_image) = PeImage::parse_mapped(&mapped)
         {
@@ -30,6 +30,20 @@ fuzz_target!(|data: &[u8]| {
         let _ = PeFile::parse(&rebuilt);
     }
 });
+
+/// Return the `SizeOfImage` that `to_mapped_image` uses for `image`.
+///
+/// The method makes a new layout, and that layout can have a larger `SizeOfImage` than the
+/// parsed value. If no new layout is possible, it uses the parsed value.
+fn mapped_image_size(image: &PeImage) -> u32 {
+    let mut updated = image.clone();
+    let parsed = image.optional_header.size_of_image();
+    if updated.try_update_layout().is_ok() {
+        parsed.max(updated.optional_header.size_of_image())
+    } else {
+        parsed
+    }
+}
 
 /// Run the directory accessors and the validation on `image`.
 fn exercise(image: &PeImage) {

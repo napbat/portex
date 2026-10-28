@@ -355,6 +355,8 @@ impl PeFile {
     /// - The stored certificate range exceeds the overlay.
     /// - The file size overflows.
     /// - The build of the image fails (see [`PeImage::try_build`]).
+    /// - The overlay or the certificate table is not empty, but the build keeps a layout whose
+    ///   raw data goes past the end of the output. Then the appended bytes would be section data.
     pub fn try_build(&self) -> Result<Vec<u8>> {
         let mut pe = self.image.clone();
         let certificate_size = self
@@ -373,11 +375,16 @@ impl PeFile {
         } else {
             self.clear_security_entry(&mut pe);
         }
-        let preserved_pass = if RawLayoutFingerprint::from_image(&pe)? == self.source_layout {
-            pe.try_build_current_layout(self.source_end)?
-        } else {
-            None
-        };
+        // A layout whose raw data goes past the end of the source can keep the source length
+        // only without bytes after it. Otherwise make a new layout.
+        let appends_data = !self.overlay.is_empty() || self.certificate_range.is_some();
+        let keeps_source_end = self.source_end.is_none() || !appends_data;
+        let preserved_pass =
+            if keeps_source_end && RawLayoutFingerprint::from_image(&pe)? == self.source_layout {
+                pe.try_build_current_layout(self.source_end)?
+            } else {
+                None
+            };
         let preserve_layout = preserved_pass.is_some();
         let first_pass = if let Some(bytes) = preserved_pass {
             bytes
@@ -389,6 +396,11 @@ impl PeFile {
             pe.try_build()?
         };
         let base_size = first_pass.len();
+        if appends_data && base_size < raw_image_end(&pe)? {
+            return Err(Error::invalid_section(
+                "the raw section data goes past the end of the image, so an overlay or a certificate table cannot follow it",
+            ));
+        }
 
         let prefix_padding = if let Some(range) = &self.certificate_range {
             if range.start > range.end || range.end > self.overlay.len() {
@@ -580,25 +592,12 @@ fn collect_preserved_regions(
     image: &PeImage,
     image_end: usize,
 ) -> Result<Vec<PreservedRegion>> {
-    let pe_offset = usize::try_from(image.dos_header.e_lfanew)
-        .map_err(|_| Error::invalid_section("e_lfanew is negative"))?;
-    let optional_start = pe_offset
-        .checked_add(4 + crate::CoffHeader::SIZE)
-        .ok_or_else(|| Error::invalid_section("optional-header offset overflow"))?;
-    let parsed_optional_end = optional_start
-        .checked_add(image.optional_header.size())
-        .ok_or_else(|| Error::invalid_section("optional-header size overflow"))?;
-    let declared_optional_end = optional_start
-        .checked_add(usize::from(image.coff_header.size_of_optional_header))
-        .ok_or_else(|| Error::invalid_section("optional-header size overflow"))?;
+    // The image keeps the header bytes after the section table and the padding before it, so
+    // the gaps start after them.
     let headers_end = nt_headers_end(image)?;
+    let header_data_end = image.header_data_end(headers_end).unwrap_or(headers_end);
 
     let mut regions = Vec::new();
-    push_preserved_region(
-        &mut regions,
-        data,
-        parsed_optional_end..declared_optional_end.min(image_end),
-    )?;
 
     let file_alignment = image.optional_header.file_alignment();
     let mut occupied: Vec<Range<usize>> = image
@@ -618,7 +617,7 @@ fn collect_preserved_regions(
         .collect();
     occupied.sort_by_key(|range| range.start);
 
-    let mut cursor = headers_end.min(image_end);
+    let mut cursor = header_data_end.min(image_end);
     for range in occupied {
         if range.end <= cursor {
             continue;

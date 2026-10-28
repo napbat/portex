@@ -366,7 +366,11 @@ impl PeImage {
     }
 
     /// Check that the raw file ranges of the sections do not overlap.
+    ///
+    /// Each range starts where the loader reads the raw data (see
+    /// [`layout::loader_raw_offset`]).
     fn validate_section_file_overlaps(&self, result: &mut ValidationResult) {
+        let file_alignment = self.optional_header.file_alignment();
         let ranges = self
             .sections
             .iter()
@@ -375,7 +379,10 @@ impl PeImage {
                 section.header.pointer_to_raw_data != 0 && section.header.size_of_raw_data != 0
             })
             .map(|(index, section)| {
-                let start = u64::from(section.header.pointer_to_raw_data);
+                let start = u64::from(layout::loader_raw_offset(
+                    section.header.pointer_to_raw_data,
+                    file_alignment,
+                ));
                 (
                     start,
                     start + u64::from(section.header.size_of_raw_data),

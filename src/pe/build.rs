@@ -2,7 +2,6 @@ use super::{HeaderBytes, PeImage};
 use crate::coff::{CoffHeader, PE_SIGNATURE};
 use crate::dos::DosHeader;
 use crate::layout;
-use crate::optional::OptionalHeader;
 use crate::prelude::*;
 use crate::section::SectionHeader;
 use crate::{Error, Result};
@@ -171,52 +170,49 @@ impl PeImage {
     ///   targets bytes outside the image.
     pub fn to_mapped_image_at(&self, runtime_image_base: u64) -> Result<Vec<u8>> {
         // A malformed image can have values that no new layout can use. Then map the current
-        // layout.
+        // layout, but only up to the end of its last section or of its headers.
         let mut updated = self.clone();
-        let pe: &PeImage = if updated.try_update_layout().is_ok() {
-            &updated
-        } else {
-            self
-        };
-
-        // The loader maps the headers as they are in the file. If the layout update keeps the
-        // section RVAs, map the headers of `self`: the update can change header fields that also
-        // hold code or data, for example in an image with overlapping headers. The image then has
-        // the larger `SizeOfImage`, and all the header bytes.
-        let source_size = pe
-            .optional_header
-            .size_of_image()
-            .max(self.optional_header.size_of_image());
-        let keeps_source_headers = pe.has_section_rvas_of(self)
-            && self
-                .sections
-                .iter()
-                .all(|section| super::inspect::section_end(section) <= u64::from(source_size));
-        let (source, image_size) = if keeps_source_headers {
-            (self, source_size)
-        } else {
-            (pe, pe.optional_header.size_of_image())
-        };
-        if let Some(section) = pe
-            .sections
-            .iter()
-            .find(|section| super::inspect::section_end(section) > u64::from(image_size))
-        {
+        let layout_updated = updated.try_update_layout().is_ok();
+        let pe: &PeImage = if layout_updated { &updated } else { self };
+        if let Some(section) = pe.sections.iter().find(|section| {
+            super::inspect::section_end(section) > u64::from(pe.optional_header.size_of_image())
+        }) {
             return Err(Error::invalid_section(format!(
                 "section '{}' exceeds SizeOfImage",
                 section.name()
             )));
         }
-        let headers = source.build_headers()?;
-        let header_count = if keeps_source_headers {
-            headers.len()
+
+        // The loader maps the headers as they are in the file. If header structures share
+        // bytes, the layout update can change header fields that also hold code or data. Then
+        // map the headers of `self`, if the update keeps the section RVAs and the headers still
+        // build.
+        let source_headers = (self.has_overlapping_headers() && pe.has_section_rvas_of(self))
+            .then(|| self.build_headers().ok())
+            .flatten();
+        let (headers, header_count) = if let Some(headers) = source_headers {
+            let count = headers.len();
+            (headers, count)
         } else {
-            headers
+            let headers = pe.build_headers()?;
+            let count = headers
                 .len()
-                .min(pe.optional_header.size_of_headers() as usize)
+                .min(pe.optional_header.size_of_headers() as usize);
+            (headers, count)
+        };
+        let image_end = if layout_updated {
+            u64::from(pe.optional_header.size_of_image())
+        } else {
+            pe.sections
+                .iter()
+                .map(super::inspect::section_end)
+                .max()
+                .unwrap_or(0)
         };
         // A malformed `SizeOfImage` can be smaller than the headers. The image holds them anyway.
-        let image_size = (image_size as usize).max(header_count);
+        let image_size = usize::try_from(image_end)
+            .map_err(|_| Error::invalid_section("mapped image exceeds usize"))?
+            .max(header_count);
         let mut mapped = try_zeroed_buffer(image_size, "mapped image")?;
         mapped[..header_count].copy_from_slice(&headers[..header_count]);
 
@@ -256,6 +252,14 @@ impl PeImage {
                 .all(|(section, other)| {
                     section.header.virtual_address == other.header.virtual_address
                 })
+    }
+
+    /// Return `true` if header structures share bytes: the NT headers start inside the DOS
+    /// header, or the section table overlaps the optional header.
+    fn has_overlapping_headers(&self) -> bool {
+        usize::try_from(self.dos_header.e_lfanew).is_ok_and(|offset| offset < DosHeader::SIZE)
+            || (usize::from(self.coff_header.size_of_optional_header) < self.optional_header.size()
+                && !self.sections.is_empty())
     }
 
     /// Update the `PointerToRawData` field of each debug directory entry after a change to the
@@ -304,9 +308,9 @@ impl PeImage {
         }
     }
 
-    /// Serialize the DOS header, the DOS stub, the NT headers and the header tail.
+    /// Serialize the DOS header, the DOS stub, the NT headers and the raw header bytes.
     ///
-    /// The method writes the structures in file order. As the loader allows, they can overlap:
+    /// The method writes the structures in file order. They can overlap:
     ///
     /// - The NT headers can start inside the DOS header (`e_lfanew` from 2 to 63).
     /// - The optional header can be longer than `SizeOfOptionalHeader`, so that the section
@@ -315,28 +319,47 @@ impl PeImage {
     /// A later structure replaces the shared bytes of an earlier one. Then the method makes sure
     /// that the shared bytes still give `e_lfanew` and the optional header.
     pub(super) fn build_headers(&self) -> Result<Vec<u8>> {
-        let written = self.write_header_structures()?;
-        if !self.keeps_e_lfanew(&written.bytes) {
+        let plan = self.plan_headers()?;
+        let mut output = try_zeroed_buffer(plan.len, "PE headers")?;
+        self.write_headers(&plan, 0, &mut output)?;
+        if !self.keeps_e_lfanew(&output) {
             return Err(Error::invalid_section(
                 "the NT headers overlap the DOS header and change e_lfanew",
             ));
         }
-        if written.table_overlaps_optional_header
-            && OptionalHeader::parse(&written.bytes[written.optional_offset..])?
+        if plan.optional_end > plan.sections_offset
+            && !self.sections.is_empty()
+            && self
+                .optional_header
+                .parse_with_layout_of(&output[plan.optional_offset..])?
                 != self.optional_header
         {
             return Err(Error::invalid_section(
                 "the section table overlaps the optional header and changes it",
             ));
         }
-        Ok(written.bytes)
+        Ok(output)
+    }
+
+    /// Return the header bytes from the file offset `start` to `end`, as the build writes them.
+    ///
+    /// The result stops at the end of the header data, so it can be shorter than `end - start`.
+    /// The method writes only the structures in the range, so a small range costs little also for
+    /// a large section table. It does not check the overlapping structures, as
+    /// [`Self::build_headers`] does.
+    pub(super) fn header_bytes(&self, start: usize, end: usize) -> Result<Vec<u8>> {
+        let plan = self.plan_headers()?;
+        let end = end.min(plan.len);
+        let mut output = try_zeroed_buffer(end.saturating_sub(start), "PE headers")?;
+        self.write_headers(&plan, start, &mut output)?;
+        Ok(output)
     }
 
     /// Return `true` if the NT headers keep the value of `e_lfanew` in a DOS header that they
     /// overlap.
     pub(super) fn nt_headers_keep_e_lfanew(&self) -> bool {
-        self.write_header_structures()
-            .is_ok_and(|written| self.keeps_e_lfanew(&written.bytes))
+        self.header_bytes(0, DosHeader::SIZE)
+            .is_ok_and(|bytes| self.keeps_e_lfanew(&bytes))
     }
 
     /// Return `true` if the header `bytes` give the `e_lfanew` of this image.
@@ -344,8 +367,8 @@ impl PeImage {
         DosHeader::parse(bytes).is_ok_and(|dos| dos.e_lfanew == self.dos_header.e_lfanew)
     }
 
-    /// Write the header structures in file order, without the checks of [`Self::build_headers`].
-    fn write_header_structures(&self) -> Result<WrittenHeaders> {
+    /// Calculate the file offsets of the header structures.
+    fn plan_headers(&self) -> Result<HeaderPlan<'_>> {
         let pe_offset = usize::try_from(self.dos_header.e_lfanew).map_err(|_| {
             Error::invalid_section("e_lfanew is negative and cannot locate a PE header")
         })?;
@@ -385,51 +408,74 @@ impl PeImage {
             .ok_or_else(|| Error::invalid_section("header size overflow"))?;
         let header_end = table_end.max(optional_end);
 
+        // Keep the padding bytes that are still between the optional header and the section
+        // table. The optional header can grow into them.
+        let padding = &self.optional_padding;
+        let padding_start = padding.offset.max(optional_end);
+        let padding_end = padding.end().unwrap_or(padding_start).min(sections_offset);
+        let padding = (padding_start < padding_end).then(|| {
+            (
+                padding_start,
+                &padding.bytes[padding_start - padding.offset..padding_end - padding.offset],
+            )
+        });
         // Keep the header tail inside `SizeOfHeaders`, so that it cannot overlap section data.
         let tail = self.header_tail_after(header_end).and_then(|tail| {
             let limit = self.optional_header.size_of_headers() as usize;
             let end = tail.end()?.min(limit);
             (end > tail.offset).then(|| (tail.offset, &tail.bytes[..end - tail.offset]))
         });
-        let output_len = tail
+        let len = tail
             .map_or(header_end, |(offset, bytes)| offset + bytes.len())
             .max(DosHeader::SIZE);
 
-        // Each range below ends at or before `output_len`, which is `output.len()`.
-        let mut output = try_zeroed_buffer(output_len, "PE headers")?;
-        self.dos_header.write(&mut output[..DosHeader::SIZE])?;
-        output[DosHeader::SIZE..stub_end].copy_from_slice(&self.dos_stub);
-        output[pe_offset..coff_offset].copy_from_slice(&PE_SIGNATURE.to_le_bytes());
-        self.coff_header
-            .write(&mut output[coff_offset..optional_offset])?;
-        self.optional_header
-            .write(&mut output[optional_offset..optional_end])?;
-        // Keep the padding bytes that are still between the optional header and the section
-        // table. The optional header can grow into them.
-        let padding = &self.optional_padding;
-        let padding_start = padding.offset.max(optional_end);
-        let padding_end = padding.end().unwrap_or(padding_start).min(sections_offset);
-        if padding_start < padding_end {
-            output[padding_start..padding_end].copy_from_slice(
-                &padding.bytes[padding_start - padding.offset..padding_end - padding.offset],
-            );
-        }
-
-        let (section_table, _) =
-            output[sections_offset..table_end].as_chunks_mut::<{ SectionHeader::SIZE }>();
-        for (section, slot) in self.sections.iter().zip(section_table) {
-            section.header.write(slot)?;
-        }
-        if let Some((offset, bytes)) = tail {
-            output[offset..offset + bytes.len()].copy_from_slice(bytes);
-        }
-
-        Ok(WrittenHeaders {
-            bytes: output,
+        Ok(HeaderPlan {
+            pe_offset,
+            coff_offset,
             optional_offset,
-            table_overlaps_optional_header: optional_end > sections_offset
-                && !self.sections.is_empty(),
+            optional_end,
+            sections_offset,
+            padding,
+            tail,
+            len,
         })
+    }
+
+    /// Write the header structures that `plan` places into `output`, in file order.
+    ///
+    /// `output` holds the header bytes from the file offset `start`. The method writes only the
+    /// parts of the structures in that window.
+    fn write_headers(&self, plan: &HeaderPlan<'_>, start: usize, output: &mut [u8]) -> Result<()> {
+        let mut window = HeaderWindow { start, output };
+        let mut dos = [0u8; DosHeader::SIZE];
+        self.dos_header.write(&mut dos)?;
+        window.put(0, &dos);
+        window.put(DosHeader::SIZE, &self.dos_stub);
+        window.put(plan.pe_offset, &PE_SIGNATURE.to_le_bytes());
+        let mut coff = [0u8; CoffHeader::SIZE];
+        self.coff_header.write(&mut coff)?;
+        window.put(plan.coff_offset, &coff);
+        window.put(plan.optional_offset, &self.optional_header.to_bytes());
+        if let Some((offset, bytes)) = plan.padding {
+            window.put(offset, bytes);
+        }
+
+        // Write only the section headers in the window. `plan_headers` checked that the table
+        // offsets do not overflow.
+        let first = start.saturating_sub(plan.sections_offset) / SectionHeader::SIZE;
+        for (index, section) in self.sections.iter().enumerate().skip(first) {
+            let offset = plan.sections_offset + index * SectionHeader::SIZE;
+            if offset >= window.end() {
+                break;
+            }
+            let mut entry = [0u8; SectionHeader::SIZE];
+            section.header.write(&mut entry)?;
+            window.put(offset, &entry);
+        }
+        if let Some((offset, bytes)) = plan.tail {
+            window.put(offset, bytes);
+        }
+        Ok(())
     }
 
     /// Return the end of the NT headers: after the section table or after the optional header,
@@ -455,7 +501,7 @@ impl PeImage {
     /// Return the end of the header data for a section table that ends at `table_end`.
     ///
     /// This is the end of the header tail, or `table_end` if no header tail follows the table.
-    pub(super) fn header_data_end(&self, table_end: usize) -> Option<usize> {
+    pub(crate) fn header_data_end(&self, table_end: usize) -> Option<usize> {
         self.header_tail_after(table_end)
             .map_or(Some(table_end), HeaderBytes::end)
     }
@@ -562,14 +608,42 @@ fn try_zeroed_buffer(size: usize, context: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// The output of [`PeImage::write_header_structures`].
-struct WrittenHeaders {
-    /// The header bytes.
-    bytes: Vec<u8>,
-    /// The file offset of the optional header.
+/// The file offsets of the header structures, from [`PeImage::plan_headers`].
+struct HeaderPlan<'a> {
+    pe_offset: usize,
+    coff_offset: usize,
     optional_offset: usize,
-    /// `true` if the section table overlaps the optional header.
-    table_overlaps_optional_header: bool,
+    optional_end: usize,
+    sections_offset: usize,
+    /// The optional-header padding that the build keeps, at its file offset.
+    padding: Option<(usize, &'a [u8])>,
+    /// The header tail that the build keeps, at its file offset.
+    tail: Option<(usize, &'a [u8])>,
+    /// The length of the header bytes.
+    len: usize,
+}
+
+/// A window of the header bytes that starts at the file offset `start`.
+struct HeaderWindow<'a> {
+    start: usize,
+    output: &'a mut [u8],
+}
+
+impl HeaderWindow<'_> {
+    /// Return the file offset after the window.
+    fn end(&self) -> usize {
+        self.start + self.output.len()
+    }
+
+    /// Copy the part of `bytes` at the file offset `offset` that is in the window.
+    fn put(&mut self, offset: usize, bytes: &[u8]) {
+        let from = offset.max(self.start);
+        let to = offset.saturating_add(bytes.len()).min(self.end());
+        if from < to {
+            self.output[from - self.start..to - self.start]
+                .copy_from_slice(&bytes[from - offset..to - offset]);
+        }
+    }
 }
 
 /// Return the file range where the loader reads the raw data of `section`, as `(start, size)`.

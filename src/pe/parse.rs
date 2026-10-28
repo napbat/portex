@@ -87,7 +87,8 @@ impl PeImage {
         Self::read_from(&reader, 0, layout)
     }
 
-    /// Parse PE bytes with explicit [`ParseOptions`] for strictness and source layout.
+    /// Parse PE bytes with explicit [`ParseOptions`]: the source layout and the policy for
+    /// section bytes that cannot be read.
     ///
     /// # Errors
     ///

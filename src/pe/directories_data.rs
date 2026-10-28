@@ -154,7 +154,8 @@ impl PeImage {
         );
         match dir {
             Some(d) => {
-                let read_fn = |rva: u32, len: usize| -> Option<Vec<u8>> { self.read_rva(rva, len) };
+                let reader = self.rva_reader();
+                let read_fn = |rva: u32, len: usize| reader.read(rva, len);
                 crate::delay_import::DelayImportDirectory::parse_sized_with_image_base(
                     d.virtual_address,
                     d.size,
@@ -283,7 +284,8 @@ impl PeImage {
             .filter(|d| d.is_present());
         match dir {
             Some(d) => {
-                let read_fn = |rva: u32, len: usize| -> Option<Vec<u8>> { self.read_rva(rva, len) };
+                let reader = self.rva_reader();
+                let read_fn = |rva: u32, len: usize| reader.read(rva, len);
                 crate::resource::ResourceDirectory::parse(d.virtual_address, d.size, read_fn)
             }
             None => Ok(crate::resource::ResourceDirectory::default()),
@@ -307,7 +309,8 @@ impl PeImage {
             .filter(|d| d.is_present());
         match dir {
             Some(d) => {
-                let read_fn = |rva: u32, len: usize| -> Option<Vec<u8>> { self.read_rva(rva, len) };
+                let reader = self.rva_reader();
+                let read_fn = |rva: u32, len: usize| reader.read(rva, len);
                 crate::resource::ResourceDirectory::parse_with_data(
                     d.virtual_address,
                     d.size,

@@ -81,15 +81,19 @@ pub enum SourceLayout {
 }
 
 /// The policy for section bytes that the parser cannot read from the source.
+///
+/// In the file layout, the end of a source that reports its size is not a read failure: raw
+/// data after it reads as zeros, as the loader maps it. The policy applies to the other read
+/// failures, and to the mapped layout.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MissingSectionData {
-    /// Reject section ranges that are truncated or that the parser cannot read.
+    /// Reject section ranges that the parser cannot read.
     #[default]
     Error,
     /// Keep the section header, and give the section empty data for the missing bytes.
     ///
     /// Use this for remote mapped images. In such images, the pages of discardable sections
-    /// can be decommitted.
+    /// can be decommitted. RVA reads do not read the missing bytes as zeros.
     Empty,
 }
 
@@ -105,7 +109,7 @@ pub struct ParseOptions {
 }
 
 impl ParseOptions {
-    /// Return options for strict parsing of a raw file.
+    /// Return the default options for a raw file.
     #[must_use]
     pub const fn file() -> Self {
         Self {
@@ -115,7 +119,7 @@ impl ParseOptions {
         }
     }
 
-    /// Return options for strict parsing of a loader-mapped image.
+    /// Return the default options for a loader-mapped image.
     #[must_use]
     pub const fn mapped() -> Self {
         Self {

@@ -672,6 +672,16 @@ impl OptionalHeader {
         }
     }
 
+    /// Parse `data` with the layout of this header (PE32 or PE32+), and keep any `Magic` value.
+    ///
+    /// The build uses this method to read back the bytes that it wrote.
+    pub(crate) fn parse_with_layout_of(&self, data: &[u8]) -> Result<Self> {
+        Ok(match self {
+            Self::Pe32(_) => Self::Pe32(OptionalHeader32::parse_with_any_magic(data)?),
+            Self::Pe32Plus(_) => Self::Pe32Plus(OptionalHeader64::parse_with_any_magic(data)?),
+        })
+    }
+
     /// Read an optional header from a [`ReadAt`] reader at the file offset `offset`.
     ///
     /// As the loader does, the method reads the fixed header and at most
@@ -684,7 +694,7 @@ impl OptionalHeader {
     /// - Returns a read error if the reader cannot read the header.
     /// - Returns an invalid-magic error for an unknown `Magic`.
     /// - Returns an invalid-data-directory error if the header offset overflows.
-    /// - Returns any error from [`Self::parse`].
+    /// - Returns a buffer-too-small error if the data directories cannot be read.
     pub fn read_from<R: ReadAt>(reader: &R, offset: u64) -> Result<Self> {
         let magic = reader.read_u16_at(offset)?;
         match magic {

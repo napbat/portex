@@ -291,8 +291,10 @@ pub struct Section {
     /// The original raw size of the section, if `data` came from a loader-mapped image.
     pub(crate) mapped_raw_size: Option<u32>,
     pub(crate) mapped_data_len: usize,
-    /// The raw range of the section goes past the end of the source file, and `data` holds the
-    /// bytes up to that end. The loader maps zeros for the rest, so RVA reads give zeros there.
+    /// The loader maps zeros for the raw bytes after `data`, so RVA reads give zeros there.
+    /// This is the case if the raw range goes past the end of the source file, and `data` holds
+    /// the bytes up to that end. It is also the case if `PointerToRawData` is 0, and `data` is
+    /// empty.
     pub(crate) raw_tail_is_zero: bool,
 }
 

@@ -3,6 +3,9 @@ use crate::optional::OptionalHeader;
 use crate::prelude::*;
 use crate::section::Section;
 use crate::{Error, Result};
+use alloc::collections::BinaryHeap;
+use core::cell::OnceCell;
+use core::cmp::Reverse;
 
 /// The number of zero bytes that one [`PeImage::read_rva`] call can always add.
 ///
@@ -63,44 +66,20 @@ impl PeImage {
     /// The result is `None` if the range is not in the image. It is also `None` if the read adds
     /// more zero bytes than the image holds in its header data and section data, or than 1 MiB
     /// if that is more. This limit keeps the memory use of a read in proportion to the input, also
-    /// if `SizeOfHeaders` or `VirtualSize` is very large.
+    /// if `SizeOfHeaders` or `VirtualSize` is very large. A range in the headers also gives `None`
+    /// if the header fields cannot be serialized, for example if the DOS stub ends after
+    /// `e_lfanew`.
     #[must_use]
     pub fn read_rva(&self, rva: u32, len: usize) -> Option<Vec<u8>> {
-        if len == 0 {
-            return Some(Vec::new());
-        }
+        RvaReader::new(self, SectionLookup::Table).read(rva, len)
+    }
 
-        // Each output byte is a copy of a held byte or a zero byte.
-        let held = self.held_len();
-        let mut zero_budget = held.max(MIN_ZERO_FILL);
-        if len > held.saturating_add(zero_budget) || !self.contains_rva_range(rva, len) {
-            return None;
-        }
-        let mut header_bytes = None;
-        let mut output = Vec::new();
-        output.try_reserve_exact(len).ok()?;
-        self.visit_rva_range(rva, len, |part| {
-            let (bytes, offset, count) = match part {
-                RvaPart::Headers { start, count } => {
-                    if header_bytes.is_none() {
-                        header_bytes = Some(self.build_headers().ok()?);
-                    }
-                    (header_bytes.as_deref()?, start, count)
-                }
-                RvaPart::Section {
-                    section,
-                    offset,
-                    count,
-                } => (section.data.as_slice(), offset, count),
-            };
-            let initialized = bytes.get(offset..).unwrap_or_default();
-            let initialized = &initialized[..initialized.len().min(count)];
-            zero_budget = zero_budget.checked_sub(count - initialized.len())?;
-            output.extend_from_slice(initialized);
-            output.resize(output.len() + count - initialized.len(), 0);
-            Some(())
-        })?;
-        Some(output)
+    /// Return a reader of RVA ranges for a directory parser.
+    ///
+    /// The reader reads as [`Self::read_rva`] does. It sorts the sections once, so that a parse
+    /// that makes many reads stays fast also in an image with many sections.
+    pub(super) fn rva_reader(&self) -> RvaReader<'_> {
+        RvaReader::new(self, SectionLookup::sorted(&self.sections))
     }
 
     /// Return the number of bytes that the image holds: the header data and the section data.
@@ -122,13 +101,14 @@ impl PeImage {
     /// The check uses the extents of [`Self::read_rva`]. Thus the zero bytes after the raw data
     /// of a section are in the range, but [`Self::read_at_rva`] cannot borrow them.
     /// [`Self::read_rva`] can also reject a range that this method accepts, if the read adds too
-    /// many zero bytes.
+    /// many zero bytes, or if it cannot serialize the headers.
     #[must_use]
     pub fn contains_rva_range(&self, rva: u32, len: usize) -> bool {
         if len == 0 {
             return rva <= self.optional_header.size_of_image();
         }
-        self.visit_rva_range(rva, len, |_| Some(())).is_some()
+        self.visit_rva_range(&SectionLookup::Table, rva, len, |_| Some(()))
+            .is_some()
     }
 
     /// Call `visit` for each part of the RVA range `rva..rva + len`, in RVA order.
@@ -137,11 +117,14 @@ impl PeImage {
     /// extent of [`mapped_extent`]. The result is `None` if a part of the range is not in the
     /// image, or if `visit` returns `None`.
     ///
-    /// The first section is the one that [`Self::section_by_rva`] finds. If the range crosses
-    /// into more sections, the method sorts them by RVA once. Thus a walk over many sections
-    /// takes O(n log n) time, also if the section table is not in RVA order.
+    /// Each section part is in the first section in table order that contains its RVA, as
+    /// [`Self::section_by_rva`] finds it. `lookup` gives the method to find that section. With
+    /// [`SectionLookup::Table`], the method sorts the sections by RVA once if the range crosses
+    /// into more sections. Thus a walk over many sections takes O(n log n) time, also if the
+    /// section table is not in RVA order or the sections overlap.
     fn visit_rva_range<'a>(
         &'a self,
+        lookup: &SectionLookup,
         rva: u32,
         len: usize,
         mut visit: impl FnMut(RvaPart<'a>) -> Option<()>,
@@ -167,6 +150,25 @@ impl PeImage {
             return Some(());
         }
 
+        if let SectionLookup::Sorted(order) = lookup {
+            // The sections do not overlap. Thus the section that contains `current` is the last
+            // section that starts at or before it, and the next part is in the next section.
+            let mut position = order
+                .partition_point(|&index| self.sections[index].header.virtual_address <= current)
+                .checked_sub(1)?;
+            while remaining != 0 {
+                let section = &self.sections[*order.get(position)?];
+                if !section.contains_rva(current) {
+                    return None;
+                }
+                let count = visit_section_part(section, current, remaining, &mut visit)?;
+                current = current.checked_add(u32::try_from(count).ok()?)?;
+                remaining -= count;
+                position += 1;
+            }
+            return Some(());
+        }
+
         let first = self.section_by_rva(current)?;
         let count = visit_section_part(first, current, remaining, &mut visit)?;
         current = current.checked_add(u32::try_from(count).ok()?)?;
@@ -175,29 +177,35 @@ impl PeImage {
             return Some(());
         }
 
-        let mut later: Vec<&Section> = self
+        // Walk the other sections in RVA order. The heap holds the sections that start at or
+        // before `current`, by table index. Its first unexpired entry is the first section in
+        // table order that contains `current`.
+        let mut later: Vec<(usize, &Section)> = self
             .sections
             .iter()
-            .filter(|section| {
+            .enumerate()
+            .filter(|(_, section)| {
                 u64::from(section.header.virtual_address) < end
                     && section_end(section) > u64::from(current)
             })
             .collect();
-        later.sort_by_key(|section| section.header.virtual_address);
+        later.sort_by_key(|(_, section)| section.header.virtual_address);
+        let mut started = BinaryHeap::new();
         let mut next = 0;
         while remaining != 0 {
-            // Skip the sections that end at or before `current`. The first other section must
-            // contain `current`: the sections after it start at a higher RVA.
-            while later
-                .get(next)
-                .is_some_and(|section| section_end(section) <= u64::from(current))
+            while let Some(&(index, section)) = later.get(next)
+                && section.header.virtual_address <= current
             {
+                started.push(Reverse(index));
                 next += 1;
             }
-            let section = later
-                .get(next)
-                .filter(|section| section.contains_rva(current))?;
-            let count = visit_section_part(section, current, remaining, &mut visit)?;
+            while let Some(&Reverse(index)) = started.peek()
+                && section_end(&self.sections[index]) <= u64::from(current)
+            {
+                started.pop();
+            }
+            let &Reverse(index) = started.peek()?;
+            let count = visit_section_part(&self.sections[index], current, remaining, &mut visit)?;
             current = current.checked_add(u32::try_from(count).ok()?)?;
             remaining -= count;
         }
@@ -432,7 +440,8 @@ impl PeImage {
             .filter(|d| d.is_present());
         match dir {
             Some(d) => {
-                let read_fn = |rva: u32, len: usize| -> Option<Vec<u8>> { self.read_rva(rva, len) };
+                let reader = self.rva_reader();
+                let read_fn = |rva: u32, len: usize| reader.read(rva, len);
                 crate::import::ImportTable::parse_sized(
                     d.virtual_address,
                     d.size,
@@ -461,7 +470,8 @@ impl PeImage {
             .filter(|d| d.is_present());
         match dir {
             Some(d) => {
-                let read_fn = |rva: u32, len: usize| -> Option<Vec<u8>> { self.read_rva(rva, len) };
+                let reader = self.rva_reader();
+                let read_fn = |rva: u32, len: usize| reader.read(rva, len);
                 crate::export::ExportTable::parse(d.virtual_address, d.size, read_fn)
             }
             None => Ok(crate::export::ExportTable::default()),
@@ -485,7 +495,8 @@ impl PeImage {
             .filter(|d| d.is_present());
         match dir {
             Some(d) => {
-                let read_fn = |rva: u32, len: usize| -> Option<Vec<u8>> { self.read_rva(rva, len) };
+                let reader = self.rva_reader();
+                let read_fn = |rva: u32, len: usize| reader.read(rva, len);
                 crate::reloc::RelocationTable::parse(d.virtual_address, d.size, read_fn)
             }
             None => Ok(crate::reloc::RelocationTable::default()),
@@ -523,6 +534,9 @@ impl PeImage {
 
     /// Store a data-directory entry. If necessary, grow the array and update
     /// `NumberOfRvaAndSizes`. The caller must validate `index` first.
+    ///
+    /// A `NumberOfRvaAndSizes` larger than the array stays as it is, so that a round trip keeps
+    /// it.
     fn store_data_directory(&mut self, index: usize, rva: u32, size: u32) {
         let dirs = self.optional_header.data_directories_mut();
         if dirs.len() <= index {
@@ -531,11 +545,12 @@ impl PeImage {
         dirs[index].virtual_address = rva;
         dirs[index].size = size;
 
-        let count = u32::try_from(dirs.len()).unwrap_or(u32::MAX);
-        match &mut self.optional_header {
-            OptionalHeader::Pe32(header) => header.number_of_rva_and_sizes = count,
-            OptionalHeader::Pe32Plus(header) => header.number_of_rva_and_sizes = count,
-        }
+        let length = u32::try_from(dirs.len()).unwrap_or(u32::MAX);
+        let count = match &mut self.optional_header {
+            OptionalHeader::Pe32(header) => &mut header.number_of_rva_and_sizes,
+            OptionalHeader::Pe32Plus(header) => &mut header.number_of_rva_and_sizes,
+        };
+        *count = (*count).max(length);
     }
 
     pub(super) fn ensure_data_directory_slot(
@@ -613,7 +628,8 @@ impl PeImage {
 /// An RVA read uses the same zeros, but only after complete raw data:
 ///
 /// - If the raw data goes past the end of the source file, the loader also maps zeros for the
-///   bytes after that end. The data is complete.
+///   bytes after that end. If `PointerToRawData` is 0, the loader maps only zeros. In both
+///   cases the data is complete.
 /// - Otherwise, if the data is shorter than `SizeOfRawData`, the parser could not read some raw
 ///   bytes (see [`MissingSectionData::Empty`](super::MissingSectionData::Empty)). These bytes
 ///   are not known to be zero, so the read stops at the end of the data.
@@ -633,6 +649,100 @@ fn mapped_extent(section: &Section) -> usize {
         .virtual_size
         .max(section.header.size_of_raw_data) as usize)
         .max(data_len)
+}
+
+/// The method that finds the section that contains an RVA.
+enum SectionLookup {
+    /// Search the section table in table order. This needs no setup, so a single read uses it.
+    Table,
+    /// The indices of the sections that are not empty, sorted by RVA. These sections do not
+    /// overlap, so a binary search finds the one section that contains an RVA.
+    Sorted(Vec<usize>),
+}
+
+impl SectionLookup {
+    /// Sort the sections by RVA. If two sections overlap, use the table order.
+    fn sorted(sections: &[Section]) -> Self {
+        let start = |index: usize| u64::from(sections[index].header.virtual_address);
+        let mut order: Vec<usize> = (0..sections.len())
+            .filter(|&index| section_end(&sections[index]) > start(index))
+            .collect();
+        order.sort_by_key(|&index| start(index));
+        if order
+            .windows(2)
+            .all(|pair| section_end(&sections[pair[0]]) <= start(pair[1]))
+        {
+            Self::Sorted(order)
+        } else {
+            Self::Table
+        }
+    }
+}
+
+/// A reader of RVA ranges, from [`PeImage::rva_reader`].
+pub(super) struct RvaReader<'a> {
+    image: &'a PeImage,
+    lookup: SectionLookup,
+    /// The value of [`PeImage::held_len`], which the reader calculates at most once.
+    held: OnceCell<usize>,
+}
+
+impl<'a> RvaReader<'a> {
+    fn new(image: &'a PeImage, lookup: SectionLookup) -> Self {
+        Self {
+            image,
+            lookup,
+            held: OnceCell::new(),
+        }
+    }
+
+    /// Read `len` bytes at an RVA into a new buffer, as [`PeImage::read_rva`] does.
+    pub(super) fn read(&self, rva: u32, len: usize) -> Option<Vec<u8>> {
+        if len == 0 {
+            return Some(Vec::new());
+        }
+
+        // Each output byte is a copy of a held byte or a zero byte. The held bytes matter only
+        // for a read that is larger than the minimum budget, and their count visits each section.
+        let mut zero_budget = if len <= MIN_ZERO_FILL {
+            MIN_ZERO_FILL
+        } else {
+            let held = *self.held.get_or_init(|| self.image.held_len());
+            let budget = held.max(MIN_ZERO_FILL);
+            if len > held.saturating_add(budget) {
+                return None;
+            }
+            budget
+        };
+        let image = self.image;
+        image.visit_rva_range(&self.lookup, rva, len, |_| Some(()))?;
+        let mut header_bytes = None;
+        let mut output = Vec::new();
+        output.try_reserve_exact(len).ok()?;
+        image.visit_rva_range(&self.lookup, rva, len, |part| {
+            let (bytes, offset, count) = match part {
+                // The header part comes first, so this builds the requested header bytes once.
+                RvaPart::Headers { start, count } => {
+                    if header_bytes.is_none() {
+                        header_bytes = Some(image.header_bytes(start, start + count).ok()?);
+                    }
+                    (header_bytes.as_deref()?, 0, count)
+                }
+                RvaPart::Section {
+                    section,
+                    offset,
+                    count,
+                } => (section.data.as_slice(), offset, count),
+            };
+            let initialized = bytes.get(offset..).unwrap_or_default();
+            let initialized = &initialized[..initialized.len().min(count)];
+            zero_budget = zero_budget.checked_sub(count - initialized.len())?;
+            output.extend_from_slice(initialized);
+            output.resize(output.len() + count - initialized.len(), 0);
+            Some(())
+        })?;
+        Some(output)
+    }
 }
 
 /// One part of an RVA range: bytes in the headers or bytes in one section.
