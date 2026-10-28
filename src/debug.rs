@@ -389,20 +389,16 @@ impl DebugInfo {
                 DebugDirectory::SIZE
             )));
         }
-        let num_entries = debug_size as usize / DebugDirectory::SIZE;
+        let table = crate::parse_utils::read_record_table(
+            read_at_rva,
+            debug_rva,
+            debug_size,
+            DebugDirectory::SIZE,
+            "debug table",
+        )?;
 
-        for i in 0..num_entries {
-            let offset = i
-                .checked_mul(DebugDirectory::SIZE)
-                .and_then(|offset| u32::try_from(offset).ok())
-                .ok_or_else(|| Error::invalid_data_directory("debug table offset overflow"))?;
-            let entry_rva = debug_rva
-                .checked_add(offset)
-                .ok_or_else(|| Error::invalid_data_directory("debug table RVA overflow"))?;
-            let data = read_at_rva(entry_rva, DebugDirectory::SIZE)
-                .ok_or(Error::invalid_rva(entry_rva))?;
-
-            let dir = DebugDirectory::parse(&data)?;
+        for data in table.as_chunks::<{ DebugDirectory::SIZE }>().0 {
+            let dir = DebugDirectory::parse(data)?;
             if dir.characteristics != 0 {
                 return Err(Error::invalid_data_directory(
                     "debug directory Characteristics must be zero",

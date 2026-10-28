@@ -78,7 +78,7 @@ impl ExceptionDirectory {
     /// # Errors
     /// Returns an error in these conditions:
     /// - `pdata_size` is not a multiple of the record size.
-    /// - An entry cannot be read.
+    /// - The table cannot be read.
     /// - The entries fail [`Self::validate`].
     pub fn parse<F>(pdata_rva: u32, pdata_size: u32, read_at_rva: F) -> Result<Self>
     where
@@ -91,18 +91,16 @@ impl ExceptionDirectory {
                 RuntimeFunction::SIZE
             )));
         }
-        // Do not reserve capacity from `pdata_size`. The size comes from the file, and each
-        // entry must be read before it uses memory.
+        let table = crate::parse_utils::read_record_table(
+            &read_at_rva,
+            pdata_rva,
+            pdata_size,
+            RuntimeFunction::SIZE,
+            "exception table",
+        )?;
         let mut functions = Vec::new();
-
-        for offset in (0..pdata_size).step_by(RuntimeFunction::SIZE) {
-            let entry_rva = pdata_rva
-                .checked_add(offset)
-                .ok_or_else(|| Error::invalid_data_directory("exception table RVA overflow"))?;
-            let data = read_at_rva(entry_rva, RuntimeFunction::SIZE)
-                .ok_or(Error::invalid_rva(entry_rva))?;
-
-            let func = RuntimeFunction::parse(&data)?;
+        for data in table.as_chunks::<{ RuntimeFunction::SIZE }>().0 {
+            let func = RuntimeFunction::parse(data)?;
             // Skip null entries.
             if func.begin_address != 0 || func.end_address != 0 {
                 functions.push(func);

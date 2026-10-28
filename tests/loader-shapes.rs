@@ -605,3 +605,77 @@ fn a_directory_that_crosses_two_sections_parses() {
     assert_eq!(directory.debug_type, 2);
     assert_eq!(directory.pointer_to_raw_data, 0x5566);
 }
+
+/// Build a file with data directory `index` of `size` bytes at the start of `.rdata`.
+///
+/// The `.rdata` section has 0x200 bytes of raw data, a `VirtualSize` of 0xFFFF0000, and a
+/// `SizeOfImage` that covers it. Thus the loader fills almost 4 GiB of the section with zeros.
+fn zero_filled_directory(machine: MachineType, index: usize, size: u32) -> Vec<u8> {
+    let mut raw = PeBuilder::new()
+        .machine(machine)
+        .add_section(".text", vec![0xcc; 0x180], characteristics::READ)
+        .add_section(".rdata", vec![0; 0x180], characteristics::READ)
+        .try_build()
+        .unwrap()
+        .try_build()
+        .unwrap();
+    let headers = PeHeaders::from_slice(&raw).unwrap();
+    let optional = optional_offset(&headers);
+    let rdata = headers.section_headers[1].virtual_address;
+    put32(&mut raw, optional + 32, 0xffff_0000);
+    put32(&mut raw, optional + 56, 0xffff_f000);
+    put32(
+        &mut raw,
+        section_header_offset(&headers, 1) + 8,
+        0xffff_0000,
+    );
+    // The PE32+ data directories start at offset 112.
+    put32(&mut raw, optional + 112 + index * 8, rdata);
+    put32(&mut raw, optional + 112 + index * 8 + 4, size);
+    raw
+}
+
+#[test]
+fn a_huge_zero_filled_exception_table_is_one_bounded_read() {
+    // Before the fix, the parse read each 12-byte or 8-byte record separately. It made
+    // hundreds of millions of reads for this size.
+    let exception = DataDirectoryType::Exception as usize;
+    let size = 0xffff_0000 / 24 * 24;
+    for machine in [MachineType::Amd64, MachineType::Arm64] {
+        let image = PeImage::parse(&zero_filled_directory(machine, exception, size)).unwrap();
+        let rdata = image.sections[1].header.virtual_address;
+        let error = image.exception_table().unwrap_err();
+        assert!(
+            matches!(error.kind, portex::ErrorKind::InvalidRva(rva) if rva == rdata),
+            "{machine:?}: {error}"
+        );
+
+        // A small table in the zero bytes after the raw data has only null records.
+        let image = PeImage::parse(&zero_filled_directory(machine, exception, 0x1_0008)).unwrap();
+        assert!(image.exception_table().unwrap().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn a_huge_zero_filled_debug_directory_is_one_bounded_read() {
+    // Before the fix, the parse read each 28-byte entry separately, and kept each zero entry.
+    // It made about 153 million reads and entries for this size.
+    let debug = DataDirectoryType::Debug as usize;
+    let size = 0xffff_0000 / 28 * 28;
+    let image = PeImage::parse(&zero_filled_directory(MachineType::Amd64, debug, size)).unwrap();
+    let rdata = image.sections[1].header.virtual_address;
+    let error = image.debug_info().unwrap_err();
+    assert!(matches!(error.kind, portex::ErrorKind::InvalidRva(rva) if rva == rdata));
+
+    // A small directory in the zero bytes after the raw data has only zero entries.
+    let image = PeImage::parse(&zero_filled_directory(
+        MachineType::Amd64,
+        debug,
+        28 * 0x100,
+    ))
+    .unwrap();
+    assert_eq!(
+        image.debug_info().unwrap().unwrap().directories.len(),
+        0x100
+    );
+}
