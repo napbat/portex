@@ -55,12 +55,18 @@ pub struct DosHeader {
     /// Reserved words.
     pub e_res2: [u16; 10],
     /// File offset of the new EXE header (the PE header).
+    ///
+    /// The value can be smaller than [`Self::SIZE`]. Then the NT headers overlap the DOS header,
+    /// and the DOS header fields after `e_lfanew` are bytes of the NT headers.
     pub e_lfanew: i32,
 }
 
 impl DosHeader {
     /// Size of the DOS header in bytes.
     pub const SIZE: usize = 64;
+
+    /// The smallest `e_lfanew` that the Windows loader accepts.
+    pub(crate) const MIN_PE_OFFSET: usize = 4;
 
     /// Parse a DOS header from a byte slice.
     ///

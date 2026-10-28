@@ -1,4 +1,4 @@
-use super::{MAX_NUMBER_OF_SECTIONS, PeHeaders, SourceLayout};
+use super::{PeHeaders, SourceLayout};
 use crate::coff::{CoffHeader, verify_pe_signature};
 use crate::dos::DosHeader;
 use crate::optional::OptionalHeader;
@@ -23,57 +23,74 @@ impl PeHeaders {
     ///
     /// - The DOS header, PE signature, COFF header, optional header, or section table cannot
     ///   be read or is invalid.
-    /// - `e_lfanew` is negative or points into the DOS header.
+    /// - `e_lfanew` is negative or smaller than 4. A value from 4 to 63 is valid: then the NT
+    ///   headers overlap the DOS header.
     /// - The calculation of a header offset overflows.
-    /// - `NumberOfSections` is more than [`MAX_NUMBER_OF_SECTIONS`].
+    ///
+    /// Each read error names the structure and its file offset in its context.
     #[must_use = "parsing returns PE headers that should be used"]
     pub fn read_from<R: ReadAt>(reader: &R, base_offset: u64) -> Result<Self> {
         // Parse the DOS header.
-        let dos_header = DosHeader::read_from(reader, base_offset)?;
+        let dos_header = DosHeader::read_from(reader, base_offset).map_err(|error| {
+            error
+                .in_structure("IMAGE_DOS_HEADER")
+                .at_offset(base_offset)
+        })?;
 
         // Get the offset of the PE header.
         let relative_pe_offset = u64::try_from(dos_header.e_lfanew)
             .map_err(|_| Error::invalid_section("e_lfanew is negative"))?;
-        if relative_pe_offset < DosHeader::SIZE as u64 {
-            return Err(Error::invalid_section(
-                "e_lfanew places the PE header inside the DOS header",
-            ));
+        if relative_pe_offset < DosHeader::MIN_PE_OFFSET as u64 {
+            return Err(Error::invalid_section(format!(
+                "e_lfanew {relative_pe_offset:#x} is smaller than {:#x}, the minimum of the loader",
+                DosHeader::MIN_PE_OFFSET
+            )));
         }
         let pe_offset = base_offset
             .checked_add(relative_pe_offset)
             .ok_or_else(|| Error::invalid_section("PE header offset overflow"))?;
 
         // Check the PE signature.
-        verify_pe_signature(reader, pe_offset)?;
+        verify_pe_signature(reader, pe_offset)
+            .map_err(|error| error.in_structure("PE signature").at_offset(pe_offset))?;
 
         // Parse the COFF header. It starts 4 bytes after the PE signature.
         let coff_offset = pe_offset
             .checked_add(4)
             .ok_or_else(|| Error::invalid_section("COFF header offset overflow"))?;
-        let coff_header = CoffHeader::read_from(reader, coff_offset)?;
+        let coff_header = CoffHeader::read_from(reader, coff_offset).map_err(|error| {
+            error
+                .in_structure("IMAGE_FILE_HEADER")
+                .at_offset(coff_offset)
+        })?;
 
-        let section_count = usize::from(coff_header.number_of_sections);
-        if section_count > MAX_NUMBER_OF_SECTIONS {
-            return Err(Error::invalid_section(format!(
-                "section count {section_count} exceeds the PE image limit of {MAX_NUMBER_OF_SECTIONS}"
-            )));
-        }
-
-        // Parse the optional header.
+        // Parse the optional header. As the loader does, read all of its fields, also if
+        // `SizeOfOptionalHeader` is smaller. Then the section table overlaps the optional header.
         let optional_offset = coff_offset
             .checked_add(CoffHeader::SIZE as u64)
             .ok_or_else(|| Error::invalid_section("optional-header offset overflow"))?;
-        let optional_header = OptionalHeader::read_sized_from(
-            reader,
-            optional_offset,
-            usize::from(coff_header.size_of_optional_header),
-        )?;
+        let optional_header =
+            OptionalHeader::read_from(reader, optional_offset).map_err(|error| {
+                error
+                    .in_structure("optional header")
+                    .at_offset(optional_offset)
+            })?;
 
-        // Parse the section headers.
+        // Parse the section headers. `SizeOfOptionalHeader` is the distance from the start of the
+        // optional header to the section table.
         let sections_offset = optional_offset
             .checked_add(u64::from(coff_header.size_of_optional_header))
             .ok_or_else(|| Error::invalid_section("section-table offset overflow"))?;
-        let section_headers = SectionHeader::read_sections(reader, sections_offset, section_count)?;
+        let section_headers = SectionHeader::read_sections(
+            reader,
+            sections_offset,
+            usize::from(coff_header.number_of_sections),
+        )
+        .map_err(|error| {
+            error
+                .in_structure("section table")
+                .at_offset(sections_offset)
+        })?;
 
         Ok(Self {
             dos_header,
@@ -130,7 +147,9 @@ impl PeHeaders {
     ///
     /// The offset is relative to the start of the image. If you called [`Self::read_from`]
     /// with a nonzero `base_offset`, add that base to the offset before you read from the
-    /// original source.
+    /// original source. In the file layout, the offset is where the loader reads the byte: the
+    /// loader rounds `PointerToRawData` down to a multiple of 0x200 if `FileAlignment` is 0x200 or
+    /// more.
     #[must_use]
     pub fn rva_to_source_offset(&self, rva: u32, layout: SourceLayout) -> Option<u32> {
         if rva >= self.optional_header.size_of_image() {
@@ -143,9 +162,10 @@ impl PeHeaders {
                 if rva < self.optional_header.size_of_headers() {
                     return Some(rva);
                 }
-                self.section_headers
-                    .iter()
-                    .find_map(|section| section.rva_to_offset(rva))
+                let file_alignment = self.optional_header.file_alignment();
+                self.section_headers.iter().find_map(|section| {
+                    crate::layout::section_rva_to_file_offset(section, rva, file_alignment)
+                })
             }
         }
     }

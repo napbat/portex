@@ -96,13 +96,18 @@ fn count_module_names(bytes: &[u8]) -> usize {
 #[test]
 fn validation_reports_an_unverifiable_checksum_without_a_panic() {
     let mut image = test_image();
-    let rdata = image.sections[1].header.virtual_address;
-    // A debug directory size that is not a multiple of 28 makes the build fail.
-    image.set_data_directory(DataDirectoryType::Debug, rdata, 29);
+    // A FileAlignment that is not a power of two makes the build fail.
     match &mut image.optional_header {
-        OptionalHeader::Pe32(header) => header.check_sum = 1,
-        OptionalHeader::Pe32Plus(header) => header.check_sum = 1,
+        OptionalHeader::Pe32(header) => {
+            header.file_alignment = 0x300;
+            header.check_sum = 1;
+        }
+        OptionalHeader::Pe32Plus(header) => {
+            header.file_alignment = 0x300;
+            header.check_sum = 1;
+        }
     }
+    assert!(image.try_build().is_err());
 
     let result = image.validate();
     assert!(
@@ -190,27 +195,17 @@ fn a_section_table_that_replaces_bound_imports_clears_the_directory() {
 fn rva_reads_do_not_zero_fill_section_bytes_that_the_parser_could_not_read() {
     let image = test_image();
     let rdata = image.sections[1].header.virtual_address;
-    let rdata_offset = image.sections[1].header.pointer_to_raw_data as usize;
     // A remote reader cannot read the pages of `.rdata`.
     let mapped = image.to_mapped_image().unwrap();
-    let mapped = PeImage::parse_with_options(
+    let parsed = PeImage::parse_with_options(
         &mapped[..rdata as usize],
         ParseOptions::mapped().allow_missing_section_data(),
     )
     .unwrap();
-    // A truncated file ends before the raw data of `.rdata`.
-    let raw = image.try_build().unwrap();
-    let file = PeImage::parse_with_options(
-        &raw[..rdata_offset],
-        ParseOptions::file().allow_missing_section_data(),
-    )
-    .unwrap();
 
-    for parsed in [mapped, file] {
-        assert_eq!(parsed.sections[1].data, []);
-        assert!(!parsed.contains_rva_range(rdata, 16));
-        assert_eq!(parsed.read_rva(rdata, 16), None);
-    }
+    assert_eq!(parsed.sections[1].data, []);
+    assert!(!parsed.contains_rva_range(rdata, 16));
+    assert_eq!(parsed.read_rva(rdata, 16), None);
 }
 
 #[test]

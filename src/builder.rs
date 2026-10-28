@@ -372,12 +372,7 @@ impl PeBuilder {
                 let mut header = SectionHeader::default();
                 header.set_name(name);
                 header.characteristics = *characteristics;
-                Section {
-                    header,
-                    data: data.clone(),
-                    mapped_raw_size: None,
-                    mapped_data_len: 0,
-                }
+                Section::from_header_and_data(header, data.clone())
             })
             .collect()
     }

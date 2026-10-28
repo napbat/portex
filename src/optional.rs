@@ -1,7 +1,7 @@
 //! Optional header (`IMAGE_OPTIONAL_HEADER32` and `IMAGE_OPTIONAL_HEADER64`) structures and
 //! parsing.
 
-use crate::data_dir::DataDirectory;
+use crate::data_dir::{DataDirectory, NUMBER_OF_DIRECTORY_ENTRIES};
 use crate::prelude::*;
 use crate::reader::ReadAt;
 use crate::{Error, Result};
@@ -165,6 +165,9 @@ pub struct OptionalHeader32 {
     /// Reserved. Must be zero.
     pub loader_flags: u32,
     /// Number of data directory entries after the fixed part of the header.
+    ///
+    /// The loader reads at most [`NUMBER_OF_DIRECTORY_ENTRIES`] entries. The parser keeps a
+    /// larger value here, but reads only that number of entries into `data_directories`.
     pub number_of_rva_and_sizes: u32,
     /// Data-directory entries (`IMAGE_DATA_DIRECTORY` array).
     pub data_directories: Vec<DataDirectory>,
@@ -230,6 +233,9 @@ pub struct OptionalHeader64 {
     /// Reserved. Must be zero.
     pub loader_flags: u32,
     /// Number of data directory entries after the fixed part of the header.
+    ///
+    /// The loader reads at most [`NUMBER_OF_DIRECTORY_ENTRIES`] entries. The parser keeps a
+    /// larger value here, but reads only that number of entries into `data_directories`.
     pub number_of_rva_and_sizes: u32,
     /// Data-directory entries (`IMAGE_DATA_DIRECTORY` array).
     pub data_directories: Vec<DataDirectory>,
@@ -253,9 +259,9 @@ impl OptionalHeader32 {
     /// # Errors
     ///
     /// - Returns a buffer-too-small error if `data` is shorter than the fixed header, or shorter
-    ///   than the data directories that `NumberOfRvaAndSizes` declares.
+    ///   than the data directories that `NumberOfRvaAndSizes` declares. As the loader does, the
+    ///   parser reads at most [`NUMBER_OF_DIRECTORY_ENTRIES`] entries.
     /// - Returns an invalid-magic error if `Magic` is not [`PE32_MAGIC`].
-    /// - Returns an invalid-data-directory error if the declared size overflows.
     pub fn parse(data: &[u8]) -> Result<Self> {
         let len = data.len();
         let Some((data, dir_bytes)) = data.split_first_chunk::<{ Self::BASE_SIZE }>() else {
@@ -375,33 +381,37 @@ impl OptionalHeader32 {
     }
 }
 
-/// Parse `NumberOfRvaAndSizes` data directories from `dir_bytes`.
+/// Parse the data directories that `NumberOfRvaAndSizes` declares from `dir_bytes`.
 ///
-/// `dir_bytes` holds the bytes after a fixed header of `base_size` bytes. `total_len` is the
-/// length of the full input. Only the errors use it.
+/// As the loader does, read at most [`NUMBER_OF_DIRECTORY_ENTRIES`] entries. `dir_bytes` holds
+/// the bytes after a fixed header of `base_size` bytes. `total_len` is the length of the full
+/// input. Only the errors use it.
 fn parse_data_directories(
     number_of_rva_and_sizes: u32,
     base_size: usize,
     dir_bytes: &[u8],
     total_len: usize,
 ) -> Result<Vec<DataDirectory>> {
-    let dirs_count = usize::try_from(number_of_rva_and_sizes)
-        .map_err(|_| Error::invalid_data_directory("data-directory count is too large"))?;
-    let dirs_len = dirs_count
-        .checked_mul(DataDirectory::SIZE)
-        .ok_or_else(|| Error::invalid_data_directory("optional-header size overflow"))?;
-    let total_size = base_size
-        .checked_add(dirs_len)
-        .ok_or_else(|| Error::invalid_data_directory("optional-header size overflow"))?;
+    let dirs_len = directory_count(number_of_rva_and_sizes) * DataDirectory::SIZE;
     let dir_bytes = dir_bytes
         .get(..dirs_len)
-        .ok_or_else(|| Error::buffer_too_small(total_size, total_len))?;
+        .ok_or_else(|| Error::buffer_too_small(base_size + dirs_len, total_len))?;
     let (entries, _) = dir_bytes.as_chunks::<{ DataDirectory::SIZE }>();
     Ok(entries
         .iter()
         .copied()
         .map(DataDirectory::from_bytes)
         .collect())
+}
+
+/// Return the number of data directory entries that the loader reads.
+///
+/// The loader rounds a `NumberOfRvaAndSizes` larger than [`NUMBER_OF_DIRECTORY_ENTRIES`] down to
+/// that value.
+fn directory_count(number_of_rva_and_sizes: u32) -> usize {
+    usize::try_from(number_of_rva_and_sizes).map_or(NUMBER_OF_DIRECTORY_ENTRIES, |count| {
+        count.min(NUMBER_OF_DIRECTORY_ENTRIES)
+    })
 }
 
 /// Return the serialized size of a header with a fixed part of `base_size` bytes and `dirs`.
@@ -439,9 +449,9 @@ impl OptionalHeader64 {
     /// # Errors
     ///
     /// - Returns a buffer-too-small error if `data` is shorter than the fixed header, or shorter
-    ///   than the data directories that `NumberOfRvaAndSizes` declares.
+    ///   than the data directories that `NumberOfRvaAndSizes` declares. As the loader does, the
+    ///   parser reads at most [`NUMBER_OF_DIRECTORY_ENTRIES`] entries.
     /// - Returns an invalid-magic error if `Magic` is not [`PE32PLUS_MAGIC`].
-    /// - Returns an invalid-data-directory error if the declared size overflows.
     pub fn parse(data: &[u8]) -> Result<Self> {
         let len = data.len();
         let Some((data, dir_bytes)) = data.split_first_chunk::<{ Self::BASE_SIZE }>() else {
@@ -652,12 +662,16 @@ impl OptionalHeader {
 
     /// Read an optional header from a [`ReadAt`] reader at the file offset `offset`.
     ///
+    /// As the loader does, the method reads the fixed header and at most
+    /// [`NUMBER_OF_DIRECTORY_ENTRIES`] data directories. It ignores `SizeOfOptionalHeader`: that
+    /// field only gives the offset of the section table. Thus the header can overlap the section
+    /// table.
+    ///
     /// # Errors
     ///
     /// - Returns a read error if the reader cannot read the header.
     /// - Returns an invalid-magic error for an unknown `Magic`.
-    /// - Returns an invalid-data-directory error if the declared size overflows, or if it is
-    ///   larger than the `u16` range of `SizeOfOptionalHeader`.
+    /// - Returns an invalid-data-directory error if the header offset overflows.
     /// - Returns any error from [`Self::parse`].
     pub fn read_from<R: ReadAt>(reader: &R, offset: u64) -> Result<Self> {
         // Read the magic first to get the layout: the fixed size and the offset of
@@ -673,77 +687,8 @@ impl OptionalHeader {
         let num_dirs_offset = offset
             .checked_add(count_relative)
             .ok_or_else(|| Error::invalid_data_directory("optional-header offset overflow"))?;
-        let num_dirs = usize::try_from(reader.read_u32_at(num_dirs_offset)?)
-            .map_err(|_| Error::invalid_data_directory("data-directory count is too large"))?;
-
-        let total_size = num_dirs
-            .checked_mul(DataDirectory::SIZE)
-            .and_then(|size| base_size.checked_add(size))
-            .ok_or_else(|| Error::invalid_data_directory("optional-header size overflow"))?;
-        if total_size > usize::from(u16::MAX) {
-            return Err(Error::invalid_data_directory(
-                "optional header cannot fit the COFF u16 size field",
-            ));
-        }
-        let data = reader.read_bytes_at(offset, total_size)?;
-        Self::parse(&data)
-    }
-
-    /// Read an optional header, but not past the size that the COFF file header declares.
-    ///
-    /// `offset` is a file offset. `declared_size` is `SizeOfOptionalHeader` from the COFF file
-    /// header.
-    ///
-    /// A PE consumer must use the declared size of the optional header to find the section
-    /// table. This method also makes sure that `NumberOfRvaAndSizes` fits in that declared
-    /// region. Thus a malformed file cannot make the parser read section headers as data
-    /// directory entries.
-    ///
-    /// # Errors
-    ///
-    /// - Returns a buffer-too-small error if `declared_size` cannot hold the fixed header.
-    /// - Returns an invalid-magic error for an unknown `Magic`.
-    /// - Returns an invalid-data-directory error if the data directories overflow, or if they
-    ///   are larger than `declared_size`.
-    /// - Returns a read error if the reader cannot read the bytes.
-    /// - Returns any error from [`Self::parse`].
-    pub fn read_sized_from<R: ReadAt>(
-        reader: &R,
-        offset: u64,
-        declared_size: usize,
-    ) -> Result<Self> {
-        if declared_size < 2 {
-            return Err(Error::buffer_too_small(2, declared_size));
-        }
-
-        let magic = reader.read_u16_at(offset)?;
-        let (base_size, count_offset) = match magic {
-            PE32_MAGIC => (OptionalHeader32::BASE_SIZE, 92u64),
-            PE32PLUS_MAGIC => (OptionalHeader64::BASE_SIZE, 108u64),
-            _ => return Err(Error::invalid_optional_header_magic(magic)),
-        };
-        if declared_size < base_size {
-            return Err(Error::buffer_too_small(base_size, declared_size));
-        }
-
-        let count_address = offset
-            .checked_add(count_offset)
-            .ok_or_else(|| Error::invalid_data_directory("optional-header offset overflow"))?;
-        let num_dirs = usize::try_from(reader.read_u32_at(count_address)?)
-            .map_err(|_| Error::invalid_data_directory("data-directory count is too large"))?;
-        let directories_size = num_dirs
-            .checked_mul(DataDirectory::SIZE)
-            .ok_or_else(|| Error::invalid_data_directory("data-directory size overflow"))?;
-        let total_size = base_size
-            .checked_add(directories_size)
-            .ok_or_else(|| Error::invalid_data_directory("optional-header size overflow"))?;
-        if total_size > declared_size {
-            return Err(Error::invalid_data_directory(format!(
-                "{num_dirs} data directories require {total_size} optional-header bytes, but COFF declares {declared_size}"
-            )));
-        }
-
-        let data = reader.read_bytes_at(offset, total_size)?;
+        let num_dirs = directory_count(reader.read_u32_at(num_dirs_offset)?);
+        let data = reader.read_bytes_at(offset, base_size + num_dirs * DataDirectory::SIZE)?;
         Self::parse(&data)
     }
 

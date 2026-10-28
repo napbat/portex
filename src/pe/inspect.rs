@@ -1,5 +1,4 @@
 use super::{MAX_NUMBER_OF_SECTIONS, PeImage, SourceLayout};
-use crate::layout;
 use crate::optional::OptionalHeader;
 use crate::prelude::*;
 use crate::section::Section;
@@ -65,78 +64,47 @@ impl PeImage {
             return Some(Vec::new());
         }
 
-        let end_rva = u64::from(rva).checked_add(len as u64)?;
-        if end_rva > u64::from(self.optional_header.size_of_image()) {
-            return None;
-        }
-        if !self.contains_rva_range(rva, len) {
-            return None;
-        }
-
         // Each output byte is a copy of a held byte or a zero byte. Thus a read that adds at most
         // `held` zero bytes is at most `2 * held` bytes long.
         let held = self.held_len();
-        if len > held.saturating_mul(2) {
+        if len > held.saturating_mul(2) || !self.contains_rva_range(rva, len) {
             return None;
         }
         let mut zero_budget = held;
+        let mut header_bytes = None;
         let mut output = Vec::new();
         output.try_reserve_exact(len).ok()?;
-        let mut current_rva = rva;
-        while output.len() < len {
-            if current_rva < self.optional_header.size_of_headers() {
-                let header_bytes = self.build_headers().ok()?;
-                let start = current_rva as usize;
-                let header_limit = self.optional_header.size_of_headers() as usize;
-                let available = header_limit.checked_sub(start)?;
-                let count = available.min(len - output.len());
-                if count == 0 {
-                    return None;
+        self.visit_rva_range(rva, len, |part| {
+            let (bytes, offset, count) = match part {
+                RvaPart::Headers { start, count } => {
+                    if header_bytes.is_none() {
+                        header_bytes = Some(self.build_headers().ok()?);
+                    }
+                    (header_bytes.as_deref()?, start, count)
                 }
-                let initialized = header_bytes.len().saturating_sub(start).min(count);
-                zero_budget = zero_budget.checked_sub(count - initialized)?;
-                if initialized != 0 {
-                    output.extend_from_slice(&header_bytes[start..start + initialized]);
-                }
-                output.resize(output.len() + count - initialized, 0);
-                current_rva = current_rva.checked_add(u32::try_from(count).ok()?)?;
-                continue;
-            }
-
-            let section = self.section_by_rva(current_rva)?;
-            let section_offset = current_rva.checked_sub(section.header.virtual_address)? as usize;
-            let available = mapped_extent(section).checked_sub(section_offset)?;
-            let count = available.min(len - output.len());
-            if count == 0 {
-                return None;
-            }
-            let initialized = section.data.len().saturating_sub(section_offset).min(count);
-            zero_budget = zero_budget.checked_sub(count - initialized)?;
-            if initialized != 0 {
-                output
-                    .extend_from_slice(&section.data[section_offset..section_offset + initialized]);
-            }
-            output.resize(output.len() + count - initialized, 0);
-            current_rva = current_rva.checked_add(u32::try_from(count).ok()?)?;
-        }
-
+                RvaPart::Section {
+                    section,
+                    offset,
+                    count,
+                } => (section.data.as_slice(), offset, count),
+            };
+            let initialized = bytes.get(offset..).unwrap_or_default();
+            let initialized = &initialized[..initialized.len().min(count)];
+            zero_budget = zero_budget.checked_sub(count - initialized.len())?;
+            output.extend_from_slice(initialized);
+            output.resize(output.len() + count - initialized.len(), 0);
+            Some(())
+        })?;
         Some(output)
     }
 
     /// Return the number of bytes that the image holds: the header data and the section data.
     ///
-    /// The header data ends at the section table or at the header tail after it.
+    /// The header data ends at the end of the NT headers or at the header tail after them.
     fn held_len(&self) -> usize {
-        let headers = usize::try_from(self.dos_header.e_lfanew)
-            .ok()
-            .and_then(|pe_offset| {
-                layout::headers_size_at(
-                    pe_offset,
-                    self.sections.len(),
-                    usize::from(self.coff_header.size_of_optional_header),
-                )
-            })
-            .and_then(|table_end| self.header_data_end(table_end))
+        let headers = self
+            .nt_headers_end()
+            .and_then(|end| self.header_data_end(end))
             .unwrap_or(0);
         self.sections.iter().fold(headers, |total, section| {
             total.saturating_add(section.data.len())
@@ -155,55 +123,80 @@ impl PeImage {
         if len == 0 {
             return rva <= self.optional_header.size_of_image();
         }
-        let Ok(len_u64) = u64::try_from(len) else {
-            return false;
-        };
-        let Some(end) = u64::from(rva).checked_add(len_u64) else {
-            return false;
-        };
+        self.visit_rva_range(rva, len, |_| Some(())).is_some()
+    }
+
+    /// Call `visit` for each part of the RVA range `rva..rva + len`, in RVA order.
+    ///
+    /// The first part can be in the headers. Each other part is in one section, up to the
+    /// extent of [`mapped_extent`]. The result is `None` if a part of the range is not in the
+    /// image, or if `visit` returns `None`.
+    ///
+    /// The first section is the one that [`Self::section_by_rva`] finds. If the range crosses
+    /// into more sections, the method sorts them by RVA once. Thus a walk over many sections
+    /// takes O(n log n) time, also if the section table is not in RVA order.
+    fn visit_rva_range<'a>(
+        &'a self,
+        rva: u32,
+        len: usize,
+        mut visit: impl FnMut(RvaPart<'a>) -> Option<()>,
+    ) -> Option<()> {
+        let end = u64::from(rva).checked_add(u64::try_from(len).ok()?)?;
         if end > u64::from(self.optional_header.size_of_image()) {
-            return false;
+            return None;
         }
 
         let mut current = rva;
         let mut remaining = len;
-        while remaining != 0 {
-            if current < self.optional_header.size_of_headers() {
-                let available = (self.optional_header.size_of_headers() - current) as usize;
-                let count = available.min(remaining);
-                let Ok(count_u32) = u32::try_from(count) else {
-                    return false;
-                };
-                let Some(next) = current.checked_add(count_u32) else {
-                    return false;
-                };
-                current = next;
-                remaining -= count;
-                continue;
-            }
-            let Some(section) = self.section_by_rva(current) else {
-                return false;
-            };
-            let Some(relative) = current.checked_sub(section.header.virtual_address) else {
-                return false;
-            };
-            let Some(available) = mapped_extent(section).checked_sub(relative as usize) else {
-                return false;
-            };
-            let count = available.min(remaining);
-            if count == 0 {
-                return false;
-            }
-            let Ok(count_u32) = u32::try_from(count) else {
-                return false;
-            };
-            let Some(next) = current.checked_add(count_u32) else {
-                return false;
-            };
-            current = next;
+        let size_of_headers = self.optional_header.size_of_headers();
+        if current < size_of_headers {
+            let count = ((size_of_headers - current) as usize).min(remaining);
+            visit(RvaPart::Headers {
+                start: current as usize,
+                count,
+            })?;
+            current = current.checked_add(u32::try_from(count).ok()?)?;
             remaining -= count;
         }
-        true
+        if remaining == 0 {
+            return Some(());
+        }
+
+        let first = self.section_by_rva(current)?;
+        let count = visit_section_part(first, current, remaining, &mut visit)?;
+        current = current.checked_add(u32::try_from(count).ok()?)?;
+        remaining -= count;
+        if remaining == 0 {
+            return Some(());
+        }
+
+        let mut later: Vec<&Section> = self
+            .sections
+            .iter()
+            .filter(|section| {
+                u64::from(section.header.virtual_address) < end
+                    && section_end(section) > u64::from(current)
+            })
+            .collect();
+        later.sort_by_key(|section| section.header.virtual_address);
+        let mut next = 0;
+        while remaining != 0 {
+            // Skip the sections that end at or before `current`. The first other section must
+            // contain `current`: the sections after it start at a higher RVA.
+            while later
+                .get(next)
+                .is_some_and(|section| section_end(section) <= u64::from(current))
+            {
+                next += 1;
+            }
+            let section = later
+                .get(next)
+                .filter(|section| section.contains_rva(current))?;
+            let count = visit_section_part(section, current, remaining, &mut visit)?;
+            current = current.checked_add(u32::try_from(count).ok()?)?;
+            remaining -= count;
+        }
+        Some(())
     }
 
     /// Write data at an RVA in one section.
@@ -219,7 +212,8 @@ impl PeImage {
     ///
     /// The offset is relative to the start of the image. If you use [`Self::read_from`] with a
     /// nonzero `base_offset`, add that base to the offset before you read from the original
-    /// source.
+    /// source. In the file layout, the offset is where the loader reads the byte: the loader
+    /// rounds `PointerToRawData` down to a multiple of 0x200 if `FileAlignment` is 0x200 or more.
     #[must_use]
     pub fn rva_to_source_offset(&self, rva: u32, layout: SourceLayout) -> Option<u32> {
         if rva >= self.optional_header.size_of_image() {
@@ -232,9 +226,10 @@ impl PeImage {
                 if rva < self.optional_header.size_of_headers() {
                     return Some(rva);
                 }
-                self.sections
-                    .iter()
-                    .find_map(|section| section.header.rva_to_offset(rva))
+                let file_alignment = self.optional_header.file_alignment();
+                self.sections.iter().find_map(|section| {
+                    crate::layout::section_rva_to_file_offset(&section.header, rva, file_alignment)
+                })
             }
         }
     }
@@ -506,17 +501,15 @@ impl PeImage {
     ///
     /// # Errors
     ///
-    /// Returns an error if `index` is too large. The `SizeOfOptionalHeader` field is a `u16`,
-    /// so the optional header cannot hold a data-directory array of that length.
+    /// Returns an error if `index` is [`NUMBER_OF_DIRECTORY_ENTRIES`] or more. The loader reads
+    /// at most that number of entries.
+    ///
+    /// [`NUMBER_OF_DIRECTORY_ENTRIES`]: crate::data_dir::NUMBER_OF_DIRECTORY_ENTRIES
     pub fn set_data_directory_by_index(&mut self, index: usize, rva: u32, size: u32) -> Result<()> {
-        let base_size = match &self.optional_header {
-            OptionalHeader::Pe32(_) => crate::optional::OptionalHeader32::BASE_SIZE,
-            OptionalHeader::Pe32Plus(_) => crate::optional::OptionalHeader64::BASE_SIZE,
-        };
-        let max_count = (usize::from(u16::MAX) - base_size) / crate::data_dir::DataDirectory::SIZE;
-        if index >= max_count {
+        if index >= crate::data_dir::NUMBER_OF_DIRECTORY_ENTRIES {
             return Err(Error::invalid_data_directory(format!(
-                "directory index {index} cannot fit in a PE optional header"
+                "directory index {index} is past the {} entries that the loader reads",
+                crate::data_dir::NUMBER_OF_DIRECTORY_ENTRIES
             )));
         }
         self.store_data_directory(index, rva, size);
@@ -614,16 +607,20 @@ impl PeImage {
 /// section: the larger of `VirtualSize` and `SizeOfRawData`, as in [`Section::contains_rva`].
 /// An RVA read uses the same zeros, but only after complete raw data:
 ///
-/// - If the data is shorter than `SizeOfRawData`, the parser could not read some raw bytes (see
-///   [`MissingSectionData::Empty`](super::MissingSectionData::Empty)). These bytes are not
-///   known to be zero, so the read stops at the end of the data.
+/// - If the raw data goes past the end of the source file, the loader also maps zeros for the
+///   bytes after that end. The data is complete.
+/// - Otherwise, if the data is shorter than `SizeOfRawData`, the parser could not read some raw
+///   bytes (see [`MissingSectionData::Empty`](super::MissingSectionData::Empty)). These bytes
+///   are not known to be zero, so the read stops at the end of the data.
 /// - The data of a section from a loader-mapped image covers the mapped range. Missing bytes
 ///   there are also not known to be zero.
 ///
 /// Section data that is longer after an edit stays readable.
 fn mapped_extent(section: &Section) -> usize {
     let data_len = section.data.len();
-    if section.mapped_raw_size.is_some() || data_len < section.header.size_of_raw_data as usize {
+    let incomplete =
+        data_len < section.header.size_of_raw_data as usize && !section.raw_tail_is_zero;
+    if section.mapped_raw_size.is_some() || incomplete {
         return data_len;
     }
     (section
@@ -631,4 +628,49 @@ fn mapped_extent(section: &Section) -> usize {
         .virtual_size
         .max(section.header.size_of_raw_data) as usize)
         .max(data_len)
+}
+
+/// One part of an RVA range: bytes in the headers or bytes in one section.
+enum RvaPart<'a> {
+    /// `count` bytes of the headers, from the file offset `start`.
+    Headers { start: usize, count: usize },
+    /// `count` bytes of `section`, from `offset` bytes after its start.
+    Section {
+        section: &'a Section,
+        offset: usize,
+        count: usize,
+    },
+}
+
+/// Visit the part of `section` that starts at `rva` and has at most `remaining` bytes.
+///
+/// Return the number of bytes in the part, or `None` if the section has no bytes at `rva`.
+fn visit_section_part<'a>(
+    section: &'a Section,
+    rva: u32,
+    remaining: usize,
+    visit: &mut impl FnMut(RvaPart<'a>) -> Option<()>,
+) -> Option<usize> {
+    let offset = rva.checked_sub(section.header.virtual_address)? as usize;
+    let count = mapped_extent(section).checked_sub(offset)?.min(remaining);
+    if count == 0 {
+        return None;
+    }
+    visit(RvaPart::Section {
+        section,
+        offset,
+        count,
+    })?;
+    Some(count)
+}
+
+/// Return the RVA after the end of a section, as in [`Section::contains_rva`].
+pub(super) fn section_end(section: &Section) -> u64 {
+    u64::from(section.header.virtual_address)
+        + u64::from(
+            section
+                .header
+                .virtual_size
+                .max(section.header.size_of_raw_data),
+        )
 }

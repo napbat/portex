@@ -2,7 +2,7 @@
 
 use core::ops::{Deref, DerefMut, Range};
 
-use crate::data_dir::DataDirectoryType;
+use crate::data_dir::{DataDirectory, DataDirectoryType};
 use crate::prelude::*;
 use crate::reader::ReadAt;
 use crate::security::{SecurityBuilder, SecurityDirectory};
@@ -26,7 +26,16 @@ pub struct PeFile {
     pub image: PeImage,
     overlay: Vec<u8>,
     certificate_range: Option<Range<usize>>,
-    source_layout: RawLayoutFingerprint,
+    /// The Security directory entry of the source, if it does not give a valid certificate table.
+    /// The loader does not use this entry, so the build keeps it as it is.
+    invalid_security: Option<DataDirectory>,
+    /// The raw layout of the source, if the build can keep it. It is `None` if the loader reads
+    /// a section at another offset than its `PointerToRawData`: then the build makes a new
+    /// layout.
+    source_layout: Option<RawLayoutFingerprint>,
+    /// The length of the source, if its headers or raw section data go past its end. The build
+    /// of the source layout then keeps this length.
+    source_end: Option<usize>,
     preserved_regions: Vec<PreservedRegion>,
 }
 
@@ -53,12 +62,14 @@ impl PeFile {
     /// represented.
     pub fn new(mut image: PeImage) -> Result<Self> {
         image.try_update_layout()?;
-        let source_layout = RawLayoutFingerprint::from_image(&image)?;
+        let source_layout = Some(RawLayoutFingerprint::from_image(&image)?);
         Ok(Self {
             image,
             overlay: Vec::new(),
             certificate_range: None,
+            invalid_security: None,
             source_layout,
+            source_end: None,
             preserved_regions: Vec::new(),
         })
     }
@@ -78,70 +89,44 @@ impl PeFile {
     ///
     /// The `VirtualAddress` field of the Security directory holds a file offset, not an RVA.
     ///
+    /// As the loader does, the method accepts these layouts:
+    ///
+    /// - The headers or the raw data of a section go past the end of the file. The loader maps
+    ///   zeros for the missing bytes. The build keeps the layout and the length of the file.
+    /// - A `PointerToRawData` is not a multiple of 0x200, and the loader rounds it down. The
+    ///   build makes a new layout, which is a valid PE file with the same loader view.
+    ///
+    /// The loader does not use the Security directory. If it does not give a valid certificate
+    /// table in the overlay, the method ignores it. The build keeps the entry as it is.
+    ///
     /// # Errors
     ///
-    /// Returns an error if:
-    ///
-    /// - [`PeImage::parse`] fails.
-    /// - `data` ends before the end of the headers and the raw section data.
-    /// - The Security directory (the attribute certificate table) has only one of its file offset
-    ///   and size set.
-    /// - The Security directory is outside the file or inside the image.
-    /// - The file offset of the Security directory is not aligned to 8 bytes.
-    /// - The certificate table does not parse.
+    /// Returns an error if [`PeImage::parse`] fails.
     pub fn parse(data: &[u8]) -> Result<Self> {
         let image = PeImage::parse(data)?;
-        let image_end = raw_image_end(&image)?;
-        if image_end > data.len() {
-            return Err(Error::buffer_too_small(image_end, data.len()));
-        }
-
-        let certificate_range = match image
+        let declared_end = raw_image_end(&image)?;
+        let image_end = declared_end.min(data.len());
+        let source_layout = raw_offsets_are_exact(&image)
+            .then(|| RawLayoutFingerprint::from_image(&image))
+            .transpose()?;
+        let certificate_range = certificate_range(&image, data, image_end);
+        let invalid_security = image
             .data_directory(DataDirectoryType::Security)
-            .filter(|directory| directory.is_present())
-        {
-            Some(directory) => {
-                if directory.virtual_address == 0 || directory.size == 0 {
-                    return Err(Error::invalid_data_directory(
-                        "Security directory has only one of file offset/size set",
-                    ));
-                }
-                let start = directory.virtual_address as usize;
-                let end = start
-                    .checked_add(directory.size as usize)
-                    .ok_or_else(|| Error::invalid_data_directory("certificate range overflow"))?;
-                if end > data.len() {
-                    return Err(Error::invalid_data_directory(format!(
-                        "certificate range {:#x}..{:#x} exceeds file size {:#x}",
-                        start,
-                        end,
-                        data.len()
-                    )));
-                }
-                if start < image_end {
-                    return Err(Error::invalid_data_directory(format!(
-                        "certificate table at {start:#x} overlaps the mapped image ending at {image_end:#x}"
-                    )));
-                }
-                if !start.is_multiple_of(8) {
-                    return Err(Error::invalid_data_directory(format!(
-                        "certificate table offset {start:#x} is not 8-byte aligned"
-                    )));
-                }
-                SecurityDirectory::parse(&data[start..end])?;
-                Some((start - image_end)..(end - image_end))
-            }
-            None => None,
+            .copied()
+            .filter(|directory| certificate_range.is_none() && directory.is_present());
+        let preserved_regions = if source_layout.is_some() {
+            collect_preserved_regions(data, &image, image_end)?
+        } else {
+            Vec::new()
         };
-
-        let source_layout = RawLayoutFingerprint::from_image(&image)?;
-        let preserved_regions = collect_preserved_regions(data, &image, image_end)?;
 
         Ok(Self {
             image,
             overlay: data[image_end..].to_vec(),
             certificate_range,
+            invalid_security,
             source_layout,
+            source_end: (declared_end > data.len()).then_some(data.len()),
             preserved_regions,
         })
     }
@@ -224,8 +209,9 @@ impl PeFile {
     /// sections of the parsed source.
     #[must_use]
     pub fn preserves_source_gaps(&self) -> bool {
-        RawLayoutFingerprint::from_image(&self.image)
-            .is_ok_and(|layout| layout == self.source_layout)
+        self.source_layout.as_ref().is_some_and(|source| {
+            RawLayoutFingerprint::from_image(&self.image).is_ok_and(|layout| &layout == source)
+        })
     }
 
     /// Consume the container and return the normalized executable image.
@@ -362,6 +348,13 @@ impl PeFile {
         self.image.clear_security();
     }
 
+    /// Clear the Security directory entry of `pe`, unless it is the invalid entry of the source.
+    fn clear_security_entry(&self, pe: &mut PeImage) {
+        if pe.data_directory(DataDirectoryType::Security).copied() != self.invalid_security {
+            pe.clear_security();
+        }
+    }
+
     /// Build a raw PE file with its overlay and certificate table.
     ///
     /// # Errors
@@ -388,13 +381,14 @@ impl PeFile {
             // five directory slots that Security needs.
             pe.set_data_directory(DataDirectoryType::Security, 1, size);
         } else {
-            pe.clear_security();
+            self.clear_security_entry(&mut pe);
         }
-        let preserved_pass = if RawLayoutFingerprint::from_image(&pe)? == self.source_layout {
-            pe.try_build_current_layout()?
-        } else {
-            None
-        };
+        let preserved_pass =
+            if self.source_layout.as_ref() == Some(&RawLayoutFingerprint::from_image(&pe)?) {
+                pe.try_build_current_layout(self.source_end)?
+            } else {
+                None
+            };
         let preserve_layout = preserved_pass.is_some();
         let first_pass = if let Some(bytes) = preserved_pass {
             bytes
@@ -433,15 +427,16 @@ impl PeFile {
                 certificate_size,
             );
         } else {
-            pe.clear_security();
+            self.clear_security_entry(&mut pe);
         }
 
         let mut output = if preserve_layout {
-            pe.try_build_current_layout()?.ok_or_else(|| {
-                Error::invalid_section(
-                    "current raw layout cannot hold the headers and the section data",
-                )
-            })?
+            pe.try_build_current_layout(self.source_end)?
+                .ok_or_else(|| {
+                    Error::invalid_section(
+                        "current raw layout cannot hold the headers and the section data",
+                    )
+                })?
         } else {
             pe.try_build()?
         };
@@ -516,33 +511,63 @@ impl DerefMut for PeFile {
     }
 }
 
+/// Return the file offset after the headers and the raw data of the sections.
+///
+/// The result can be past the end of the file. The raw data starts where the loader reads it.
 fn raw_image_end(pe: &PeImage) -> Result<usize> {
-    let mut image_end = (pe.optional_header.size_of_headers() as usize).max(section_table_end(pe)?);
+    let file_alignment = pe.optional_header.file_alignment();
+    let mut image_end = u64::from(pe.optional_header.size_of_headers());
     for section in &pe.sections {
         let header = &section.header;
         if header.pointer_to_raw_data == 0 || header.size_of_raw_data == 0 {
             continue;
         }
-        let end = (header.pointer_to_raw_data as usize)
-            .checked_add(header.size_of_raw_data as usize)
-            .ok_or_else(|| Error::invalid_section("section file range overflow"))?;
-        image_end = image_end.max(end);
+        let start = crate::layout::loader_raw_offset(header.pointer_to_raw_data, file_alignment);
+        image_end = image_end.max(u64::from(start) + u64::from(header.size_of_raw_data));
     }
-    Ok(image_end)
+    Ok(usize::try_from(image_end)
+        .unwrap_or(usize::MAX)
+        .max(nt_headers_end(pe)?))
 }
 
-/// Return the file offset of the end of the section table.
+/// Return `true` if the loader reads the raw data of each section at its `PointerToRawData`.
+fn raw_offsets_are_exact(pe: &PeImage) -> bool {
+    let file_alignment = pe.optional_header.file_alignment();
+    pe.sections.iter().all(|section| {
+        let pointer = section.header.pointer_to_raw_data;
+        crate::layout::loader_raw_offset(pointer, file_alignment) == pointer
+    })
+}
+
+/// Return the range of the certificate table, as offsets from the start of the overlay.
 ///
-/// The loader reads the complete section table, also if it ends after `SizeOfHeaders`.
-fn section_table_end(image: &PeImage) -> Result<usize> {
-    let pe_offset = usize::try_from(image.dos_header.e_lfanew)
-        .map_err(|_| Error::invalid_section("e_lfanew is negative"))?;
-    crate::layout::headers_size_at(
-        pe_offset,
-        image.sections.len(),
-        usize::from(image.coff_header.size_of_optional_header),
-    )
-    .ok_or_else(|| Error::invalid_section("section-table offset overflow"))
+/// The result is `None` if the Security directory is absent, or if it does not give a valid
+/// certificate table in the overlay: inside the file, after `image_end`, aligned to 8 bytes, and
+/// with entries that parse.
+fn certificate_range(pe: &PeImage, data: &[u8], image_end: usize) -> Option<Range<usize>> {
+    let directory = pe
+        .data_directory(DataDirectoryType::Security)
+        .filter(|directory| directory.is_present())?;
+    let start = directory.virtual_address as usize;
+    let end = start.checked_add(directory.size as usize)?;
+    let valid = directory.virtual_address != 0
+        && directory.size != 0
+        && start >= image_end
+        && start.is_multiple_of(8)
+        && data
+            .get(start..end)
+            .is_some_and(|table| SecurityDirectory::parse(table).is_ok());
+    valid.then(|| (start - image_end)..(end - image_end))
+}
+
+/// Return the file offset of the end of the NT headers.
+///
+/// The loader reads the complete section table and optional header, also if they end after
+/// `SizeOfHeaders`.
+fn nt_headers_end(image: &PeImage) -> Result<usize> {
+    image
+        .nt_headers_end()
+        .ok_or_else(|| Error::invalid_section("NT header offset overflow"))
 }
 
 impl RawLayoutFingerprint {
@@ -583,13 +608,13 @@ fn collect_preserved_regions(
     let declared_optional_end = optional_start
         .checked_add(usize::from(image.coff_header.size_of_optional_header))
         .ok_or_else(|| Error::invalid_section("optional-header size overflow"))?;
-    let section_table_end = section_table_end(image)?;
+    let headers_end = nt_headers_end(image)?;
 
     let mut regions = Vec::new();
     push_preserved_region(
         &mut regions,
         data,
-        parsed_optional_end..declared_optional_end,
+        parsed_optional_end..declared_optional_end.min(image_end),
     )?;
 
     let mut occupied: Vec<Range<usize>> = image
@@ -608,7 +633,7 @@ fn collect_preserved_regions(
         .collect::<Result<_>>()?;
     occupied.sort_by_key(|range| range.start);
 
-    let mut cursor = section_table_end.min(image_end);
+    let mut cursor = headers_end.min(image_end);
     for range in occupied {
         if range.end <= cursor {
             continue;

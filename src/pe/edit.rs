@@ -287,15 +287,42 @@ impl PeImage {
     /// The update is atomic. If an address, a size or an aggregate overflows, the function does
     /// not change the image.
     ///
+    /// The update changes the header structures in these conditions:
+    ///
+    /// - `SizeOfOptionalHeader` grows to the size of the optional header, so that the section
+    ///   table follows the optional header.
+    /// - If the NT headers overlap the DOS header, and a new layout field changes the bytes of
+    ///   `e_lfanew`, the NT headers move to offset 64 (`e_lfanew` = 0x40).
+    ///
     /// # Errors
     ///
     /// Returns an error in these conditions:
     /// - The `SectionAlignment` or the `FileAlignment` of the optional header is invalid.
     /// - The image has more than [`MAX_NUMBER_OF_SECTIONS`] sections.
-    /// - The file offset `e_lfanew` puts the PE header inside the DOS header.
+    /// - `e_lfanew` is smaller than 4, the minimum of the loader.
     /// - A header size, a section address, a section size or an aggregate size overflows its
     ///   field.
     pub fn try_update_layout(&mut self) -> Result<()> {
+        if usize::try_from(self.dos_header.e_lfanew)
+            .is_ok_and(|pe_offset| pe_offset < DosHeader::SIZE)
+        {
+            // NT headers that overlap the DOS header are rare, so a copy costs little here.
+            let mut updated = self.clone();
+            updated.update_layout_fields()?;
+            if !updated.nt_headers_keep_e_lfanew() {
+                updated.clone_from(self);
+                updated.dos_header.e_lfanew = DOS_HEADER_END;
+                updated.update_layout_fields()?;
+            }
+            *self = updated;
+            return Ok(());
+        }
+        self.update_layout_fields()
+    }
+
+    /// Recalculate the layout for the current `e_lfanew`. This is the atomic part of
+    /// [`Self::try_update_layout`].
+    fn update_layout_fields(&mut self) -> Result<()> {
         let config = LayoutConfig::from_optional_header(&self.optional_header);
         validate_layout_config(&config)?;
         if self.sections.len() > MAX_NUMBER_OF_SECTIONS {
@@ -308,10 +335,11 @@ impl PeImage {
         // Calculate the size of the headers.
         let pe_offset = usize::try_from(self.dos_header.e_lfanew)
             .map_err(|_| Error::invalid_section("e_lfanew is negative"))?;
-        if pe_offset < DosHeader::SIZE {
-            return Err(Error::invalid_section(
-                "e_lfanew places the PE header inside the DOS header",
-            ));
+        if pe_offset < DosHeader::MIN_PE_OFFSET {
+            return Err(Error::invalid_section(format!(
+                "e_lfanew {pe_offset:#x} is smaller than {:#x}, the minimum of the loader",
+                DosHeader::MIN_PE_OFFSET
+            )));
         }
         let actual_optional_size = self.optional_header.size();
         let declared_optional_size = usize::from(self.coff_header.size_of_optional_header);
@@ -607,3 +635,6 @@ fn minimum_nonzero(current: u32, candidate: u32) -> u32 {
         current.min(candidate)
     }
 }
+
+/// The value of `e_lfanew` for NT headers directly after the DOS header.
+const DOS_HEADER_END: i32 = 0x40;

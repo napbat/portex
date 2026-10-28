@@ -147,7 +147,10 @@ impl Default for ParseOptions {
 }
 
 /// The maximum number of sections that the Windows image loader accepts.
-pub const MAX_NUMBER_OF_SECTIONS: usize = 96;
+///
+/// Windows Vista and later accept up to 65535 sections, the range of `NumberOfSections`. The
+/// loader of Windows XP accepts only 96.
+pub const MAX_NUMBER_OF_SECTIONS: usize = 65535;
 
 /// A parsed PE file that owns its section data.
 ///
