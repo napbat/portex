@@ -16,7 +16,8 @@
 //! - **Self-contained**: The crate defines all PE structures itself. It does not use the
 //!   Windows SDK.
 //! - **Normalization**: [`PeFile::normalize`] sets malformed header fields and the file layout
-//!   to normal values. It keeps how the loader maps the image.
+//!   to normal values. It builds and parses each fixed copy again, and keeps a fix only if the
+//!   loader view stays the same. `Normalization::kept` names each rejected fix.
 //! - **`no_std` mode**: Disable the `std` feature for `no_std + alloc` builds. The full PE
 //!   API (parsers, builders, layout, validation and in-memory readers) stays available.
 //!   Only these items need `std`, and they compile out:

@@ -268,5 +268,5 @@ mod parse;
 mod utilities;
 mod validate;
 
+pub(crate) use normalize::{LoaderView, check_sum, normalize_changes, set_check_sum};
 pub use normalize::{Normalization, NormalizeChange, NormalizeKept};
-pub(crate) use normalize::{check_sum, normalize_changes, set_check_sum};

@@ -151,11 +151,30 @@ sections.
 - It gives each section its own aligned raw range, and calculates `SizeOfHeaders`,
   `SizeOfImage` and the size fields again. It corrects a wrong nonzero checksum.
 
-The loader view stays the same. Each section keeps its RVA, its virtual size and its data. The
-header bytes that the entry point or a data directory refers to do not change. The method does
-not make a fix that would change the loader view. Instead, it names the fix in
-`Normalization::kept`. Examples are code in the headers, a section RVA that is not aligned, and
-a `SectionAlignment` smaller than a page.
+The loader view stays the same. Each section keeps its RVA, its virtual size, its
+characteristics and its bytes. The header bytes that the entry point or a data directory refers
+to do not change. The loader maps `SizeOfHeaders` header bytes, or the whole file when the
+alignment is low.
+
+The method builds each fixed copy with `PeFile::try_build`, parses the output again, and
+compares it with the built original. It keeps the first copy that has the same loader view. If
+no copy passes, the fields and the layout of the file stay. It then corrects a wrong checksum
+with the same check. The method does not make a rejected fix. Instead, it names the reason in
+`Normalization::kept`:
+
+- `HeaderBytesInUse`: the fix changes header bytes that the image refers to.
+- `SectionData`: the fix changes or drops section bytes.
+- `SectionAddresses`: the fix changes a section RVA, virtual size or characteristics.
+- `LowAlignment`: `SectionAlignment` is smaller than a page, so the file layout stays.
+- `Alignment`: the alignments are invalid, and no valid `SectionAlignment` keeps all section
+  RVAs.
+- `Layout(String)`: the method cannot make a new layout.
+- `Build(String)`: the fixed copy does not build or parse.
+
+After a new layout, the build rebases the debug `PointerToRawData` fields. `changes` reports
+this as `NormalizeChange::DebugPointers`. If the debug directory is in an executable section,
+the layout stays, and `kept` names `SectionData`. When the section table grows into a header
+tail, `changes` reports `NormalizeChange::HeaderTail`.
 
 ```rust,no_run
 use portex::PeFile;

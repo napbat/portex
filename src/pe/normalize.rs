@@ -1,9 +1,12 @@
+mod view;
+
+pub(crate) use view::LoaderView;
+
 use super::PeImage;
 use crate::data_dir::{DataDirectory, DataDirectoryType};
 use crate::dos::DosHeader;
 use crate::optional::{OptionalHeader, PE32_MAGIC, PE32PLUS_MAGIC};
 use crate::prelude::*;
-use core::ops::Range;
 
 /// The page size of the loader. If `SectionAlignment` is smaller, the loader maps the file as
 /// it is (low alignment).
@@ -112,6 +115,12 @@ pub enum NormalizeChange {
         /// The index of the section in the section table.
         index: usize,
     },
+    /// The header bytes after the section table were dropped, because the section table grows
+    /// into them. No entry point or data directory refers to them.
+    HeaderTail,
+    /// The `PointerToRawData` fields of the debug directory entries follow the new file layout.
+    /// The loader does not read them.
+    DebugPointers,
 }
 
 /// A problem that [`PeFile::normalize`](crate::PeFile::normalize) does not fix, because the fix
@@ -119,9 +128,12 @@ pub enum NormalizeChange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum NormalizeKept {
-    /// The entry point or a data directory refers to header bytes that a fix changes. The
+    /// A fix changes the header bytes that the entry point or a data directory refers to. The
     /// headers then hold code or data, so the header fields stay.
     HeaderBytesInUse,
+    /// A fix changes the bytes that the loader maps for a section, or moves the raw data of a
+    /// low-alignment section.
+    SectionData,
     /// A new layout would move a section or change its virtual size. An example is a section
     /// whose RVA is not aligned, or a section that starts inside the headers. The layout stays.
     SectionAddresses,
@@ -132,35 +144,25 @@ pub enum NormalizeKept {
     Alignment,
     /// The layout update fails with this error message, for example on an overflow.
     Layout(String),
+    /// The build of a fixed copy fails, or the built file does not parse. The value is the
+    /// error message.
+    Build(String),
 }
 
 impl PeImage {
-    /// Return a copy with normal header fields and a normal file layout, and the problems that
-    /// the copy keeps.
+    /// Return the normalized copies of this image, in the order of preference, and the reasons
+    /// why a fix is not in them.
     ///
-    /// The copy keeps the loader view of the image:
-    ///
-    /// - Each section keeps its RVA, its virtual size, its characteristics and its data.
-    /// - The header bytes that the entry point or a data directory refers to stay the same.
-    ///
-    /// The method does not make a fix that changes the loader view. The result names it.
-    pub(crate) fn normalized(&self) -> (Self, Vec<NormalizeKept>) {
-        let mut kept = Vec::new();
+    /// The first copy has normal header fields and a new file layout, if a new layout keeps the
+    /// RVA, the virtual size, the characteristics and the data of each section. The last copy
+    /// has only the normal header fields. The caller must check the loader view of each copy.
+    pub(crate) fn normalize_candidates(&self) -> (Vec<Self>, Vec<NormalizeKept>) {
         let mut fields = self.clone();
         fields.normalize_fields();
-        if let Some(layout) = fields.normalized_layout(self, &mut kept) {
-            if self.keeps_used_header_bytes(&layout) {
-                return (layout, kept);
-            }
-            kept.push(NormalizeKept::HeaderBytesInUse);
+        match fields.normalized_layout(self) {
+            Ok(layout) => (vec![layout, fields], Vec::new()),
+            Err(reason) => (vec![fields], vec![reason]),
         }
-        if self.keeps_used_header_bytes(&fields) {
-            return (fields, kept);
-        }
-        if !kept.contains(&NormalizeKept::HeaderBytesInUse) {
-            kept.push(NormalizeKept::HeaderBytesInUse);
-        }
-        (self.clone(), kept)
     }
 
     /// Set the fields that the loader does not read to their normal values.
@@ -192,17 +194,14 @@ impl PeImage {
     }
 
     /// Return a copy of this image with a new file layout, if the copy keeps the sections of
-    /// `original` in the loader view. Otherwise add the reason to `kept`.
-    fn normalized_layout(&self, original: &Self, kept: &mut Vec<NormalizeKept>) -> Option<Self> {
+    /// `original`. Otherwise return the reason.
+    fn normalized_layout(&self, original: &Self) -> Result<Self, NormalizeKept> {
         let section_alignment = self.optional_header.section_alignment();
         if section_alignment.is_power_of_two() && section_alignment < PAGE_SIZE {
-            kept.push(NormalizeKept::LowAlignment);
-            return None;
+            return Err(NormalizeKept::LowAlignment);
         }
-        let Some((file_alignment, section_alignment)) = self.normal_alignments() else {
-            kept.push(NormalizeKept::Alignment);
-            return None;
-        };
+        let (file_alignment, section_alignment) =
+            self.normal_alignments().ok_or(NormalizeKept::Alignment)?;
 
         let mut candidate = self.clone();
         match &mut candidate.optional_header {
@@ -222,14 +221,12 @@ impl PeImage {
             candidate.dos_header.e_lfanew = 0x40;
         }
         if let Err(error) = candidate.try_update_layout() {
-            kept.push(NormalizeKept::Layout(error.to_string()));
-            return None;
+            return Err(NormalizeKept::Layout(error.to_string()));
         }
         if !candidate.keeps_sections_of(original) {
-            kept.push(NormalizeKept::SectionAddresses);
-            return None;
+            return Err(NormalizeKept::SectionAddresses);
         }
-        Some(candidate)
+        Ok(candidate)
     }
 
     /// Return valid `(FileAlignment, SectionAlignment)` values that keep all section RVAs.
@@ -277,88 +274,6 @@ impl PeImage {
                         && section.data == old.data
                 })
     }
-
-    /// Return `true` if `other` has the header bytes that the entry point and the data
-    /// directories of this image refer to.
-    ///
-    /// The method compares the header bytes of the loader view. It returns `false` if it
-    /// cannot serialize the headers of an image.
-    pub(crate) fn keeps_used_header_bytes(&self, other: &Self) -> bool {
-        let (Some((old, old_end)), Some((new, new_end))) =
-            (self.header_view(), other.header_view())
-        else {
-            return false;
-        };
-        let clears_bound_imports = self
-            .data_directory(DataDirectoryType::BoundImport)
-            .is_some_and(|directory| directory.is_present())
-            && !other
-                .data_directory(DataDirectoryType::BoundImport)
-                .is_some_and(|directory| directory.is_present());
-        self.header_references(old_end, clears_bound_imports)
-            .into_iter()
-            .all(|range| range.end <= new_end && same_bytes(&old, &new, range))
-    }
-
-    /// Return the header bytes of the loader view, and the RVA where the header view ends.
-    ///
-    /// The header view ends at `SizeOfHeaders` or at the end of the header bytes, whichever is
-    /// later. A section that starts before that end covers the rest.
-    fn header_view(&self) -> Option<(Vec<u8>, usize)> {
-        let bytes = self.build_headers().ok()?;
-        let end = bytes
-            .len()
-            .max(self.optional_header.size_of_headers() as usize);
-        let first_section = self
-            .sections
-            .iter()
-            .filter(|section| loader_virtual_size(&section.header) != 0)
-            .map(|section| section.header.virtual_address as usize)
-            .min();
-        Some((bytes, first_section.map_or(end, |start| end.min(start))))
-    }
-
-    /// Return the ranges of header bytes before `header_end` that the loader view uses: the code
-    /// at the entry point, and the data that the data directories refer to.
-    ///
-    /// The method skips the entries that the loader does not read: `Security` (a file offset),
-    /// the reserved entries, and entries with an RVA of 0. It also skips `BoundImport` if
-    /// `skip_bound_imports` is `true`. A directory with a size of 0 uses the rest of the
-    /// headers, because the loader ignores the size of some directories.
-    fn header_references(&self, header_end: usize, skip_bound_imports: bool) -> Vec<Range<usize>> {
-        let mut ranges = Vec::new();
-        let entry_point = self.optional_header.address_of_entry_point() as usize;
-        // A DLL has no entry point if the value is 0. An executable starts at RVA 0 then.
-        if entry_point < header_end && (entry_point != 0 || !self.coff_header.is_dll()) {
-            ranges.push(entry_point..header_end);
-        }
-        for (index, directory) in self.optional_header.data_directories().iter().enumerate() {
-            let skipped = match DataDirectoryType::from_index(index) {
-                Some(
-                    DataDirectoryType::Security
-                    | DataDirectoryType::Architecture
-                    | DataDirectoryType::GlobalPtr
-                    | DataDirectoryType::Reserved,
-                )
-                | None => true,
-                Some(DataDirectoryType::BoundImport) => skip_bound_imports,
-                Some(_) => false,
-            };
-            let start = directory.virtual_address as usize;
-            if skipped || directory.virtual_address == 0 || start >= header_end {
-                continue;
-            }
-            let end = if directory.size == 0 {
-                header_end
-            } else {
-                start
-                    .saturating_add(directory.size as usize)
-                    .min(header_end)
-            };
-            ranges.push(start..end);
-        }
-        ranges
-    }
 }
 
 /// Return the virtual size that the loader uses for a section: `VirtualSize`, or
@@ -369,20 +284,6 @@ fn loader_virtual_size(header: &crate::section::SectionHeader) -> u32 {
     } else {
         header.virtual_size
     }
-}
-
-/// Return `true` if `old` and `new` have the same bytes in `range`. Bytes after the end of a
-/// slice are zero.
-fn same_bytes(old: &[u8], new: &[u8], range: Range<usize>) -> bool {
-    fn part<'a>(bytes: &'a [u8], range: &Range<usize>) -> &'a [u8] {
-        let end = range.end.min(bytes.len());
-        bytes.get(range.start..end).unwrap_or_default()
-    }
-    let (old, new) = (part(old, &range), part(new, &range));
-    let common = old.len().min(new.len());
-    old[..common] == new[..common]
-        && old[common..].iter().all(|byte| *byte == 0)
-        && new[common..].iter().all(|byte| *byte == 0)
 }
 
 /// Return the changes from `old` to `new`, in header order.
@@ -460,6 +361,9 @@ pub(crate) fn normalize_changes(old: &PeImage, new: &PeImage) -> Vec<NormalizeCh
         if section.header != old_section.header {
             changes.push(NormalizeChange::Section { index });
         }
+    }
+    if !old.header_tail.bytes.is_empty() && new.header_tail.bytes.is_empty() {
+        changes.push(NormalizeChange::HeaderTail);
     }
     changes
 }

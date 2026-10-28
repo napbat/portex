@@ -4,7 +4,10 @@ use core::ops::{Deref, DerefMut, Range};
 
 use crate::checksum::{calculate_checksum, checksum_field_offset};
 use crate::data_dir::{DataDirectory, DataDirectoryType};
-use crate::pe::{Normalization, NormalizeKept, check_sum, normalize_changes, set_check_sum};
+use crate::pe::{
+    LoaderView, Normalization, NormalizeChange, NormalizeKept, check_sum, normalize_changes,
+    set_check_sum,
+};
 use crate::prelude::*;
 use crate::reader::ReadAt;
 use crate::security::{SecurityBuilder, SecurityDirectory};
@@ -487,55 +490,95 @@ impl PeFile {
     ///   fields again.
     /// - It corrects a wrong checksum. A checksum of 0 stays 0.
     ///
-    /// Each section keeps its RVA, its virtual size, its characteristics and its data. The
-    /// header bytes that the entry point or a data directory refers to stay the same. The
-    /// method does not make a fix that would change this loader view. [`Normalization::kept`]
-    /// names the fixes that it does not make. The overlay and the certificate table stay.
+    /// The method builds each fixed copy, parses it again, and keeps a fix only if the built
+    /// file keeps the loader view of the built original: the section RVAs, virtual sizes,
+    /// characteristics and bytes, and the header bytes that the entry point or a data directory
+    /// refers to. The loader maps `SizeOfHeaders` bytes of the headers, or the whole file with a
+    /// low alignment. The only accepted change to section bytes is the rebase of the debug
+    /// `PointerToRawData` fields in a section that is not executable.
+    /// [`Normalization::changes`] reports it as [`NormalizeChange::DebugPointers`].
+    /// [`Normalization::kept`] names the fixes that the method does not make. The overlay and
+    /// the certificate table stay.
     ///
     /// A change invalidates an Authenticode signature. A new layout also drops the file bytes
     /// between the raw ranges of the sections, which the loader does not map.
     ///
     /// # Errors
     ///
-    /// Returns an error if [`Self::try_build`] fails for the normalized file. The file then
-    /// does not change.
+    /// Returns an error if [`Self::try_build`] fails for the file, or if the built file does not
+    /// parse. The file then does not change.
     pub fn normalize(&mut self) -> Result<Normalization> {
-        let (image, mut kept) = self.image.normalized();
-        let original = core::mem::replace(&mut self.image, image);
-        if let Err(error) = self.normalize_checksum(&original, &mut kept) {
-            self.image = original;
-            return Err(error);
+        let original_bytes = self.try_build()?;
+        let original_view = LoaderView::parse(&original_bytes)?;
+        let original = self.image.clone();
+        let (candidates, mut kept) = original.normalize_candidates();
+        let mut accepted = None;
+        for candidate in candidates {
+            match self.try_normalized(candidate, &original_view) {
+                Ok(result) => {
+                    accepted = Some(result);
+                    break;
+                }
+                Err(reason) => add_kept(&mut kept, reason),
+            }
         }
-        Ok(Normalization {
-            changes: normalize_changes(&original, &self.image),
-            kept,
-        })
+        let moves_debug_offsets = accepted.as_ref().is_some_and(|(_, moved)| *moved);
+        let bytes = accepted
+            .as_ref()
+            .map_or(original_bytes.as_slice(), |(bytes, _)| bytes.as_slice());
+        self.normalize_checksum(bytes, &original_view, &mut kept);
+        let mut changes = normalize_changes(&original, &self.image);
+        if moves_debug_offsets {
+            changes.push(NormalizeChange::DebugPointers);
+        }
+        Ok(Normalization { changes, kept })
     }
 
-    /// Correct a wrong nonzero checksum, if the change keeps the header bytes that `original`
-    /// uses.
+    /// Use `candidate` if its built file keeps the loader view of `original`. Return the built
+    /// file and `true` if the debug file offsets moved. On an error, the image does not change.
+    fn try_normalized(
+        &mut self,
+        candidate: PeImage,
+        original: &LoaderView<'_>,
+    ) -> core::result::Result<(Vec<u8>, bool), NormalizeKept> {
+        let previous = core::mem::replace(&mut self.image, candidate);
+        let result = self
+            .try_build()
+            .map_err(|error| NormalizeKept::Build(error.to_string()))
+            .and_then(|bytes| {
+                let view = LoaderView::parse(&bytes)
+                    .map_err(|error| NormalizeKept::Build(error.to_string()))?;
+                let moved = original.check(&view)?;
+                drop(view);
+                Ok((bytes, moved))
+            });
+        if result.is_err() {
+            self.image = previous;
+        }
+        result
+    }
+
+    /// Correct a wrong nonzero checksum of the file `bytes`, if the fix keeps the loader view
+    /// of `original`. Otherwise add the reason to `kept`.
     fn normalize_checksum(
         &mut self,
-        original: &PeImage,
+        bytes: &[u8],
+        original: &LoaderView<'_>,
         kept: &mut Vec<NormalizeKept>,
-    ) -> Result<()> {
-        let bytes = self.try_build()?;
+    ) {
         let stored = check_sum(&self.image.optional_header);
-        let Some(offset) = checksum_field_offset(&bytes).filter(|_| stored != 0) else {
-            return Ok(());
+        let Some(offset) = checksum_field_offset(bytes).filter(|_| stored != 0) else {
+            return;
         };
-        let computed = calculate_checksum(&bytes, offset);
+        let computed = calculate_checksum(bytes, offset);
         if computed == stored {
-            return Ok(());
+            return;
         }
         let mut candidate = self.image.clone();
         set_check_sum(&mut candidate.optional_header, computed);
-        if original.keeps_used_header_bytes(&candidate) {
-            self.image = candidate;
-        } else if !kept.contains(&NormalizeKept::HeaderBytesInUse) {
-            kept.push(NormalizeKept::HeaderBytesInUse);
+        if let Err(reason) = self.try_normalized(candidate, original) {
+            add_kept(kept, reason);
         }
-        Ok(())
     }
 
     /// Write the complete raw PE file to disk.
@@ -579,6 +622,13 @@ impl Deref for PeFile {
 impl DerefMut for PeFile {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.image
+    }
+}
+
+/// Add `reason` to `kept`, if it is not there.
+fn add_kept(kept: &mut Vec<NormalizeKept>, reason: NormalizeKept) {
+    if !kept.contains(&reason) {
+        kept.push(reason);
     }
 }
 

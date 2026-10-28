@@ -4,6 +4,11 @@
 //! normalization keeps the loader view: the section RVAs, the section data, and the header bytes
 //! that the entry point or a data directory refers to.
 
+mod bound_imports;
+mod debug_offsets;
+mod header_page;
+mod low_alignment;
+
 use portex::directories::{Certificate, CertificateRevision, CertificateType, SecurityDirectory};
 use portex::headers::{CoffHeader, DataDirectoryType, MachineType, SectionHeader};
 use portex::image::{
@@ -96,11 +101,8 @@ fn sections_that_share_raw_data_get_their_own_raw_ranges() {
 
     let mut file = PeFile::parse(&raw).unwrap();
     let result = file.normalize().unwrap();
-    assert!(
-        result
-            .changes
-            .contains(&NormalizeChange::Section { index: 1 })
-    );
+    assert_eq!(result.changes, [NormalizeChange::Section { index: 1 }]);
+    assert_eq!(result.kept, []);
     let normalized = PeImage::parse(&file.try_build().unwrap()).unwrap();
     assert!(!has_issue(&normalized, ValidationCode::OverlappingSections));
     assert_eq!(section_rvas(&normalized), section_rvas(&original));
@@ -115,13 +117,18 @@ fn nt_headers_in_the_dos_header_move_after_it() {
 
     let mut file = PeFile::parse(&raw).unwrap();
     let result = file.normalize().unwrap();
+    // The move writes 0x10 into `BaseOfCode`, so the code and data fields change too.
     assert_eq!(
-        result.changes[0],
-        NormalizeChange::NtHeadersOffset {
-            old: 0x10,
-            new: 0x40
-        }
+        result.changes,
+        [
+            NormalizeChange::NtHeadersOffset {
+                old: 0x10,
+                new: 0x40
+            },
+            NormalizeChange::CodeAndDataFields,
+        ]
     );
+    assert_eq!(result.kept, []);
     let normalized = PeImage::parse(&file.try_build().unwrap()).unwrap();
     assert_eq!(normalized.dos_header.e_lfanew, 0x40);
     assert_eq!(normalized.entry_point(), original.entry_point());
@@ -158,7 +165,8 @@ fn a_data_directory_in_the_headers_keeps_its_bytes() {
 
     let mut file = PeFile::parse(&raw).unwrap();
     let result = file.normalize().unwrap();
-    assert!(result.kept.contains(&NormalizeKept::HeaderBytesInUse));
+    assert_eq!(result.changes, []);
+    assert_eq!(result.kept, [NormalizeKept::HeaderBytesInUse]);
     let normalized = file.try_build().unwrap();
     assert_eq!(normalized[0x30..0x44], raw[0x30..0x44]);
 }
@@ -206,10 +214,14 @@ fn an_invalid_section_alignment_becomes_a_page() {
 
     let mut file = PeFile::parse(&raw).unwrap();
     let result = file.normalize().unwrap();
-    assert!(result.changes.contains(&NormalizeChange::SectionAlignment {
-        old: 0,
-        new: 0x1000
-    }));
+    assert_eq!(
+        result.changes,
+        [NormalizeChange::SectionAlignment {
+            old: 0,
+            new: 0x1000
+        }]
+    );
+    assert_eq!(result.kept, []);
     let normalized = PeImage::parse(&file.try_build().unwrap()).unwrap();
     assert!(!has_issue(
         &normalized,
@@ -229,14 +241,14 @@ fn reserved_directories_and_a_large_directory_count_become_valid() {
 
     let mut file = PeFile::parse(&raw).unwrap();
     let result = file.normalize().unwrap();
-    assert!(
-        result
-            .changes
-            .contains(&NormalizeChange::NumberOfRvaAndSizes { old: 0x20, new: 16 })
+    assert_eq!(
+        result.changes,
+        [
+            NormalizeChange::NumberOfRvaAndSizes { old: 0x20, new: 16 },
+            NormalizeChange::DataDirectory(DataDirectoryType::Architecture),
+        ]
     );
-    assert!(result.changes.contains(&NormalizeChange::DataDirectory(
-        DataDirectoryType::Architecture
-    )));
+    assert_eq!(result.kept, []);
     let normalized = PeImage::parse(&file.try_build().unwrap()).unwrap();
     assert!(!has_issue(
         &normalized,
@@ -280,14 +292,55 @@ fn the_overlay_and_the_certificate_table_survive_a_new_layout() {
 
     let mut file = PeFile::parse(&raw).unwrap();
     let result = file.normalize().unwrap();
+    // The move writes 0x10 into `BaseOfCode`, so the code and data fields change too.
     assert_eq!(
-        result.changes[0],
-        NormalizeChange::NtHeadersOffset {
-            old: 0x10,
-            new: 0x40
-        }
+        result.changes,
+        [
+            NormalizeChange::NtHeadersOffset {
+                old: 0x10,
+                new: 0x40
+            },
+            NormalizeChange::CodeAndDataFields,
+        ]
     );
+    assert_eq!(result.kept, []);
     let normalized = PeFile::parse(&file.try_build().unwrap()).unwrap();
+    assert!(normalized.overlay().starts_with(b"OVERLAY"));
+    assert_eq!(normalized.security().unwrap(), Some(security));
+}
+
+#[test]
+fn a_checksum_fix_covers_the_overlay_and_the_certificate() {
+    let mut file = PeFile::parse(&test_image().try_build().unwrap()).unwrap();
+    file.set_overlay(b"OVERLAY".to_vec());
+    let security = SecurityDirectory {
+        certificates: vec![Certificate {
+            length: 8,
+            revision: CertificateRevision::Revision2,
+            certificate_type: CertificateType::PkcsSignedData,
+            data: Vec::new(),
+        }],
+    };
+    file.set_security(&security).unwrap();
+    let mut raw = file.try_build().unwrap();
+    let field = optional_offset(&raw) + 64;
+    put32(&mut raw, field, 1);
+    assert_eq!(PeFile::parse(&raw).unwrap().try_build().unwrap(), raw);
+
+    let mut file = PeFile::parse(&raw).unwrap();
+    let result = file.normalize().unwrap();
+    let output = file.try_build().unwrap();
+    let stored = u32::from_le_bytes(output[field..field + 4].try_into().unwrap());
+    assert_eq!(Some(stored), compute_pe_checksum(&output));
+    assert_eq!(
+        result.changes,
+        [NormalizeChange::Checksum {
+            old: 1,
+            new: stored
+        }]
+    );
+    assert_eq!(result.kept, []);
+    let normalized = PeFile::parse(&output).unwrap();
     assert!(normalized.overlay().starts_with(b"OVERLAY"));
     assert_eq!(normalized.security().unwrap(), Some(security));
 }
