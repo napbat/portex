@@ -643,10 +643,9 @@ fn a_huge_zero_filled_exception_table_is_one_bounded_read() {
     let size = 0xffff_0000 / 24 * 24;
     for machine in [MachineType::Amd64, MachineType::Arm64] {
         let image = PeImage::parse(&zero_filled_directory(machine, exception, size)).unwrap();
-        let rdata = image.sections[1].header.virtual_address;
         let error = image.exception_table().unwrap_err();
         assert!(
-            matches!(error.kind, portex::ErrorKind::InvalidRva(rva) if rva == rdata),
+            matches!(error.kind, portex::ErrorKind::InvalidDataDirectory(_)),
             "{machine:?}: {error}"
         );
 
@@ -663,9 +662,11 @@ fn a_huge_zero_filled_debug_directory_is_one_bounded_read() {
     let debug = DataDirectoryType::Debug as usize;
     let size = 0xffff_0000 / 28 * 28;
     let image = PeImage::parse(&zero_filled_directory(MachineType::Amd64, debug, size)).unwrap();
-    let rdata = image.sections[1].header.virtual_address;
     let error = image.debug_info().unwrap_err();
-    assert!(matches!(error.kind, portex::ErrorKind::InvalidRva(rva) if rva == rdata));
+    assert!(
+        matches!(error.kind, portex::ErrorKind::InvalidDataDirectory(_)),
+        "{error}"
+    );
 
     // A small directory in the zero bytes after the raw data has only zero entries.
     let image = PeImage::parse(&zero_filled_directory(
@@ -678,4 +679,26 @@ fn a_huge_zero_filled_debug_directory_is_one_bounded_read() {
         image.debug_info().unwrap().unwrap().directories.len(),
         0x100
     );
+}
+
+#[test]
+fn a_huge_zero_filled_relocation_table_is_an_invalid_data_directory() {
+    // The RVA is valid, but the table is larger than the data that the image holds.
+    let reloc = DataDirectoryType::BaseReloc as usize;
+    let image = PeImage::parse(&zero_filled_directory(
+        MachineType::Amd64,
+        reloc,
+        0xffff_0000,
+    ))
+    .unwrap();
+    let error = image.relocations().unwrap_err();
+    assert!(
+        matches!(error.kind, portex::ErrorKind::InvalidDataDirectory(_)),
+        "{error}"
+    );
+
+    // A small table in the zero bytes after the raw data ends at the first null block.
+    let image =
+        PeImage::parse(&zero_filled_directory(MachineType::Amd64, reloc, 0x1_0000)).unwrap();
+    assert!(image.relocations().is_ok());
 }

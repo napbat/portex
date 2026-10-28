@@ -485,7 +485,8 @@ impl PeImage {
     /// # Errors
     ///
     /// Returns an error if a base relocation block (`IMAGE_BASE_RELOCATION`) cannot be read or
-    /// is malformed.
+    /// is malformed. Returns an [`ErrorKind::InvalidDataDirectory`](crate::ErrorKind) error if
+    /// the directory is larger than the data that the image holds.
     #[must_use = "parsing returns a relocation table that should be used"]
     pub fn relocations(&self) -> Result<crate::reloc::RelocationTable> {
         use crate::data_dir::DataDirectoryType;
@@ -496,6 +497,11 @@ impl PeImage {
         match dir {
             Some(d) => {
                 let reader = self.rva_reader();
+                if reader.exceeds_zero_fill(d.size) {
+                    return Err(Error::invalid_data_directory(
+                        "base relocation table is larger than the data that the image holds",
+                    ));
+                }
                 let read_fn = |rva: u32, len: usize| reader.read(rva, len);
                 crate::reloc::RelocationTable::parse(d.virtual_address, d.size, read_fn)
             }
@@ -694,6 +700,19 @@ impl<'a> RvaReader<'a> {
             lookup,
             held: OnceCell::new(),
         }
+    }
+
+    /// Return true if [`Self::read`] refuses a read of `len` bytes because of the zero-fill
+    /// budget: the read is larger than the held bytes plus the zero-fill budget.
+    pub(super) fn exceeds_zero_fill(&self, len: u32) -> bool {
+        let Ok(len) = usize::try_from(len) else {
+            return true;
+        };
+        if len <= MIN_ZERO_FILL {
+            return false;
+        }
+        let held = *self.held.get_or_init(|| self.image.held_len());
+        len > held.saturating_add(held.max(MIN_ZERO_FILL))
     }
 
     /// Read `len` bytes at an RVA into a new buffer, as [`PeImage::read_rva`] does.

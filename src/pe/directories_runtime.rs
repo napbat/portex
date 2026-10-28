@@ -113,7 +113,9 @@ impl PeImage {
     /// # Errors
     ///
     /// Returns an error if the debug directory entries cannot be read from the
-    /// image or are malformed.
+    /// image or are malformed. Returns an
+    /// [`ErrorKind::InvalidDataDirectory`](crate::ErrorKind) error if the debug directory is
+    /// larger than the data that the image holds.
     pub fn debug_info(&self) -> Result<Option<crate::debug::DebugInfo>> {
         use crate::data_dir::DataDirectoryType;
 
@@ -123,6 +125,11 @@ impl PeImage {
         match dir {
             Some(d) => {
                 let reader = self.rva_reader();
+                if reader.exceeds_zero_fill(d.size) {
+                    return Err(crate::Error::invalid_data_directory(
+                        "debug directory is larger than the data that the image holds",
+                    ));
+                }
                 let read_fn = |rva: u32, len: usize| reader.read(rva, len);
                 Ok(Some(crate::debug::DebugInfo::parse(
                     d.virtual_address,
@@ -341,7 +348,9 @@ impl PeImage {
     /// # Errors
     ///
     /// Returns an error if the exception directory cannot be read or is
-    /// malformed for the image's machine type.
+    /// malformed for the image's machine type. Returns an
+    /// [`ErrorKind::InvalidDataDirectory`](crate::ErrorKind) error if the exception table is
+    /// larger than the data that the image holds.
     pub fn exception_table(&self) -> Result<Option<crate::exception::ExceptionTable>> {
         use crate::data_dir::DataDirectoryType;
 
@@ -352,6 +361,11 @@ impl PeImage {
             return Ok(None);
         };
         let reader = self.rva_reader();
+        if reader.exceeds_zero_fill(directory.size) {
+            return Err(crate::Error::invalid_data_directory(
+                "exception table is larger than the data that the image holds",
+            ));
+        }
         let read = |rva: u32, len: usize| reader.read(rva, len);
         crate::exception::ExceptionTable::parse(
             self.coff_header.machine,
