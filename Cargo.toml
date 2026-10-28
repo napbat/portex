@@ -3,7 +3,7 @@
 
 [package]
 name = "portex"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A no_std-friendly parser, editor, and builder for raw and mapped PE executable images"
