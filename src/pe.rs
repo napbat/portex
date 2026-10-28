@@ -263,6 +263,10 @@ mod directories_runtime;
 mod edit;
 mod headers;
 mod inspect;
+mod normalize;
 mod parse;
 mod utilities;
 mod validate;
+
+pub use normalize::{Normalization, NormalizeChange, NormalizeKept};
+pub(crate) use normalize::{check_sum, normalize_changes, set_check_sum};

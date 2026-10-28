@@ -26,6 +26,8 @@ a different source offset.
 - Parsing of malformed input for PE tooling: headers that end early, overlapping header
   structures and garbage fields still parse, and `validate()` reports the problems. Fallible
   builders, with no panics on file data.
+- Normalization of malformed files through `PeFile::normalize`, with no change to how the
+  loader maps the image.
 - Sequential I/O and positional I/O.
 - `no_std + alloc` support. Sequential I/O uses
   [`nostdio`](https://github.com/coconutbird/nostdio). Positional `ReadAt` access is also
@@ -137,6 +139,37 @@ PeImage::read_mapped_from(&reader, source_offset, runtime_image_base)
 
 `PeHeaders::rva_to_source_offset` does the same layout-aware translation. It does not read all
 sections.
+
+## Normalize a malformed file
+
+`PeFile::normalize` sets malformed header fields and the file layout to normal values:
+
+- It moves NT headers that overlap the DOS header, and a section table that overlaps the
+  optional header.
+- It sets an unknown `Magic`, invalid alignments, `NumberOfRvaAndSizes` and the reserved data
+  directories to valid values.
+- It gives each section its own aligned raw range, and calculates `SizeOfHeaders`,
+  `SizeOfImage` and the size fields again. It corrects a wrong nonzero checksum.
+
+The loader view stays the same. Each section keeps its RVA, its virtual size and its data. The
+header bytes that the entry point or a data directory refers to do not change. The method does
+not make a fix that would change the loader view. Instead, it names the fix in
+`Normalization::kept`. Examples are code in the headers, a section RVA that is not aligned, and
+a `SectionAlignment` smaller than a page.
+
+```rust,no_run
+use portex::PeFile;
+
+# let damaged: &[u8] = &[];
+let mut file = PeFile::parse(damaged)?;
+let result = file.normalize()?;
+println!("changed: {:?}", result.changes);
+println!("kept: {:?}", result.kept);
+let normalized = file.try_build()?;
+# Ok::<(), portex::Error>(())
+```
+
+A change invalidates an Authenticode signature. The overlay and the certificate table stay.
 
 ## Sequential and positional I/O
 

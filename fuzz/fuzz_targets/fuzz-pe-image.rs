@@ -1,5 +1,5 @@
 //! Fuzz target that parses arbitrary bytes as PE files, and then runs the directory accessors,
-//! the validation and the build paths on the result.
+//! the validation, the build paths and the normalization on the result.
 
 #![no_main]
 
@@ -24,10 +24,15 @@ fuzz_target!(|data: &[u8]| {
             let _ = PeImage::parse(&rebuilt);
         }
     }
-    if let Ok(file) = PeFile::parse(data)
-        && let Ok(rebuilt) = file.try_build()
-    {
-        let _ = PeFile::parse(&rebuilt);
+    if let Ok(mut file) = PeFile::parse(data) {
+        if let Ok(rebuilt) = file.try_build() {
+            let _ = PeFile::parse(&rebuilt);
+        }
+        if file.normalize().is_ok()
+            && let Ok(normalized) = file.try_build()
+        {
+            let _ = PeFile::parse(&normalized);
+        }
     }
 });
 

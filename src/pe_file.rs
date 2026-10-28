@@ -2,7 +2,9 @@
 
 use core::ops::{Deref, DerefMut, Range};
 
+use crate::checksum::{calculate_checksum, checksum_field_offset};
 use crate::data_dir::{DataDirectory, DataDirectoryType};
+use crate::pe::{Normalization, NormalizeKept, check_sum, normalize_changes, set_check_sum};
 use crate::prelude::*;
 use crate::reader::ReadAt;
 use crate::security::{SecurityBuilder, SecurityDirectory};
@@ -469,6 +471,71 @@ impl PeFile {
     pub fn build(&self) -> Vec<u8> {
         self.try_build()
             .expect("PeFile build failed: use PeFile::try_build() to handle invalid structures")
+    }
+
+    /// Set malformed header fields and the file layout to normal values, and keep the loader
+    /// view of the image.
+    ///
+    /// The method makes these changes:
+    ///
+    /// - It moves NT headers that overlap the DOS header to offset 0x40. It grows
+    ///   `SizeOfOptionalHeader`, so that the section table follows the optional header.
+    /// - It sets an unknown `Magic`, invalid alignments, `NumberOfRvaAndSizes` and the
+    ///   reserved data directories to valid values.
+    /// - It lays out the raw section data again, so that each section has its own aligned raw
+    ///   range. It also calculates `SizeOfHeaders`, `SizeOfImage` and the code and data size
+    ///   fields again.
+    /// - It corrects a wrong checksum. A checksum of 0 stays 0.
+    ///
+    /// Each section keeps its RVA, its virtual size, its characteristics and its data. The
+    /// header bytes that the entry point or a data directory refers to stay the same. The
+    /// method does not make a fix that would change this loader view. [`Normalization::kept`]
+    /// names the fixes that it does not make. The overlay and the certificate table stay.
+    ///
+    /// A change invalidates an Authenticode signature. A new layout also drops the file bytes
+    /// between the raw ranges of the sections, which the loader does not map.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if [`Self::try_build`] fails for the normalized file. The file then
+    /// does not change.
+    pub fn normalize(&mut self) -> Result<Normalization> {
+        let (image, mut kept) = self.image.normalized();
+        let original = core::mem::replace(&mut self.image, image);
+        if let Err(error) = self.normalize_checksum(&original, &mut kept) {
+            self.image = original;
+            return Err(error);
+        }
+        Ok(Normalization {
+            changes: normalize_changes(&original, &self.image),
+            kept,
+        })
+    }
+
+    /// Correct a wrong nonzero checksum, if the change keeps the header bytes that `original`
+    /// uses.
+    fn normalize_checksum(
+        &mut self,
+        original: &PeImage,
+        kept: &mut Vec<NormalizeKept>,
+    ) -> Result<()> {
+        let bytes = self.try_build()?;
+        let stored = check_sum(&self.image.optional_header);
+        let Some(offset) = checksum_field_offset(&bytes).filter(|_| stored != 0) else {
+            return Ok(());
+        };
+        let computed = calculate_checksum(&bytes, offset);
+        if computed == stored {
+            return Ok(());
+        }
+        let mut candidate = self.image.clone();
+        set_check_sum(&mut candidate.optional_header, computed);
+        if original.keeps_used_header_bytes(&candidate) {
+            self.image = candidate;
+        } else if !kept.contains(&NormalizeKept::HeaderBytesInUse) {
+            kept.push(NormalizeKept::HeaderBytesInUse);
+        }
+        Ok(())
     }
 
     /// Write the complete raw PE file to disk.
