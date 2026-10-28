@@ -444,3 +444,20 @@ fn an_odd_checksum_offset_gets_a_stable_checksum() {
     assert_eq!(result.kept, []);
     assert_eq!(file.try_build().unwrap(), output);
 }
+
+#[test]
+fn a_checksum_that_windows_accepts_stays() {
+    let mut raw = test_image().try_build().unwrap();
+    move_nt_headers_one_byte_later(&mut raw);
+    let field = optional_offset(&raw) + 64;
+    assert_eq!(field % 2, 1);
+    // `CheckSumMappedFile` in Windows `imagehlp.dll` returned this checksum for this file.
+    put32(&mut raw, field, 0x4CC5);
+    assert_eq!(compute_pe_checksum(&raw), Some(0x4CC5));
+
+    let mut file = PeFile::parse(&raw).unwrap();
+    let result = file.normalize().unwrap();
+    assert_eq!(result.changes, []);
+    assert_eq!(result.kept, []);
+    assert_eq!(file.try_build().unwrap(), raw);
+}
