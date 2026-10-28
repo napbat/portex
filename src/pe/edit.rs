@@ -299,7 +299,7 @@ impl PeImage {
     /// Returns an error in these conditions:
     /// - The `SectionAlignment` or the `FileAlignment` of the optional header is invalid.
     /// - The image has more than [`MAX_NUMBER_OF_SECTIONS`] sections.
-    /// - `e_lfanew` is smaller than 4, the minimum of the loader.
+    /// - `e_lfanew` is smaller than 2, so that the PE signature overlaps `e_magic`.
     /// - A header size, a section address, a section size or an aggregate size overflows its
     ///   field.
     pub fn try_update_layout(&mut self) -> Result<()> {
@@ -337,7 +337,7 @@ impl PeImage {
             .map_err(|_| Error::invalid_section("e_lfanew is negative"))?;
         if pe_offset < DosHeader::MIN_PE_OFFSET {
             return Err(Error::invalid_section(format!(
-                "e_lfanew {pe_offset:#x} is smaller than {:#x}, the minimum of the loader",
+                "e_lfanew {pe_offset:#x} is smaller than {:#x}: the PE signature overlaps e_magic",
                 DosHeader::MIN_PE_OFFSET
             )));
         }

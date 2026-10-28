@@ -86,15 +86,6 @@ fn strict_and_lenient_mapped_parsing_are_explicit() {
 }
 
 #[test]
-fn raw_section_with_bytes_and_zero_pointer_is_rejected() {
-    let mut raw = test_image().try_build().unwrap();
-    let headers = PeHeaders::from_slice(&raw).unwrap();
-    let first = section_table_offset(&headers);
-    raw[first + 20..first + 24].copy_from_slice(&0u32.to_le_bytes());
-    assert!(PeImage::parse(&raw).is_err());
-}
-
-#[test]
 fn nonstandard_pe_header_offset_round_trips() {
     let mut image = test_image();
     image.dos_header.e_lfanew = 0x240;

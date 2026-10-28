@@ -1,4 +1,4 @@
-use super::{HeaderTail, MissingSectionData, ParseOptions, PeHeaders, PeImage, SourceLayout};
+use super::{HeaderBytes, MissingSectionData, ParseOptions, PeHeaders, PeImage, SourceLayout};
 use crate::dos::DosHeader;
 use crate::layout;
 use crate::prelude::*;
@@ -157,7 +157,6 @@ impl PeImage {
     ///
     /// - [`PeHeaders::read_from`] fails.
     /// - A source offset overflows.
-    /// - A section in the file layout has raw bytes but a zero `PointerToRawData`.
     /// - The reader fails.
     /// - The DOS stub cannot be fully read.
     /// - The bytes of a section cannot be fully read, and the options use
@@ -169,6 +168,7 @@ impl PeImage {
     ) -> Result<Self> {
         let headers = PeHeaders::read_from(reader, base_offset)?;
         let header_tail = Self::read_header_tail(reader, base_offset, &headers, options.layout);
+        let optional_padding = Self::read_optional_padding(reader, base_offset, &headers);
 
         // Read the DOS stub. If the NT headers overlap the DOS header, there is no stub.
         let dos_stub_start = base_offset
@@ -204,6 +204,7 @@ impl PeImage {
             source_layout: options.layout,
             runtime_image_base: options.runtime_image_base,
             header_tail,
+            optional_padding,
         })
     }
 
@@ -287,10 +288,11 @@ impl PeImage {
             return Ok(Section::from_header_and_data(header, Vec::new()));
         }
         if header.pointer_to_raw_data == 0 {
-            return Err(Error::invalid_section(format!(
-                "section '{}' has raw bytes but a zero file pointer",
-                header.name_str()
-            )));
+            // The section declares raw data, but no file offset. It has no bytes in the file, so
+            // read it as zeros.
+            let mut section = Section::from_header_and_data(header, Vec::new());
+            section.raw_tail_is_zero = true;
+            return Ok(section);
         }
         let offset = u64::from(layout::loader_raw_offset(
             header.pointer_to_raw_data,
@@ -325,7 +327,7 @@ impl PeImage {
         base_offset: u64,
         headers: &PeHeaders,
         source_layout: SourceLayout,
-    ) -> HeaderTail {
+    ) -> HeaderBytes {
         let Some(table_end) = headers
             .pe_offset
             .checked_sub(base_offset)
@@ -339,7 +341,7 @@ impl PeImage {
                 )
             })
         else {
-            return HeaderTail::default();
+            return HeaderBytes::default();
         };
 
         let file_alignment = headers.optional_header.file_alignment();
@@ -356,27 +358,63 @@ impl PeImage {
                 limit = limit.min(u64::from(start));
             }
         }
+        Self::read_header_bytes(reader, base_offset, table_end, limit)
+    }
+
+    /// Read the raw bytes between the optional header and the section table.
+    ///
+    /// These bytes exist if `SizeOfOptionalHeader` is larger than the optional header. The result
+    /// is empty if the bytes are all zero or cannot be read.
+    fn read_optional_padding<R: ReadAt>(
+        reader: &R,
+        base_offset: u64,
+        headers: &PeHeaders,
+    ) -> HeaderBytes {
+        let optional_offset = headers
+            .pe_offset
+            .checked_sub(base_offset)
+            .and_then(|pe_offset| usize::try_from(pe_offset).ok())
+            .and_then(|pe_offset| pe_offset.checked_add(4 + crate::coff::CoffHeader::SIZE));
+        let Some(optional_offset) = optional_offset else {
+            return HeaderBytes::default();
+        };
+        let start = optional_offset.saturating_add(headers.optional_header.size());
+        let end = optional_offset
+            .saturating_add(usize::from(headers.coff_header.size_of_optional_header));
+        Self::read_header_bytes(reader, base_offset, start, end as u64)
+    }
+
+    /// Read the raw header bytes from `start` to `limit`, but not past the end of the source.
+    ///
+    /// The result keeps the offset `start`, and has no trailing zeros. It is empty if the bytes
+    /// cannot be read: these bytes are optional data, so a read failure does not make the parse
+    /// fail.
+    fn read_header_bytes<R: ReadAt>(
+        reader: &R,
+        base_offset: u64,
+        start: usize,
+        mut limit: u64,
+    ) -> HeaderBytes {
         if let Some(source_size) = reader.size() {
             limit = limit.min(source_size.saturating_sub(base_offset));
         }
-
         let (Some(len), Some(source_offset)) = (
             limit
-                .checked_sub(table_end as u64)
+                .checked_sub(start as u64)
                 .filter(|len| *len != 0)
                 .and_then(|len| usize::try_from(len).ok()),
-            base_offset.checked_add(table_end as u64),
+            base_offset.checked_add(start as u64),
         ) else {
-            return HeaderTail::default();
+            return HeaderBytes::default();
         };
         let bytes = Self::read_source_bytes(reader, source_offset, len, MissingSectionData::Empty)
             .unwrap_or_default();
-        let mut tail = HeaderTail {
-            offset: table_end,
+        let mut header_bytes = HeaderBytes {
+            offset: start,
             bytes,
         };
-        tail.trim_trailing_zeros();
-        tail
+        header_bytes.trim_trailing_zeros();
+        header_bytes
     }
 
     /// Read a source range and apply the selected [`MissingSectionData`] policy.

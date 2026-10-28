@@ -169,23 +169,30 @@ pub struct PeImage {
     pub sections: Vec<Section>,
     pub(crate) source_layout: SourceLayout,
     pub(crate) runtime_image_base: Option<u64>,
-    pub(crate) header_tail: HeaderTail,
+    /// The raw bytes after the section table.
+    ///
+    /// Linkers can put data there, for example the bound import table.
+    pub(crate) header_tail: HeaderBytes,
+    /// The raw bytes after the optional header and before the section table, if
+    /// `SizeOfOptionalHeader` is larger than the optional header.
+    ///
+    /// A file can put other data there, for example the raw data of a section.
+    pub(crate) optional_padding: HeaderBytes,
 }
 
-/// Raw bytes in the headers after the section table.
+/// Raw header bytes that no header structure describes.
 ///
-/// Linkers can put data there, for example the bound import table. The bytes keep their offset,
-/// because data directories refer to them by RVA. In the headers, a file offset and an RVA have
-/// the same value.
+/// The bytes keep their offset, because data directories and section headers can refer to them.
+/// In the headers, a file offset and an RVA have the same value.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct HeaderTail {
+pub(crate) struct HeaderBytes {
     /// The offset of the first byte from the start of the image.
     pub(crate) offset: usize,
     /// The bytes, without trailing zeros.
     pub(crate) bytes: Vec<u8>,
 }
 
-impl HeaderTail {
+impl HeaderBytes {
     /// Return the offset after the last byte, or `None` on overflow.
     pub(crate) fn end(&self) -> Option<usize> {
         self.offset.checked_add(self.bytes.len())

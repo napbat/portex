@@ -1,4 +1,4 @@
-use super::{HeaderTail, PeImage};
+use super::{HeaderBytes, PeImage};
 use crate::coff::{CoffHeader, PE_SIGNATURE};
 use crate::dos::DosHeader;
 use crate::layout;
@@ -31,11 +31,15 @@ impl PeImage {
 
     /// Build the PE file, or return an error for an invalid offset, size or header relationship.
     ///
+    /// The build calculates the layout again. A malformed image can have values that no new
+    /// layout can use, for example a `SectionAlignment` of 0. Then the build keeps the current
+    /// layout, if it holds the headers and the section data.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
     ///
-    /// - The layout update fails.
+    /// - The layout update fails, and the current layout cannot hold the data.
     /// - `e_lfanew`, the DOS stub, the optional header or the raw ranges of the sections are not
     ///   consistent, or they overflow.
     /// - The allocation of the output buffer fails.
@@ -45,8 +49,10 @@ impl PeImage {
     /// build.
     pub fn try_build(&self) -> Result<Vec<u8>> {
         let mut pe = self.clone();
-        pe.try_update_layout()?;
-        pe.try_build_updated_layout()
+        match pe.try_update_layout() {
+            Ok(()) => pe.try_build_updated_layout(),
+            Err(error) => self.try_build_current_layout(Some(0))?.ok_or(error),
+        }
     }
 
     /// Serialize the image after a call to [`Self::try_update_layout`].
@@ -65,8 +71,10 @@ impl PeImage {
     /// headers and the section data, or if the headers do not fit the current layout. Then the
     /// caller can make a new layout.
     ///
-    /// `source_end` is the length of a source whose headers or raw section data go past its end.
-    /// Then the output keeps that length, and does not hold the zero padding after it.
+    /// If `source_end` is set, the output size comes from the section data, not from
+    /// `SizeOfRawData`. The output has at least `source_end` bytes, and no zero padding after
+    /// them. Use the length of a source whose headers or raw section data go past its end, or 0
+    /// for a layout that can declare raw ranges far after its data.
     pub(crate) fn try_build_current_layout(
         &self,
         source_end: Option<usize>,
@@ -88,14 +96,13 @@ impl PeImage {
     /// File ranges can overlap here, and the header table can extend past `SizeOfHeaders`.
     /// [`Self::output_holds_data`] checks the overlapping bytes.
     fn current_layout_can_hold(&self) -> bool {
-        self.sections.iter().all(|section| {
-            let start = section.header.pointer_to_raw_data;
-            let size = section.header.size_of_raw_data as usize;
-            if size == 0 {
-                return section.data.is_empty() || section.preserved_raw_size() == Some(0);
-            }
-            start != 0 && section.data.len() <= size
-        })
+        let file_alignment = self.optional_header.file_alignment();
+        self.sections
+            .iter()
+            .all(|section| match loader_raw_range(section, file_alignment) {
+                Some((_, size)) => section.data.len() <= size,
+                None => section.data.is_empty() || section.preserved_raw_size() == Some(0),
+            })
     }
 
     /// Return `true` if `output` holds the headers and the data of each section at its file
@@ -104,12 +111,11 @@ impl PeImage {
     /// Packed files can declare headers and sections that share file bytes. Such a layout is
     /// correct only if the shared bytes agree. Otherwise one write replaces part of another.
     fn output_holds_data(&self, output: &[u8], headers: &[u8]) -> bool {
+        let file_alignment = self.optional_header.file_alignment();
         let mut ranges = Vec::with_capacity(self.sections.len() + 1);
         ranges.push(0..headers.len());
         for section in &self.sections {
-            let start = section.header.pointer_to_raw_data as usize;
-            let size = section.header.size_of_raw_data as usize;
-            if start != 0 && size != 0 {
+            if let Some((start, size)) = loader_raw_range(section, file_alignment) {
                 ranges.push(start..start.saturating_add(size));
             }
         }
@@ -118,16 +124,16 @@ impl PeImage {
             return true;
         }
 
-        // Some ranges overlap. Compare each component with the bytes in the output.
-        if output.get(..headers.len()) != Some(headers) {
+        // Some ranges overlap. Compare each component with the bytes in the output. The output
+        // of a short source can end inside the headers, after their last nonzero byte.
+        let (kept, trimmed) = headers.split_at(headers.len().min(output.len()));
+        if &output[..kept.len()] != kept || trimmed.iter().any(|byte| *byte != 0) {
             return false;
         }
         self.sections.iter().all(|section| {
-            let start = section.header.pointer_to_raw_data as usize;
-            let size = section.header.size_of_raw_data as usize;
-            if start == 0 || size == 0 {
+            let Some((start, size)) = loader_raw_range(section, file_alignment) else {
                 return true;
-            }
+            };
             // The output can end before the raw range, after the data of the section.
             let end = start.saturating_add(size).min(output.len());
             let written = &output[start.min(end)..end];
@@ -158,14 +164,20 @@ impl PeImage {
     ///
     /// Returns an error if:
     ///
-    /// - The layout update or the header serialization fails.
-    /// - A section extends past `SizeOfImage`.
+    /// - The layout update fails, and the current layout has a section after `SizeOfImage`.
+    /// - The header serialization fails.
     /// - The allocation of the image buffer fails.
     /// - A rebase is necessary, but the base relocation table is missing or malformed, or it
     ///   targets bytes outside the image.
     pub fn to_mapped_image_at(&self, runtime_image_base: u64) -> Result<Vec<u8>> {
-        let mut pe = self.clone();
-        pe.try_update_layout()?;
+        // A malformed image can have values that no new layout can use. Then map the current
+        // layout.
+        let mut updated = self.clone();
+        let pe: &PeImage = if updated.try_update_layout().is_ok() {
+            &updated
+        } else {
+            self
+        };
 
         // The loader maps the headers as they are in the file. If the layout update keeps the
         // section RVAs, map the headers of `self`: the update can change header fields that also
@@ -183,33 +195,38 @@ impl PeImage {
         let (source, image_size) = if keeps_source_headers {
             (self, source_size)
         } else {
-            (&pe, pe.optional_header.size_of_image())
+            (pe, pe.optional_header.size_of_image())
         };
-        let mut mapped = try_zeroed_buffer(image_size as usize, "mapped image")?;
+        if let Some(section) = pe
+            .sections
+            .iter()
+            .find(|section| super::inspect::section_end(section) > u64::from(image_size))
+        {
+            return Err(Error::invalid_section(format!(
+                "section '{}' exceeds SizeOfImage",
+                section.name()
+            )));
+        }
         let headers = source.build_headers()?;
-        let header_limit = if keeps_source_headers {
+        let header_count = if keeps_source_headers {
             headers.len()
         } else {
-            pe.optional_header.size_of_headers() as usize
+            headers
+                .len()
+                .min(pe.optional_header.size_of_headers() as usize)
         };
-        let header_count = headers.len().min(header_limit).min(mapped.len());
+        // A malformed `SizeOfImage` can be smaller than the headers. The image holds them anyway.
+        let image_size = (image_size as usize).max(header_count);
+        let mut mapped = try_zeroed_buffer(image_size, "mapped image")?;
         mapped[..header_count].copy_from_slice(&headers[..header_count]);
 
         for section in &pe.sections {
+            // The check above makes sure that the section is inside the image.
             let start = section.header.virtual_address as usize;
             let mapped_size = section
                 .header
                 .virtual_size
                 .max(section.header.size_of_raw_data) as usize;
-            let end = start
-                .checked_add(mapped_size)
-                .ok_or_else(|| Error::invalid_section("mapped section range overflow"))?;
-            if end > mapped.len() {
-                return Err(Error::invalid_section(format!(
-                    "section '{}' exceeds SizeOfImage",
-                    section.name()
-                )));
-            }
             let count = section.data.len().min(mapped_size);
             mapped[start..start + count].copy_from_slice(&section.data[..count]);
         }
@@ -291,7 +308,7 @@ impl PeImage {
     ///
     /// The method writes the structures in file order. As the loader allows, they can overlap:
     ///
-    /// - The NT headers can start inside the DOS header (`e_lfanew` from 4 to 63).
+    /// - The NT headers can start inside the DOS header (`e_lfanew` from 2 to 63).
     /// - The optional header can be longer than `SizeOfOptionalHeader`, so that the section
     ///   table overlaps it.
     ///
@@ -334,7 +351,7 @@ impl PeImage {
         })?;
         if pe_offset < DosHeader::MIN_PE_OFFSET {
             return Err(Error::invalid_section(format!(
-                "e_lfanew {pe_offset:#x} is smaller than {:#x}, the minimum of the loader",
+                "e_lfanew {pe_offset:#x} is smaller than {:#x}: the PE signature overlaps e_magic",
                 DosHeader::MIN_PE_OFFSET
             )));
         }
@@ -387,6 +404,16 @@ impl PeImage {
             .write(&mut output[coff_offset..optional_offset])?;
         self.optional_header
             .write(&mut output[optional_offset..optional_end])?;
+        // Keep the padding bytes that are still between the optional header and the section
+        // table. The optional header can grow into them.
+        let padding = &self.optional_padding;
+        let padding_start = padding.offset.max(optional_end);
+        let padding_end = padding.end().unwrap_or(padding_start).min(sections_offset);
+        if padding_start < padding_end {
+            output[padding_start..padding_end].copy_from_slice(
+                &padding.bytes[padding_start - padding.offset..padding_end - padding.offset],
+            );
+        }
 
         let (section_table, _) =
             output[sections_offset..table_end].as_chunks_mut::<{ SectionHeader::SIZE }>();
@@ -420,7 +447,7 @@ impl PeImage {
     ///
     /// `table_end` is the end of the section table. If the header table grows into the tail,
     /// the header table replaces the tail.
-    pub(super) fn header_tail_after(&self, table_end: usize) -> Option<&HeaderTail> {
+    pub(super) fn header_tail_after(&self, table_end: usize) -> Option<&HeaderBytes> {
         let tail = &self.header_tail;
         (!tail.bytes.is_empty() && tail.offset >= table_end).then_some(tail)
     }
@@ -430,7 +457,7 @@ impl PeImage {
     /// This is the end of the header tail, or `table_end` if no header tail follows the table.
     pub(super) fn header_data_end(&self, table_end: usize) -> Option<usize> {
         self.header_tail_after(table_end)
-            .map_or(Some(table_end), HeaderTail::end)
+            .map_or(Some(table_end), HeaderBytes::end)
     }
 
     /// Write the PE bytes with the serialized `headers`, and do not update the layout.
@@ -449,16 +476,18 @@ impl PeImage {
         // Calculate the total file size. The loader ignores `PointerToRawData` if
         // `SizeOfRawData` is zero. For a source that ends early, only the section data counts:
         // the source has no bytes for the rest of the raw range.
+        let file_alignment = self.optional_header.file_alignment();
         let mut file_size = source_end.unwrap_or(self.optional_header.size_of_headers() as usize);
         for section in &self.sections {
-            let start = section.header.pointer_to_raw_data as usize;
-            let size = section.header.size_of_raw_data as usize;
+            let Some((start, size)) = loader_raw_range(section, file_alignment) else {
+                continue;
+            };
             let written = if source_end.is_some() {
                 section.data.len().min(size)
             } else {
                 size
             };
-            if start == 0 || written == 0 {
+            if written == 0 {
                 continue;
             }
             let end = start
@@ -471,19 +500,15 @@ impl PeImage {
         let mut output = try_zeroed_buffer(file_size, "raw PE image")?;
         output[..headers.len()].copy_from_slice(headers);
 
-        // Write the section data.
+        // Write the section data where the loader reads it. The padding is already zero.
         for section in &self.sections {
-            let start = section.header.pointer_to_raw_data as usize;
-            let size = section.header.size_of_raw_data as usize;
-            let data_len = section.data.len().min(size);
-            if start > 0
-                && size > 0
-                && start
-                    .checked_add(data_len)
-                    .is_some_and(|end| end <= output.len())
-            {
-                output[start..start + data_len].copy_from_slice(&section.data[..data_len]);
-                // The padding is already zero.
+            let target = loader_raw_range(section, file_alignment).and_then(|(start, size)| {
+                let data_len = section.data.len().min(size);
+                let end = start.checked_add(data_len)?;
+                output.get_mut(start..end).map(|target| (target, data_len))
+            });
+            if let Some((target, data_len)) = target {
+                target.copy_from_slice(&section.data[..data_len]);
             } else if !section.data.is_empty() && section.preserved_raw_size() != Some(0) {
                 return Err(Error::invalid_section(format!(
                     "section '{}' has data but no writable raw-file range",
@@ -545,4 +570,21 @@ struct WrittenHeaders {
     optional_offset: usize,
     /// `true` if the section table overlaps the optional header.
     table_overlaps_optional_header: bool,
+}
+
+/// Return the file range where the loader reads the raw data of `section`, as `(start, size)`.
+///
+/// The start is the rounded `PointerToRawData` (see [`layout::loader_raw_offset`]). The result
+/// is `None` if the section has no raw data: its `PointerToRawData` or its `SizeOfRawData` is 0.
+fn loader_raw_range(
+    section: &crate::section::Section,
+    file_alignment: u32,
+) -> Option<(usize, usize)> {
+    let header = &section.header;
+    (header.pointer_to_raw_data != 0 && header.size_of_raw_data != 0).then(|| {
+        (
+            layout::loader_raw_offset(header.pointer_to_raw_data, file_alignment) as usize,
+            header.size_of_raw_data as usize,
+        )
+    })
 }

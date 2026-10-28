@@ -1,6 +1,6 @@
-//! Regression tests for image shapes that the loader of Windows Vista and later accepts.
+//! Regression tests for malformed image shapes that portex reads, and builds back.
 //!
-//! Each test builds its image with `PeBuilder` and then changes the bytes.
+//! Each test builds its image with `PeBuilder` or explicit bytes, and then changes the bytes.
 
 use portex::headers::{CoffHeader, DataDirectoryType, MachineType, OptionalHeader, SectionHeader};
 use portex::image::{PeBuilder, PeFile, PeHeaders, PeImage};
@@ -298,9 +298,8 @@ fn an_unaligned_pointer_to_raw_data_reads_where_the_loader_reads() {
         Some(rdata.pointer_to_raw_data)
     );
 
-    let rebuilt = PeImage::parse(&PeFile::parse(&raw).unwrap().try_build().unwrap()).unwrap();
-    assert_eq!(rebuilt.sections[1].data[..0x180], [0x5a; 0x180]);
-    assert_eq!(rebuilt.sections[1].header.pointer_to_raw_data % 0x200, 0);
+    // The build writes the section data at the rounded offset, so the file stays the same.
+    assert_eq!(PeFile::parse(&raw).unwrap().try_build().unwrap(), raw);
 }
 
 #[test]
@@ -312,4 +311,85 @@ fn a_malformed_debug_directory_does_not_stop_the_build() {
 
     let rebuilt = PeImage::parse(&image.try_build().unwrap()).unwrap();
     assert_eq!(rebuilt.sections[1].data[..0x180], [0x5a; 0x180]);
+}
+
+#[test]
+fn a_file_that_ends_inside_its_headers_reads_them_as_zeros() {
+    // A data-file DLL: the PE signature follows "MZ", and the file ends inside the optional
+    // header. The `e_lfanew` field at 0x3C is also a field of the optional header.
+    let mut raw = vec![0; 0x40];
+    raw[..2].copy_from_slice(b"MZ");
+    raw[2..6].copy_from_slice(b"PE\0\0");
+    put32(&mut raw, 0x3c, 2);
+
+    let image = PeImage::parse(&raw).unwrap();
+    assert_eq!(image.dos_header.e_lfanew, 2);
+    // The machine type and the magic are 0. The parser uses the PE32 layout and keeps the magic.
+    let OptionalHeader::Pe32(optional) = &image.optional_header else {
+        panic!("an unknown magic uses the PE32 layout");
+    };
+    assert_eq!(optional.magic, 0);
+    assert!(
+        image
+            .validate()
+            .issues
+            .iter()
+            .any(|issue| issue.code == ValidationCode::InvalidOptionalMagic)
+    );
+    assert_eq!(PeFile::parse(&raw).unwrap().try_build().unwrap(), raw);
+}
+
+#[test]
+fn a_section_with_raw_size_and_no_file_offset_reads_as_zeros() {
+    let mut raw = test_image().try_build().unwrap();
+    let headers = PeHeaders::from_slice(&raw).unwrap();
+    let rva = headers.section_headers[1].virtual_address;
+    let header = section_header_offset(&headers, 1);
+    // A VirtualSize of 0 makes SizeOfRawData the extent of the section.
+    put32(&mut raw, header + 8, 0);
+    put32(&mut raw, header + 16, 0x1000);
+    put32(&mut raw, header + 20, 0);
+
+    let image = PeImage::parse(&raw).unwrap();
+    assert_eq!(image.sections[1].data, []);
+    // The read adds more zero bytes than the image holds. That is allowed up to 1 MiB.
+    assert_eq!(image.read_rva(rva, 0x1000), Some(vec![0; 0x1000]));
+    assert_eq!(PeFile::parse(&raw).unwrap().try_build().unwrap(), raw);
+}
+
+#[test]
+fn section_data_in_the_optional_header_padding_round_trips() {
+    // Move the section table to the end of the file. Then `SizeOfOptionalHeader` covers the
+    // raw data of the sections.
+    let mut raw = test_image().try_build().unwrap();
+    let headers = PeHeaders::from_slice(&raw).unwrap();
+    let old_table = section_header_offset(&headers, 0);
+    let length = headers.section_headers.len() * SectionHeader::SIZE;
+    let table = raw[old_table..old_table + length].to_vec();
+    raw[old_table..old_table + length].fill(0);
+    let new_table = raw.len();
+    raw.extend_from_slice(&table);
+    let size_of_optional_header = u16::try_from(new_table - optional_offset(&headers)).unwrap();
+    put16(
+        &mut raw,
+        pe_offset(&headers) + 4 + 16,
+        size_of_optional_header,
+    );
+
+    let image = PeImage::parse(&raw).unwrap();
+    assert_eq!(image.sections[1].data[..0x180], [0x5a; 0x180]);
+    assert_eq!(PeFile::parse(&raw).unwrap().try_build().unwrap(), raw);
+}
+
+#[test]
+fn an_invalid_section_alignment_keeps_the_current_layout() {
+    let mut raw = test_image().try_build().unwrap();
+    let headers = PeHeaders::from_slice(&raw).unwrap();
+    put32(&mut raw, optional_offset(&headers) + 32, 0);
+
+    let image = PeImage::parse(&raw).unwrap();
+    // No new layout can use a SectionAlignment of 0, so the build keeps the current layout.
+    assert_eq!(image.try_build().unwrap(), raw);
+    let mapped = PeImage::parse_mapped(&image.to_mapped_image().unwrap()).unwrap();
+    assert_eq!(mapped.sections[1].data[..0x180], [0x5a; 0x180]);
 }

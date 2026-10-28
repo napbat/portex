@@ -3,7 +3,7 @@ use crate::coff::{CoffHeader, verify_pe_signature};
 use crate::dos::DosHeader;
 use crate::optional::OptionalHeader;
 use crate::prelude::*;
-use crate::reader::{ReadAt, SliceReader};
+use crate::reader::{ReadAt, SliceReader, ZeroPadded};
 use crate::section::SectionHeader;
 use crate::{Error, Result};
 
@@ -17,19 +17,29 @@ impl PeHeaders {
     ///
     /// `base_offset` is the source offset of the DOS header (`IMAGE_DOS_HEADER`).
     ///
+    /// The method reads malformed headers as far as it can, so that tools can examine them:
+    ///
+    /// - The headers can end after the end of the source. If the source reports its size, the
+    ///   method reads the missing bytes as zeros, as the data-file loader of Windows does.
+    /// - An unknown `Magic` in the optional header does not stop the parse. The method then uses
+    ///   the PE32+ layout for a 64-bit `Machine`, and the PE32 layout for all other values.
+    ///
+    /// [`PeImage::validate`](crate::PeImage::validate) reports such problems.
+    ///
     /// # Errors
     ///
     /// Returns an error in these conditions:
     ///
     /// - The DOS header, PE signature, COFF header, optional header, or section table cannot
     ///   be read or is invalid.
-    /// - `e_lfanew` is negative or smaller than 4. A value from 4 to 63 is valid: then the NT
-    ///   headers overlap the DOS header.
+    /// - `e_lfanew` is negative or smaller than 2, so that the PE signature overlaps `e_magic`.
+    ///   A value from 2 to 63 is valid: then the NT headers overlap the DOS header.
     /// - The calculation of a header offset overflows.
     ///
     /// Each read error names the structure and its file offset in its context.
     #[must_use = "parsing returns PE headers that should be used"]
     pub fn read_from<R: ReadAt>(reader: &R, base_offset: u64) -> Result<Self> {
+        let reader = &ZeroPadded::new(reader);
         // Parse the DOS header.
         let dos_header = DosHeader::read_from(reader, base_offset).map_err(|error| {
             error
@@ -42,7 +52,7 @@ impl PeHeaders {
             .map_err(|_| Error::invalid_section("e_lfanew is negative"))?;
         if relative_pe_offset < DosHeader::MIN_PE_OFFSET as u64 {
             return Err(Error::invalid_section(format!(
-                "e_lfanew {relative_pe_offset:#x} is smaller than {:#x}, the minimum of the loader",
+                "e_lfanew {relative_pe_offset:#x} is smaller than {:#x}: the PE signature overlaps e_magic",
                 DosHeader::MIN_PE_OFFSET
             )));
         }
@@ -70,11 +80,12 @@ impl PeHeaders {
             .checked_add(CoffHeader::SIZE as u64)
             .ok_or_else(|| Error::invalid_section("optional-header offset overflow"))?;
         let optional_header =
-            OptionalHeader::read_from(reader, optional_offset).map_err(|error| {
-                error
-                    .in_structure("optional header")
-                    .at_offset(optional_offset)
-            })?;
+            OptionalHeader::read_for_machine(reader, optional_offset, coff_header.machine)
+                .map_err(|error| {
+                    error
+                        .in_structure("optional header")
+                        .at_offset(optional_offset)
+                })?;
 
         // Parse the section headers. `SizeOfOptionalHeader` is the distance from the start of the
         // optional header to the section table.
@@ -205,12 +216,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_buffer_too_small() {
-        let data = vec![0x4D, 0x5A]; // Only the "MZ" signature.
+    fn test_parse_dos_signature_only() {
+        // The missing DOS header bytes read as zeros, so `e_lfanew` is 0 and no PE header follows.
+        let data = vec![0x4D, 0x5A];
         let result = PeImage::parse(&data);
         assert!(matches!(
-            result,
-            Err(ref e) if matches!(e.kind, crate::error::ErrorKind::BufferTooSmall { .. })
+            &result,
+            Err(e) if matches!(e.kind, crate::error::ErrorKind::InvalidSection(_))
         ));
     }
 

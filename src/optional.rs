@@ -263,15 +263,21 @@ impl OptionalHeader32 {
     ///   parser reads at most [`NUMBER_OF_DIRECTORY_ENTRIES`] entries.
     /// - Returns an invalid-magic error if `Magic` is not [`PE32_MAGIC`].
     pub fn parse(data: &[u8]) -> Result<Self> {
+        let header = Self::parse_with_any_magic(data)?;
+        if header.magic != PE32_MAGIC {
+            return Err(Error::invalid_optional_header_magic(header.magic));
+        }
+        Ok(header)
+    }
+
+    /// Parse the PE32 layout, and keep any `Magic` value.
+    fn parse_with_any_magic(data: &[u8]) -> Result<Self> {
         let len = data.len();
         let Some((data, dir_bytes)) = data.split_first_chunk::<{ Self::BASE_SIZE }>() else {
             return Err(Error::buffer_too_small(Self::BASE_SIZE, len));
         };
 
         let magic = u16::from_le_bytes([data[0], data[1]]);
-        if magic != PE32_MAGIC {
-            return Err(Error::invalid_optional_header_magic(magic));
-        }
         let number_of_rva_and_sizes = u32::from_le_bytes([data[92], data[93], data[94], data[95]]);
         let data_directories =
             parse_data_directories(number_of_rva_and_sizes, Self::BASE_SIZE, dir_bytes, len)?;
@@ -453,15 +459,21 @@ impl OptionalHeader64 {
     ///   parser reads at most [`NUMBER_OF_DIRECTORY_ENTRIES`] entries.
     /// - Returns an invalid-magic error if `Magic` is not [`PE32PLUS_MAGIC`].
     pub fn parse(data: &[u8]) -> Result<Self> {
+        let header = Self::parse_with_any_magic(data)?;
+        if header.magic != PE32PLUS_MAGIC {
+            return Err(Error::invalid_optional_header_magic(header.magic));
+        }
+        Ok(header)
+    }
+
+    /// Parse the PE32+ layout, and keep any `Magic` value.
+    fn parse_with_any_magic(data: &[u8]) -> Result<Self> {
         let len = data.len();
         let Some((data, dir_bytes)) = data.split_first_chunk::<{ Self::BASE_SIZE }>() else {
             return Err(Error::buffer_too_small(Self::BASE_SIZE, len));
         };
 
         let magic = u16::from_le_bytes([data[0], data[1]]);
-        if magic != PE32PLUS_MAGIC {
-            return Err(Error::invalid_optional_header_magic(magic));
-        }
         let number_of_rva_and_sizes =
             u32::from_le_bytes([data[108], data[109], data[110], data[111]]);
         let data_directories =
@@ -674,22 +686,49 @@ impl OptionalHeader {
     /// - Returns an invalid-data-directory error if the header offset overflows.
     /// - Returns any error from [`Self::parse`].
     pub fn read_from<R: ReadAt>(reader: &R, offset: u64) -> Result<Self> {
-        // Read the magic first to get the layout: the fixed size and the offset of
-        // `NumberOfRvaAndSizes`.
         let magic = reader.read_u16_at(offset)?;
-        let (base_size, count_relative) = match magic {
-            PE32_MAGIC => (OptionalHeader32::BASE_SIZE, 92u64),
-            PE32PLUS_MAGIC => (OptionalHeader64::BASE_SIZE, 108u64),
-            _ => return Err(Error::invalid_optional_header_magic(magic)),
-        };
+        match magic {
+            PE32_MAGIC => Self::read_layout(reader, offset, false),
+            PE32PLUS_MAGIC => Self::read_layout(reader, offset, true),
+            _ => Err(Error::invalid_optional_header_magic(magic)),
+        }
+    }
 
-        // Read the number of data directories.
+    /// Read an optional header as [`Self::read_from`] does, but accept an unknown `Magic`.
+    ///
+    /// For an unknown `Magic`, the method uses the PE32+ layout if `machine` is a 64-bit machine
+    /// type, and the PE32 layout for all other values. The header keeps the `Magic` value.
+    pub(crate) fn read_for_machine<R: ReadAt>(
+        reader: &R,
+        offset: u64,
+        machine: u16,
+    ) -> Result<Self> {
+        let pe32plus = match reader.read_u16_at(offset)? {
+            PE32_MAGIC => false,
+            PE32PLUS_MAGIC => true,
+            _ => crate::coff::MachineType::from_u16(machine)
+                .is_some_and(crate::coff::MachineType::is_64_bit),
+        };
+        Self::read_layout(reader, offset, pe32plus)
+    }
+
+    /// Read the PE32 or the PE32+ layout, and keep any `Magic` value.
+    fn read_layout<R: ReadAt>(reader: &R, offset: u64, pe32plus: bool) -> Result<Self> {
+        let (base_size, count_relative) = if pe32plus {
+            (OptionalHeader64::BASE_SIZE, 108u64)
+        } else {
+            (OptionalHeader32::BASE_SIZE, 92u64)
+        };
         let num_dirs_offset = offset
             .checked_add(count_relative)
             .ok_or_else(|| Error::invalid_data_directory("optional-header offset overflow"))?;
         let num_dirs = directory_count(reader.read_u32_at(num_dirs_offset)?);
         let data = reader.read_bytes_at(offset, base_size + num_dirs * DataDirectory::SIZE)?;
-        Self::parse(&data)
+        Ok(if pe32plus {
+            Self::Pe32Plus(OptionalHeader64::parse_with_any_magic(&data)?)
+        } else {
+            Self::Pe32(OptionalHeader32::parse_with_any_magic(&data)?)
+        })
     }
 
     /// Return the RVA of the entry point.

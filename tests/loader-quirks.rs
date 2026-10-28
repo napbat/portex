@@ -96,16 +96,11 @@ fn count_module_names(bytes: &[u8]) -> usize {
 #[test]
 fn validation_reports_an_unverifiable_checksum_without_a_panic() {
     let mut image = test_image();
-    // A FileAlignment that is not a power of two makes the build fail.
+    // An `e_lfanew` of 1 puts the PE signature over `e_magic`, so no build can succeed.
+    image.dos_header.e_lfanew = 1;
     match &mut image.optional_header {
-        OptionalHeader::Pe32(header) => {
-            header.file_alignment = 0x300;
-            header.check_sum = 1;
-        }
-        OptionalHeader::Pe32Plus(header) => {
-            header.file_alignment = 0x300;
-            header.check_sum = 1;
-        }
+        OptionalHeader::Pe32(header) => header.check_sum = 1,
+        OptionalHeader::Pe32Plus(header) => header.check_sum = 1,
     }
     assert!(image.try_build().is_err());
 

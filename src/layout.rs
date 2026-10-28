@@ -221,9 +221,11 @@ pub fn try_layout_sections(
 
         // `VirtualSize` does not include raw file padding. Keep the parsed value, unless the
         // data grew past the old raw extent. This also keeps BSS sections (`VirtualSize` > 0,
-        // no raw bytes) intact.
+        // no raw bytes) intact. A `VirtualSize` of 0 makes the old `SizeOfRawData` the virtual
+        // extent, so keep that extent also if the data is shorter, for example after the end of
+        // the file.
         let virtual_size = if section.header.virtual_size == 0 {
-            data_size
+            data_size.max(old_raw_size)
         } else if data_size > old_raw_size {
             section.header.virtual_size.max(data_size)
         } else {

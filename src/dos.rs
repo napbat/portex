@@ -65,8 +65,10 @@ impl DosHeader {
     /// Size of the DOS header in bytes.
     pub const SIZE: usize = 64;
 
-    /// The smallest `e_lfanew` that the Windows loader accepts.
-    pub(crate) const MIN_PE_OFFSET: usize = 4;
+    /// The smallest `e_lfanew`: the PE signature cannot overlap `e_magic`.
+    ///
+    /// The loader of executable images needs 4 or more, but the data-file loader accepts 2.
+    pub(crate) const MIN_PE_OFFSET: usize = 2;
 
     /// Parse a DOS header from a byte slice.
     ///

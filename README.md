@@ -23,7 +23,9 @@ a different source offset.
 - Rich headers, the CLR/CLI header of the PE image, and the raw metadata blob.
 - Lossless round trips of raw files through `PeFile`. When the layout does not change, `PeFile`
   keeps noncanonical gaps, certificate bytes and overlays.
-- Strict checks for malformed input, fallible builders, and structural validation.
+- Parsing of malformed input for PE tooling: headers that end early, overlapping header
+  structures and garbage fields still parse, and `validate()` reports the problems. Fallible
+  builders, with no panics on file data.
 - Sequential I/O and positional I/O.
 - `no_std + alloc` support. Sequential I/O uses
   [`nostdio`](https://github.com/coconutbird/nostdio). Positional `ReadAt` access is also

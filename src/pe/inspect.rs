@@ -4,6 +4,12 @@ use crate::prelude::*;
 use crate::section::Section;
 use crate::{Error, Result};
 
+/// The number of zero bytes that one [`PeImage::read_rva`] call can always add.
+///
+/// A file that ends early can hold fewer bytes than a directory that it declares. This floor
+/// lets such a read succeed, and it still limits the memory use of one read.
+const MIN_ZERO_FILL: usize = 1 << 20;
+
 impl PeImage {
     /// Return `true` if this is a 64-bit (PE32+) image.
     #[must_use]
@@ -55,22 +61,21 @@ impl PeImage {
     /// - The bytes of a section after its complete raw data and before its virtual end.
     ///
     /// The result is `None` if the range is not in the image. It is also `None` if the read adds
-    /// more zero bytes than the image holds in its header data and section data. This limit
-    /// keeps the memory use of a read in proportion to the input, also if `SizeOfHeaders` or
-    /// `VirtualSize` is very large.
+    /// more zero bytes than the image holds in its header data and section data, or than 1 MiB
+    /// if that is more. This limit keeps the memory use of a read in proportion to the input, also
+    /// if `SizeOfHeaders` or `VirtualSize` is very large.
     #[must_use]
     pub fn read_rva(&self, rva: u32, len: usize) -> Option<Vec<u8>> {
         if len == 0 {
             return Some(Vec::new());
         }
 
-        // Each output byte is a copy of a held byte or a zero byte. Thus a read that adds at most
-        // `held` zero bytes is at most `2 * held` bytes long.
+        // Each output byte is a copy of a held byte or a zero byte.
         let held = self.held_len();
-        if len > held.saturating_mul(2) || !self.contains_rva_range(rva, len) {
+        let mut zero_budget = held.max(MIN_ZERO_FILL);
+        if len > held.saturating_add(zero_budget) || !self.contains_rva_range(rva, len) {
             return None;
         }
-        let mut zero_budget = held;
         let mut header_bytes = None;
         let mut output = Vec::new();
         output.try_reserve_exact(len).ok()?;

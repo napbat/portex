@@ -60,6 +60,17 @@ impl PeImage {
                 "DOS signature is not 'MZ'",
             ));
         }
+        // The parser reads an unknown magic with the layout of the machine type.
+        let magic = match &self.optional_header {
+            OptionalHeader::Pe32(header) => header.magic,
+            OptionalHeader::Pe32Plus(header) => header.magic,
+        };
+        if magic != crate::optional::PE32_MAGIC && magic != crate::optional::PE32PLUS_MAGIC {
+            result.push(ValidationIssue::error(
+                ValidationCode::InvalidOptionalMagic,
+                format!("optional-header magic {magic:#06x} is not PE32 or PE32+"),
+            ));
+        }
 
         // Check that sections exist.
         if self.sections.is_empty() {
@@ -182,9 +193,11 @@ impl PeImage {
 
     /// Check `e_lfanew` and `SizeOfHeaders` against the header table.
     fn validate_headers_size(&self, result: &mut ValidationResult, file_align: u32) {
+        // The loader of executable images needs `e_lfanew` of 4 or more. The data-file loader
+        // also accepts 2 and 3.
         match usize::try_from(self.dos_header.e_lfanew) {
             Ok(pe_offset) if pe_offset >= DosHeader::SIZE => {}
-            Ok(pe_offset) if pe_offset >= DosHeader::MIN_PE_OFFSET => {
+            Ok(pe_offset) if pe_offset >= 4 => {
                 result.push(ValidationIssue::warning(
                     ValidationCode::InconsistentHeadersSize,
                     "e_lfanew places the NT headers inside the DOS header",
@@ -193,7 +206,7 @@ impl PeImage {
             _ => {
                 result.push(ValidationIssue::error(
                     ValidationCode::InconsistentHeadersSize,
-                    "e_lfanew is smaller than 4, the minimum of the loader",
+                    "e_lfanew is smaller than 4, the minimum for an executable image",
                 ));
             }
         }
