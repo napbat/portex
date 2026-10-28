@@ -49,6 +49,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "fuzz-pe-image"
+path = "fuzz_targets/fuzz-pe-image.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fuzz-pe-parse"
 path = "fuzz_targets/fuzz-pe-parse.rs"
 test = false
