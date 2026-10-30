@@ -3,6 +3,7 @@ use crate::coff::{CoffHeader, verify_pe_signature};
 use crate::dos::DosHeader;
 use crate::optional::OptionalHeader;
 use crate::prelude::*;
+use crate::raw::HeaderOffsets;
 use crate::reader::{ReadAt, SliceReader, ZeroPadded};
 use crate::section::SectionHeader;
 use crate::{Error, Result};
@@ -39,7 +40,27 @@ impl PeHeaders {
     /// Each read error names the structure and its file offset in its context.
     #[must_use = "parsing returns PE headers that should be used"]
     pub fn read_from<R: ReadAt>(reader: &R, base_offset: u64) -> Result<Self> {
-        let reader = &ZeroPadded::new(reader);
+        Self::read_headers(&ZeroPadded::new(reader), base_offset)
+    }
+
+    /// Read PE headers from any [`ReadAt`] implementation, and reject headers that end after
+    /// the end of the source.
+    ///
+    /// This method does not read missing bytes as zeros. Use it to follow a tool that reads
+    /// the headers directly from the file buffer, for example `msdelta.dll`. All other rules
+    /// of [`Self::read_from`] apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns a read error if a header structure ends after the end of the source. Also
+    /// returns an error for each condition that [`Self::read_from`] lists.
+    #[must_use = "parsing returns PE headers that should be used"]
+    pub fn read_from_strict<R: ReadAt>(reader: &R, base_offset: u64) -> Result<Self> {
+        Self::read_headers(reader, base_offset)
+    }
+
+    /// Read the headers from `reader`. The caller selects how the reader handles its end.
+    fn read_headers<R: ReadAt>(reader: &R, base_offset: u64) -> Result<Self> {
         // Parse the DOS header.
         let dos_header = DosHeader::read_from(reader, base_offset).map_err(|error| {
             error
@@ -134,6 +155,37 @@ impl PeHeaders {
     pub fn from_slice(data: &[u8]) -> Result<Self> {
         let reader = SliceReader::new(data);
         Self::read_from(&reader, 0)
+    }
+
+    /// Read the headers from a byte slice, and reject headers that end after the slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for each condition that [`Self::read_from_strict`] lists.
+    #[must_use = "parsing returns PE headers that should be used"]
+    pub fn from_slice_strict(data: &[u8]) -> Result<Self> {
+        let reader = SliceReader::new(data);
+        Self::read_from_strict(&reader, 0)
+    }
+
+    /// Return the source offsets of the header fields that a tool rewrites in place.
+    ///
+    /// The offsets use the same base as [`Self::pe_offset`]. The optional header layout
+    /// (PE32 or PE32+) of [`Self::optional_header`] selects the field offsets.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ErrorKind::OffsetOutOfBounds`](crate::ErrorKind::OffsetOutOfBounds) error
+    /// if an offset does not fit in `usize`.
+    pub fn header_offsets(&self) -> Result<HeaderOffsets> {
+        let too_large = || Error::offset_out_of_bounds(usize::MAX, 0);
+        let nt_headers = usize::try_from(self.pe_offset).map_err(|_| too_large())?;
+        HeaderOffsets::new(
+            nt_headers,
+            self.coff_header.size_of_optional_header,
+            self.is_64bit(),
+        )
+        .ok_or_else(too_large)
     }
 
     /// Return `true` if this is a 64-bit (PE32+) image.
