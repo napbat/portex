@@ -45,6 +45,12 @@
 //!    - `ResourceDirectory::parse(rva, size, read_fn)`
 //!    - The `read_fn` closure reads from many locations, because it resolves each RVA.
 //!
+//! 3. **Raw views** in [`raw`] read a structure in place, at a buffer offset:
+//!    - `RawImportDescriptor::parse(&[u8], offset)`, `RawRelocationBlocks::new(offset, size)`
+//!    - Each field keeps its offset, so that a patch tool can rewrite it in place.
+//!    - A [`RawCursor`] reads one record for each call. You can change the buffer between
+//!      two calls.
+//!
 //! ### Builder Pattern
 //!
 //! Each directory builder (`ImportTableBuilder`, `ExportTableBuilder`, `ResourceBuilder` and
@@ -111,6 +117,7 @@ pub mod optional;
 mod parse_utils;
 pub mod pe;
 pub mod pe_file;
+pub mod raw;
 pub mod reader;
 pub mod reloc;
 pub mod resource;
@@ -153,6 +160,12 @@ pub use pe::{
     PeImage, SourceLayout,
 };
 pub use pe_file::PeFile;
+pub use raw::{
+    HeaderOffsets, ImportTableEnd, RawAddressTable, RawCursor, RawExportDirectory, RawField,
+    RawImportByName, RawImportDescriptor, RawImportDescriptors, RawIter, RawLoadConfigDirectory,
+    RawRelocation, RawRelocationBlock, RawRelocationBlocks, RawRelocations, RawResourceDataEntry,
+    RawResourceDirectory, RawResourceEntry, RawRuntimeFunction, RawRuntimeFunctions, RawUnwindInfo,
+};
 #[cfg(feature = "std")]
 pub use reader::FileReader;
 pub use reader::{BaseAddressReader, ReadAt, SeekReader, SliceReader, VecReader};

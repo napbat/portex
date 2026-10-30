@@ -25,6 +25,12 @@ pub use crate::loadconfig::{
     CfgSettings, LoadConfigBuilder, LoadConfigDirectory, LoadConfigDirectory32,
     LoadConfigDirectory64,
 };
+pub use crate::raw::{
+    ImportTableEnd, RawAddressTable, RawCursor, RawExportDirectory, RawField, RawImportByName,
+    RawImportDescriptor, RawImportDescriptors, RawIter, RawLoadConfigDirectory, RawRelocation,
+    RawRelocationBlock, RawRelocationBlocks, RawRelocations, RawResourceDataEntry,
+    RawResourceDirectory, RawResourceEntry, RawRuntimeFunction, RawRuntimeFunctions, RawUnwindInfo,
+};
 pub use crate::reloc::{
     RelocationBlock, RelocationBuilder, RelocationEntry, RelocationTable, RelocationType,
 };

@@ -16,6 +16,8 @@ a different source offset.
 - Imports, delay imports, bound imports, and exports (also sparse and aliased exports).
 - Resources, base relocations, TLS, debug records, and the load configuration.
 - Exception tables for x64, ARM and ARM64.
+- Raw views for patch tools: import, export, relocation, exception, resource and load
+  configuration records with the buffer offset of each field, and strict header reads.
 - A load configuration that is limited by its declared size, also with legacy prefixes. A
   partial field is an error. A field that is fully absent stays zero.
 - Serialization of x64 unwind data with borrowed handler data for a different language, through
@@ -246,6 +248,37 @@ Portex also has the positional `ReadAt` abstraction. `ReadAt` is better for thes
 - sources that must not share cursor state
 
 `SeekReader` adapts a `nostdio::Read + Seek` source to `ReadAt`.
+
+## Rewriting tables in place
+
+A patch tool rewrites the fields of a table in the file buffer. The `raw` module reads each
+structure at a buffer offset and keeps the offset of each field. A cursor reads one record for
+each call, so you can change the buffer between two calls:
+
+```rust,no_run
+use portex::PeHeaders;
+use portex::raw::{ImportTableEnd, RawCursor, RawImportDescriptors};
+
+# let mut file: Vec<u8> = Vec::new();
+let headers = PeHeaders::from_slice_strict(&file)?;
+let import = headers.optional_header.data_directories()[1];
+let offset = headers
+    .rva_to_offset(import.virtual_address)
+    .and_then(|offset| usize::try_from(offset).ok())
+    .unwrap_or(0);
+let size = usize::try_from(import.size).unwrap_or(0);
+
+let mut descriptors = RawImportDescriptors::new(offset, size, ImportTableEnd::NullDescriptor);
+while let Some(descriptor) = descriptors.read_next(&file)? {
+    // Clear the time stamp of a bound import.
+    let field = descriptor.time_date_stamp.offset;
+    file[field..field + 4].fill(0);
+}
+# Ok::<(), portex::Error>(())
+```
+
+The views take buffer offsets, not RVAs. Use your own rule to convert an RVA. The caller also
+selects the end of each table, for example `ImportTableEnd` or the size of a table.
 
 ## Building an image
 
