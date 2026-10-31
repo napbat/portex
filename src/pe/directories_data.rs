@@ -177,6 +177,19 @@ impl PeImage {
     /// Returns the RVA of the written delay import data. Returns 0 if `directory` has no DLLs;
     /// then the function clears the data directory.
     ///
+    /// For each DLL whose function list is unchanged, the function keeps the module handle,
+    /// the IAT, the bound IAT, the unload IAT and the time stamp of the descriptor. Only the
+    /// import name table, the names and the descriptors move. A DLL is unchanged if
+    /// [`Self::delay_imports`] has a DLL with the same `import_address_table_rva` and the same
+    /// `imports`. See [`crate::DelayImportBuilder`].
+    ///
+    /// # Caution
+    ///
+    /// A new DLL, or a DLL whose function list changed, gets a new IAT with placeholder
+    /// values. Write a load stub for each new slot, put the stub VA into the slot, and add a
+    /// base relocation for the slot. Existing stubs pass the address of the old descriptor
+    /// to the delay-load helper, so they do not use the moved descriptor.
+    ///
     /// # Errors
     ///
     /// Returns an error in these conditions:
@@ -202,6 +215,13 @@ impl PeImage {
             self.optional_header,
             crate::optional::OptionalHeader::Pe32Plus(_)
         );
+        // Keep the tables of the unchanged DLLs. If the current directory is malformed, no DLL
+        // is unchanged, and each DLL gets new tables.
+        let current = self.delay_imports().unwrap_or_default();
+        let builder_at = |base_rva| {
+            crate::delay_import::DelayImportBuilder::new(is_64bit, base_rva)
+                .keep_unchanged(&current)
+        };
 
         // Find the target section first, to get the base RVA.
         let existing_dir = self.data_directory(DataDirectoryType::DelayImport).copied();
@@ -235,30 +255,26 @@ impl PeImage {
         // Calculate the RVA at which to put the data.
         let base_rva = self.prepare_section_append(section_idx)?;
 
-        let builder = crate::delay_import::DelayImportBuilder::new(is_64bit, base_rva);
-        let (data, encoded_size) = builder.try_build(&directory.dlls)?;
+        let (data, encoded_size) = builder_at(base_rva).try_build(&directory.dlls)?;
         let required_size = data.len();
 
-        // Try to replace the data in place.
-        if let Some(ref dir) = existing_dir
+        // Try to replace the data in place. For an in-place write, rebuild the data with the
+        // existing RVA. Do not write in place if a kept table is in the way.
+        if let Some(dir) = &existing_dir
             && dir.is_present()
             && dir.size as usize >= required_size
-        {
-            // For an in-place write, rebuild the data with the existing RVA.
-            let existing_builder =
-                crate::delay_import::DelayImportBuilder::new(is_64bit, dir.virtual_address);
-            let (existing_data, existing_size) = existing_builder.try_build(&directory.dlls)?;
-            if self
+            && let Ok((existing_data, existing_size)) =
+                builder_at(dir.virtual_address).try_build(&directory.dlls)
+            && self
                 .write_at_rva(dir.virtual_address, &existing_data)
                 .is_some()
-            {
-                self.set_data_directory(
-                    DataDirectoryType::DelayImport,
-                    dir.virtual_address,
-                    existing_size,
-                );
-                return Ok(dir.virtual_address);
-            }
+        {
+            self.set_data_directory(
+                DataDirectoryType::DelayImport,
+                dir.virtual_address,
+                existing_size,
+            );
+            return Ok(dir.virtual_address);
         }
 
         // Append the data to the section.
