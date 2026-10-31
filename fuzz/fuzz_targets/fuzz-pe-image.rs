@@ -13,19 +13,33 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use portex::{PeFile, PeImage};
+use portex::{PeFile, PeHeaders, PeImage};
 
-/// The largest mapped image that the target makes, in bytes.
+/// The largest mapped image or section end that the target accepts, in bytes.
 ///
-/// A mapped image needs `SizeOfImage` bytes, and libFuzzer stops at 2 GiB of memory.
-const MAX_MAPPED_IMAGE_SIZE: u32 = 64 << 20;
+/// A mapped image needs `SizeOfImage` bytes. An append to a section fills the section data with
+/// zeros up to its `VirtualSize`. libFuzzer stops at 2 GiB of memory, and each mapped image
+/// costs time to fill with zeros. 16 MiB covers the images that inputs of `-max_len` bytes
+/// describe without padding.
+const MAX_MAPPED_IMAGE_SIZE: u32 = 16 << 20;
 
 /// The value that the target XORs with the image base to get a new base for the rebase path.
 ///
 /// The value keeps the 64 KiB alignment of the base.
 const REBASE_DELTA: u64 = 0x1_0000;
 
+/// The largest section count that the target accepts.
+///
+/// The work of the target grows linearly with the section count, and the image is cloned many
+/// times. An image with 65,535 sections takes about 0.3 s without instrumentation, but more
+/// than the 10 s timeout with the sanitizer coverage. `fuzz-pe-parse` covers larger counts.
+const MAX_SECTIONS: usize = 4096;
+
 fuzz_target!(|data: &[u8]| {
+    if PeHeaders::from_slice(data).is_ok_and(|headers| headers.section_headers.len() > MAX_SECTIONS)
+    {
+        return;
+    }
     if let Ok(image) = PeImage::parse(data) {
         exercise(&image);
         if mapped_image_size(&image) <= MAX_MAPPED_IMAGE_SIZE {
@@ -34,7 +48,9 @@ fuzz_target!(|data: &[u8]| {
         if let Ok(rebuilt) = image.try_build() {
             let _ = PeImage::parse(&rebuilt);
         }
-        rebuild_directories(&image);
+        if largest_section_end(&image) <= u64::from(MAX_MAPPED_IMAGE_SIZE) {
+            rebuild_directories(&image);
+        }
     }
     if let Ok(file) = PeFile::parse(data) {
         check_file(data, file);
@@ -66,6 +82,25 @@ fn rebuild_directories(image: &PeImage) {
         PeImage::parse(&bytes)
             .expect("rebuild_supported_directories returned Ok, but the image does not parse");
     }
+}
+
+/// Return the largest RVA end of a section of `image`: the RVA plus the largest of
+/// `VirtualSize`, `SizeOfRawData` and the data length.
+///
+/// `rebuild_supported_directories` appends to a section, and the append fills the section data
+/// with zeros up to its `VirtualSize`. Thus the memory of the append grows with this value.
+fn largest_section_end(image: &PeImage) -> u64 {
+    image
+        .sections
+        .iter()
+        .map(|section| {
+            let header = &section.header;
+            let data = u64::try_from(section.data.len()).unwrap_or(u64::MAX);
+            let size = u64::from(header.virtual_size.max(header.size_of_raw_data)).max(data);
+            u64::from(header.virtual_address).saturating_add(size)
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Run the raw-file accessors, the round trip, the build and the normalization on `file`.

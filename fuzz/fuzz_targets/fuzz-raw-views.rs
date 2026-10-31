@@ -211,7 +211,8 @@ where
 
 /// Make sure that the headers agree with the bytes at their offsets.
 ///
-/// If `strict` is `true`, all header bytes are in `data`. Then each read must succeed.
+/// `PeHeaders::from_slice` reads the bytes after the end of `data` as zeros, so the check does
+/// the same. If `strict` is `true`, all header bytes must be in `data`.
 fn check_headers(headers: &PeHeaders, data: &[u8], strict: bool) {
     for kind in DataDirectoryType::all() {
         assert_eq!(
@@ -226,14 +227,6 @@ fn check_headers(headers: &PeHeaders, data: &[u8], strict: bool) {
     let offsets = headers
         .header_offsets()
         .expect("the headers parse, but their offsets overflow");
-    // The parser found the PE signature in `data`.
-    assert_eq!(
-        portex::raw::RawField {
-            offset: offsets.nt_headers,
-            value: PE_SIGNATURE,
-        },
-        read_u32(data, offsets.nt_headers).expect("the PE signature is not in the buffer"),
-    );
     let coff = &headers.coff_header;
     let optional = &headers.optional_header;
     let (magic, check_sum) = match optional {
@@ -242,6 +235,7 @@ fn check_headers(headers: &PeHeaders, data: &[u8], strict: bool) {
     };
     let image_base_size = if headers.is_64bit() { 8 } else { 4 };
     let mut fields: Vec<HeaderField> = vec![
+        (offsets.nt_headers, 4, u64::from(PE_SIGNATURE), "Signature"),
         (offsets.coff_header, 2, u64::from(coff.machine), "Machine"),
         (
             offsets.time_date_stamp,
@@ -280,18 +274,16 @@ fn check_headers(headers: &PeHeaders, data: &[u8], strict: bool) {
     }
     fields.extend(section_fields(headers, &offsets));
     for (offset, size, expected, name) in fields {
-        let Some(bytes) = offset
-            .checked_add(size)
-            .and_then(|end| data.get(offset..end))
-        else {
-            assert!(
-                !strict,
-                "the strict parse succeeds, but {name} is not in the buffer"
-            );
-            continue;
-        };
+        let end = offset.checked_add(size).expect("a field end overflows");
+        assert!(
+            !strict || end <= data.len(),
+            "the strict parse succeeds, but {name} is not in the buffer"
+        );
+        let bytes = data
+            .get(offset.min(data.len())..end.min(data.len()))
+            .unwrap_or_default();
         let mut value = [0; 8];
-        value[..size].copy_from_slice(bytes);
+        value[..bytes.len()].copy_from_slice(bytes);
         assert_eq!(u64::from_le_bytes(value), expected, "{name} is different");
     }
 }

@@ -367,13 +367,30 @@ The only unsafe code is `BaseAddressReader`. Direct Cargo commands thus apply th
 The Rust examples in this README compile as doctests.
 
 The fuzz targets are in `fuzz/`. Run them with `cargo-fuzz` and a nightly toolchain. This works
-on Linux, macOS and Windows (MSVC):
+on Linux, macOS and Windows (MSVC). There are four targets:
+
+- `fuzz-pe-headers` parses the input with `PeHeaders::from_slice`.
+- `fuzz-pe-parse` parses the input as a raw `PeImage`, a mapped `PeImage` and a `PeFile`.
+- `fuzz-pe-image` runs the directory accessors, the validation, the builds, the mapping at
+  the image base and at a new base, `rebuild_supported_directories` and `normalize`. It also
+  checks that an unedited `PeFile` round trip returns the input byte for byte when
+  `preserves_source_gaps` is `true`.
+- `fuzz-raw-views` drives each view and cursor of `portex::raw`. The last 64 bytes of the
+  input select the offsets, sizes, end rules and entry widths. The target also compares
+  `PeHeaders::from_slice_strict` with `PeHeaders::from_slice`, and reads each field at the
+  offsets of `PeHeaders::header_offsets`.
 
 ```bash
 cargo +nightly fuzz run fuzz-pe-headers
 cargo +nightly fuzz run fuzz-pe-image
 cargo +nightly fuzz run fuzz-pe-parse
+cargo +nightly fuzz run fuzz-raw-views
 ```
+
+On Windows, put the directory of `clang_rt.asan_dynamic-x86_64.dll` from the Visual Studio
+installation on `PATH` before you run a target. A Rust panic on Windows stops the process with
+`__fastfail`, so libFuzzer does not write a crash file for it. The timeout and out-of-memory
+files are not affected.
 
 ## License
 
