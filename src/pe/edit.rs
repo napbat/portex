@@ -220,16 +220,13 @@ impl PeImage {
         let builder_at =
             |base_rva| ImportTableBuilder::new(is_64bit, base_rva).keep_unchanged_iats(&current);
 
-        // Calculate the required size.
-        let required_size = builder_at(0).try_calculate_size(imports)?;
-
         // Try to replace the data in place. Do not write in place if a kept IAT is in the way.
         let existing_dir = self.data_directory(DataDirectoryType::Import).copied();
         if let Some(dir) = &existing_dir
             && dir.is_present()
-            && dir.size as usize >= required_size
             && let Ok((data, iat_rva, iat_size)) =
                 builder_at(dir.virtual_address).try_build(imports)
+            && data.len() <= dir.size as usize
             && self.write_at_rva(dir.virtual_address, &data).is_some()
         {
             let import_size = import_descriptor_table_size(imports.dlls.len())?;
@@ -270,14 +267,12 @@ impl PeImage {
             return Err(crate::Error::invalid_section(section_name));
         };
 
-        // Calculate the RVA at which to put the data.
-        let append_rva = self.prepare_section_append(section_idx)?;
-
-        // Build the import data at the append RVA.
-        let (data, iat_rva, iat_size) = builder_at(append_rva).try_build(imports)?;
-
-        // Append the data to the section.
-        self.commit_section_append(section_idx, append_rva, &data)?;
+        // Build the import data at the append RVA, and append it to the section.
+        let (append_rva, (iat_rva, iat_size)) =
+            self.append_section_data(section_idx, target_section.is_some(), |rva| {
+                let (data, iat_rva, iat_size) = builder_at(rva).try_build(imports)?;
+                Ok((data, (iat_rva, iat_size)))
+            })?;
 
         // Update the data directories.
         let import_size = import_descriptor_table_size(imports.dlls.len())?;

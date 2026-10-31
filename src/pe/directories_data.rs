@@ -262,19 +262,13 @@ impl PeImage {
             return Err(crate::Error::invalid_section(section_name));
         };
 
-        // Calculate the RVA at which to put the data.
-        let base_rva = self.prepare_section_append(section_idx)?;
-
-        let (data, encoded_size) = builder_at(base_rva).try_build(&directory.dlls)?;
-        let required_size = data.len();
-
-        // Try to replace the data in place. For an in-place write, rebuild the data with the
-        // existing RVA. Do not write in place if a kept table is in the way.
+        // Try to replace the data in place. Rebuild the data at the existing RVA. Do not write
+        // in place if a kept table is in the way.
         if let Some(dir) = &existing_dir
             && dir.is_present()
-            && dir.size as usize >= required_size
             && let Ok((existing_data, existing_size)) =
                 builder_at(dir.virtual_address).try_build(&directory.dlls)
+            && existing_data.len() <= dir.size as usize
             && self
                 .write_at_rva(dir.virtual_address, &existing_data)
                 .is_some()
@@ -287,8 +281,11 @@ impl PeImage {
             return Ok(dir.virtual_address);
         }
 
-        // Append the data to the section.
-        self.commit_section_append(section_idx, base_rva, &data)?;
+        // Build the data at the append RVA, and append it to the section.
+        let (base_rva, encoded_size) =
+            self.append_section_data(section_idx, target_section.is_some(), |rva| {
+                builder_at(rva).try_build(&directory.dlls)
+            })?;
         self.set_data_directory(DataDirectoryType::DelayImport, base_rva, encoded_size);
 
         Ok(base_rva)
