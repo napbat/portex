@@ -157,30 +157,26 @@ pub(crate) fn section_rva_to_file_offset(
         .checked_sub(rounding)
 }
 
-/// Calculate the section layout again (RVAs and file offsets).
+/// Calculate the section layout again (RVAs and file offsets), with checked size and address
+/// arithmetic.
+///
+/// `headers_size` is the end of the header data. If `keep_raw_offsets` is `false`, the layout
+/// packs the raw data of the sections after the headers. Use `false` for sections from a
+/// loader-mapped source: their `PointerToRawData` values do not describe the source, and an
+/// untrusted value must not decide the size of the output file.
 ///
 /// Returns the total file size.
-///
-/// # Panics
-///
-/// Panics if a section RVA, file offset or aligned size overflows `u32`. For a fallible
-/// layout, use [`try_layout_sections`].
-pub fn layout_sections(sections: &mut [Section], config: &LayoutConfig, headers_size: u32) -> u32 {
-    try_layout_sections(sections, config, headers_size)
-        .expect("PE layout overflow: use try_layout_sections() for fallible layout")
-}
-
-/// Calculate the section layout again, with checked size and address arithmetic.
 ///
 /// # Errors
 ///
 /// Returns an `InvalidSection` error in these conditions:
 /// - The section data is larger than `u32`.
 /// - An RVA, file offset or aligned size overflows `u32`.
-pub fn try_layout_sections(
+pub(crate) fn try_layout_sections(
     sections: &mut [Section],
     config: &LayoutConfig,
     headers_size: u32,
+    keep_raw_offsets: bool,
 ) -> Result<u32> {
     // The first section starts after the headers, aligned to the section alignment.
     let mut current_rva = checked_align_up(headers_size, config.section_alignment)
@@ -212,7 +208,8 @@ pub fn try_layout_sections(
         let existing_file_offset = section.header.pointer_to_raw_data;
         section.header.pointer_to_raw_data = if initialized_size == 0 {
             0
-        } else if existing_file_offset >= current_file_offset
+        } else if keep_raw_offsets
+            && existing_file_offset >= current_file_offset
             && existing_file_offset != 0
             && (config.file_alignment == 0
                 || existing_file_offset.is_multiple_of(config.file_alignment))

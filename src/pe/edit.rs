@@ -468,9 +468,11 @@ impl PeImage {
         let size_of_headers = layout::checked_align_up(headers_size, config.file_alignment)
             .ok_or_else(|| Error::invalid_section("SizeOfHeaders exceeds u32"))?;
 
-        // Work on a clone, so that an overflow cannot leave sections half updated.
+        // Work on a clone, so that an overflow cannot leave sections half updated. The raw
+        // offsets of a loader-mapped source do not describe that source, so pack them.
         let mut sections = self.sections.clone();
-        layout::try_layout_sections(&mut sections, &config, headers_size)?;
+        let keep_raw_offsets = self.source_layout == super::SourceLayout::File;
+        layout::try_layout_sections(&mut sections, &config, headers_size, keep_raw_offsets)?;
 
         // Update `SizeOfImage`.
         let size_of_image =

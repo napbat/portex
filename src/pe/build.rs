@@ -32,13 +32,16 @@ impl PeImage {
     ///
     /// The build calculates the layout again. A malformed image can have values that no new
     /// layout can use, for example a `SectionAlignment` of 0. Then the build keeps the current
-    /// layout, if it holds the headers and the section data.
+    /// layout, if it holds the headers and the section data. For an image from a loader-mapped
+    /// source, the build always makes a new layout: the raw file offsets in the headers of such a
+    /// source do not describe the source.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     ///
-    /// - The layout update fails, and the current layout cannot hold the data.
+    /// - The layout update fails, and the current layout cannot hold the data, or the image is
+    ///   from a loader-mapped source.
     /// - `e_lfanew`, the DOS stub, the optional header or the raw ranges of the sections are not
     ///   consistent, or they overflow.
     /// - The allocation of the output buffer fails.
@@ -50,6 +53,7 @@ impl PeImage {
         let mut pe = self.clone();
         match pe.try_update_layout() {
             Ok(()) => pe.try_build_updated_layout(),
+            Err(error) if self.source_layout == super::SourceLayout::Mapped => Err(error),
             Err(error) => self.try_build_current_layout(Some(0))?.ok_or(error),
         }
     }
