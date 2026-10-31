@@ -95,7 +95,9 @@ for dll in &image.imports()?.dlls {
     println!("imports from {}", dll.name);
 }
 
-// Edits go through the normalized image while PeFile retains raw-only state.
+// Edits go through the normalized image while PeFile retains raw-only state. The second
+// argument selects the section (by index) for a table that does not fit in place. `None`
+// adds a new section for it.
 let imports = file.image().imports()?;
 file.image_mut().update_imports(&imports, None)?;
 file.write_to_file("modified.exe")?;

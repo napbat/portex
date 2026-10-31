@@ -107,13 +107,13 @@ impl PeImage {
     /// Use this method after structural changes to sections. It makes sure that all data
     /// directory content has the correct alignment and layout.
     ///
-    /// The operation is atomic. It appends the rebuilt tables to one section, so that the RVAs
-    /// of existing sections do not move. If you do not supply a target section, the method
-    /// uses the last section, with the rules of the append fallback (see
-    /// [Directory updates](crate::PeImage#directory-updates)): if the last section is not
-    /// readable, has uninitialized data, is discardable or is `.rsrc`, the method adds a new
-    /// `.portex` section for the tables. The method intentionally does not touch these
-    /// directories:
+    /// The operation is atomic. Each update writes its table in place if the table fits
+    /// there. Otherwise it appends the table to the section with the index `target_section` in
+    /// [`Self::sections`], so that the RVAs of existing sections do not move. If
+    /// `target_section` is `None`, the first table that does not fit in place goes to a new
+    /// section, and the next tables go to the same section. See
+    /// [Directory updates](crate::PeImage#directory-updates). The method intentionally does
+    /// not touch these directories:
     /// - Security (raw-file state)
     /// - CLR metadata
     /// - Directories with an encoding that Portex does not own
@@ -125,9 +125,17 @@ impl PeImage {
     ///
     /// # Errors
     ///
-    /// Returns an error if any data directory fails to parse or rebuild. Also returns an error
-    /// if the method adds a `.portex` section and another section already has this name.
-    pub fn rebuild_supported_directories(&mut self, target_section: Option<&str>) -> Result<()> {
+    /// Returns an error if any data directory fails to parse or rebuild, or if
+    /// `target_section` is not the index of a section.
+    pub fn rebuild_supported_directories(&mut self, target_section: Option<usize>) -> Result<()> {
+        if let Some(index) = target_section
+            && index >= self.sections.len()
+        {
+            return Err(Error::invalid_section(format!(
+                "section index {index} is out of range: the image has {} sections",
+                self.sections.len()
+            )));
+        }
         // Parse all directories before you change anything.
         let imports = self.imports()?;
         let exports = self.exports()?;
@@ -141,58 +149,54 @@ impl PeImage {
         let load_config = self.load_config()?;
 
         let mut rebuilt = self.clone();
-        let selected_section = if let Some(name) = target_section {
-            if self.section_by_name(name).is_none() {
-                return Err(Error::invalid_section(name));
+        // The first update that adds a section puts it after the existing sections. The next
+        // updates use that section.
+        let section_count = rebuilt.sections.len();
+        let mut target_section = target_section;
+        let follow = |image: &Self, target: &mut Option<usize>| {
+            if target.is_none() && image.sections.len() > section_count {
+                *target = Some(section_count);
             }
-            name.to_string()
-        } else {
-            let index = rebuilt.default_append_section()?;
-            let name = rebuilt.sections[index].name().to_string();
-            // The update methods find the section by its name. The name must be unique.
-            if rebuilt
-                .sections
-                .iter()
-                .position(|section| section.name() == name)
-                != Some(index)
-            {
-                return Err(Error::invalid_section(format!(
-                    "the target section '{name}' does not have a unique name"
-                )));
-            }
-            name
         };
-        let target_section = Some(selected_section.as_str());
 
         // Rebuild each directory, but only if it is not empty.
         if !imports.is_empty() {
             rebuilt.update_imports(&imports, target_section)?;
+            follow(&rebuilt, &mut target_section);
         }
         if !exports.is_empty() {
             rebuilt.update_exports(&exports, target_section)?;
+            follow(&rebuilt, &mut target_section);
         }
         if !relocations.is_empty() {
             rebuilt.update_relocations(&relocations, target_section)?;
+            follow(&rebuilt, &mut target_section);
         }
         if !resources.resources.is_empty() {
             rebuilt.update_resources(&resources, target_section)?;
+            follow(&rebuilt, &mut target_section);
         }
         if let Some(bound) = bound_imports
             && !bound.descriptors.is_empty()
         {
             rebuilt.update_bound_imports(&bound, target_section)?;
+            follow(&rebuilt, &mut target_section);
         }
         if !delay_imports.dlls.is_empty() {
             rebuilt.update_delay_imports(&delay_imports, target_section)?;
+            follow(&rebuilt, &mut target_section);
         }
         if let Some(tls) = tls {
             rebuilt.update_tls(&tls, target_section)?;
+            follow(&rebuilt, &mut target_section);
         }
         if let Some(debug) = debug {
             rebuilt.update_debug(&debug, target_section)?;
+            follow(&rebuilt, &mut target_section);
         }
         if let Some(exceptions) = exceptions {
             rebuilt.update_exception_table(&exceptions, target_section)?;
+            follow(&rebuilt, &mut target_section);
         }
         if let Some(load_config) = load_config {
             rebuilt.update_load_config(&load_config, target_section)?;

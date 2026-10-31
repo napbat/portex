@@ -657,14 +657,16 @@ impl PeImage {
         }
     }
 
-    /// Append data to a section, and return the RVA of the data.
+    /// Append data to the section with the index `section_index` in [`Self::sections`], and
+    /// return the RVA of the data.
     ///
     /// Returns `None` if [`Self::try_append_to_section`] returns an error.
-    pub fn append_to_section(&mut self, section_name: &str, data: &[u8]) -> Option<u32> {
-        self.try_append_to_section(section_name, data).ok()
+    pub fn append_to_section(&mut self, section_index: usize, data: &[u8]) -> Option<u32> {
+        self.try_append_to_section(section_index, data).ok()
     }
 
-    /// Append data to a section, with checked layout and address calculation.
+    /// Append data to the section with the index `section_index` in [`Self::sections`], with
+    /// checked layout and address calculation.
     ///
     /// The data goes after `VirtualSize` and after the last nonzero byte of the section data,
     /// at the next multiple of 8 bytes. Thus it does not overwrite the uninitialized data (BSS)
@@ -675,17 +677,13 @@ impl PeImage {
     ///
     /// Returns an error in these conditions. Then the image does not change.
     ///
-    /// - No section has the name `section_name`.
+    /// - `section_index` is not the index of a section.
     /// - The layout calculation fails.
     /// - The appended data overflows the size or the RVA range of the section.
-    /// - The data does not fit before the next section.
-    pub fn try_append_to_section(&mut self, section_name: &str, data: &[u8]) -> Result<u32> {
-        let index = self
-            .sections
-            .iter()
-            .position(|section| section.name() == section_name)
-            .ok_or_else(|| Error::invalid_section(section_name))?;
-        self.append_to_section_at(index, data)
+    /// - The data does not fit before the next section, or it needs more than 16 MiB of zero
+    ///   fill.
+    pub fn try_append_to_section(&mut self, section_index: usize, data: &[u8]) -> Result<u32> {
+        self.append_to_section_at(section_index, data)
     }
 }
 

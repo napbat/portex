@@ -1,5 +1,6 @@
-//! Regression tests for the append of a directory table: the fallback section, the reuse of
-//! zero raw padding, and the atomic updates of the TLS and load configuration directories.
+//! Tests for the section that gets an appended directory table: a section that the caller
+//! selects by its index, or a new section. Also the reuse of zero raw padding, the zero fill
+//! limit and the atomic updates of the TLS and load configuration directories.
 
 use portex::directories::RelocationTable;
 use portex::directories::{
@@ -33,14 +34,27 @@ fn image_with_last_section(name: &str, flags: u32) -> PeImage {
         .unwrap()
 }
 
+/// Return the parts of a section that an append to another section must not change.
+fn content(image: &PeImage, index: usize) -> (u32, u32, u32, Vec<u8>) {
+    let section = &image.sections[index];
+    let header = &section.header;
+    (
+        header.virtual_address,
+        header.virtual_size,
+        header.characteristics,
+        section.data.clone(),
+    )
+}
+
 #[test]
-fn the_fallback_does_not_use_a_discardable_or_resource_section() {
+fn an_update_without_a_section_adds_a_new_section() {
     for (name, flags) in [
         (".reloc", READ_DATA | characteristics::DISCARDABLE),
         (".rsrc", READ_DATA),
+        (".data", READ_DATA | characteristics::WRITE),
     ] {
         let mut image = image_with_last_section(name, flags);
-        // Before the fix, the table went to the last section.
+        let last = content(&image, 2);
         let rva = image.update_exports(&large_exports(), None).unwrap();
         assert_eq!(image.sections.len(), 4);
         let added = &image.sections[3];
@@ -48,17 +62,72 @@ fn the_fallback_does_not_use_a_discardable_or_resource_section() {
         assert_eq!(added.header.virtual_address, 0x4000);
         assert_eq!(added.header.characteristics, READ_DATA);
         assert_eq!(rva, 0x4000);
+        // Before the change, the table went to a readable last section such as `.data`.
+        assert_eq!(content(&image, 2), last, "{name}");
         let rebuilt = PeImage::parse(&image.try_build().unwrap()).unwrap();
         assert_eq!(rebuilt.exports().unwrap().exports.len(), 400);
     }
 }
 
 #[test]
-fn the_fallback_uses_a_readable_last_section() {
-    let mut image = image_with_last_section(".data", READ_DATA | characteristics::WRITE);
+fn an_update_does_not_reuse_a_section_with_the_new_section_name() {
+    // The last section has the default name of a new section. It can come from the file or
+    // from another tool, so an update must not treat it as free space.
+    let mut image = image_with_last_section(".portex", READ_DATA);
+    let existing = content(&image, 2);
     let rva = image.update_exports(&large_exports(), None).unwrap();
+    assert_eq!(image.sections.len(), 4);
+    assert_eq!(content(&image, 2), existing);
+    assert_eq!(image.sections[3].name(), ".portex");
+    assert_eq!(
+        image.section_by_rva(rva).unwrap().header.virtual_address,
+        0x4000
+    );
+}
+
+#[test]
+fn an_update_with_a_section_index_uses_that_section() {
+    let mut image = image_with_last_section(".data", READ_DATA | characteristics::WRITE);
+    let rva = image.update_exports(&large_exports(), Some(2)).unwrap();
     assert_eq!(image.sections.len(), 3);
+    assert_eq!(rva, 0x3010);
     assert_eq!(image.section_by_rva(rva).unwrap().name(), ".data");
+}
+
+#[test]
+fn a_section_index_out_of_range_is_an_error() {
+    let mut image = image_with_last_section(".data", READ_DATA | characteristics::WRITE);
+    let before = image.clone();
+    assert!(image.update_exports(&large_exports(), Some(3)).is_err());
+    assert!(image.try_append_to_section(3, &[1; 8]).is_err());
+    assert!(image.rebuild_supported_directories(Some(3)).is_err());
+    assert_eq!(image, before);
+}
+
+#[test]
+fn the_new_section_has_the_configured_name() {
+    let mut image = image_with_last_section(".data", READ_DATA | characteristics::WRITE);
+    assert_eq!(image.append_section_name(), ".portex");
+    image.try_set_append_section_name(Some(".edit")).unwrap();
+    assert_eq!(image.append_section_name(), ".edit");
+    image.update_exports(&large_exports(), None).unwrap();
+    assert_eq!(image.sections[3].name(), ".edit");
+
+    image.try_set_append_section_name(None).unwrap();
+    assert_eq!(image.append_section_name(), ".portex");
+}
+
+#[test]
+fn an_invalid_new_section_name_is_an_error() {
+    let mut image = image_with_last_section(".data", READ_DATA);
+    image.try_set_append_section_name(Some(".edit")).unwrap();
+    for name in ["", ".toolong!", ".a\0b"] {
+        assert!(image.try_set_append_section_name(Some(name)).is_err());
+        assert_eq!(image.append_section_name(), ".edit");
+    }
+    // A name of 8 bytes uses the complete name field.
+    image.try_set_append_section_name(Some("12345678")).unwrap();
+    assert_eq!(image.append_section_name(), "12345678");
 }
 
 /// Build `.text` and `.rdata`. `.rdata` has 0x200 raw bytes, and its `VirtualSize` is 0x10.
@@ -83,12 +152,7 @@ fn image_with_raw_padding(extra: &[(usize, u8)]) -> PeImage {
 #[test]
 fn an_append_reuses_zero_raw_padding() {
     let mut image = image_with_raw_padding(&[]);
-
-    // Before the fix, the append went after the 0x200 raw bytes.
-    assert_eq!(
-        image.try_append_to_section(".rdata", &[7; 8]).unwrap(),
-        0x2010
-    );
+    assert_eq!(image.try_append_to_section(1, &[7; 8]).unwrap(), 0x2010);
     let rdata = &image.sections[1];
     assert_eq!(rdata.data.len(), 0x200);
     assert_eq!(rdata.header.virtual_size, 0x18);
@@ -98,21 +162,20 @@ fn an_append_reuses_zero_raw_padding() {
 #[test]
 fn an_append_does_not_overwrite_nonzero_bytes_after_the_virtual_size() {
     let mut image = image_with_raw_padding(&[(0x100, 0xaa)]);
-
-    assert_eq!(
-        image.try_append_to_section(".rdata", &[7; 8]).unwrap(),
-        0x2108
-    );
+    assert_eq!(image.try_append_to_section(1, &[7; 8]).unwrap(), 0x2108);
     let rdata = &image.sections[1];
     assert_eq!(rdata.data[0x100], 0xaa);
     assert_eq!(&rdata.data[0x108..0x110], &[7; 8]);
     assert_eq!(rdata.header.virtual_size, 0x110);
 }
 
-/// Build a PE32+ image with `SectionAlignment` 0x200 and a full section table. `.reloc` is
-/// full and is not the last section. The last section has uninitialized data, so a fallback
-/// needs a new section, but the headers have no space for it.
-fn image_with_full_headers() -> PeImage {
+/// The index of `.rdata` in [`image_with_full_headers`].
+const FULL_RDATA: usize = 12;
+
+/// Build a PE32+ image with `SectionAlignment` 0x200 and a full section table. `.rdata` holds
+/// `rdata_used` bytes of its 0x200 bytes. `.reloc` after it is full, and the last section has
+/// uninitialized data. The headers have no space for one more section.
+fn image_with_full_headers(rdata_used: usize) -> PeImage {
     let mut reloc = vec![0u8; 0x200];
     reloc[4..8].copy_from_slice(&12u32.to_le_bytes());
     let mut builder = PeBuilder::new()
@@ -123,8 +186,9 @@ fn image_with_full_headers() -> PeImage {
     for index in 0..11 {
         builder = builder.add_section(&format!(".d{index}"), vec![0; 0x10], READ_DATA);
     }
+    let rdata_size = u32::try_from(rdata_used).unwrap();
     let mut image = builder
-        .add_section_with_virtual_size(".rdata", vec![0; 0x100], 0x100, READ_DATA)
+        .add_section_with_virtual_size(".rdata", vec![1; rdata_used], rdata_size, READ_DATA)
         .add_section_with_virtual_size(".reloc", reloc, 0x200, READ_DATA)
         .add_section_with_virtual_size(
             ".bss",
@@ -134,13 +198,10 @@ fn image_with_full_headers() -> PeImage {
         )
         .try_build()
         .unwrap();
+    assert_eq!(image.sections[FULL_RDATA].name(), ".rdata");
     // One DIR64 relocation in `.text` (page 0) and one padding entry.
     let text = image.sections[0].header.virtual_address;
-    let reloc_rva = image
-        .section_by_name(".reloc")
-        .unwrap()
-        .header
-        .virtual_address;
+    let reloc_rva = image.sections[FULL_RDATA + 1].header.virtual_address;
     let entry = (10u16 << 12) | u16::try_from(text + 0x10).unwrap();
     image
         .write_at_rva(reloc_rva + 8, &entry.to_le_bytes())
@@ -150,10 +211,16 @@ fn image_with_full_headers() -> PeImage {
     image
 }
 
+/// Return a copy of `image` without its base relocation directory.
+fn without_relocations(image: &PeImage) -> PeImage {
+    let mut image = image.clone();
+    image.clear_data_directory(DataDirectoryType::BaseReloc);
+    image
+}
+
 #[test]
 fn a_failed_relocation_update_leaves_the_tls_unchanged() {
-    let mut image = image_with_full_headers();
-    let base = image.image_base();
+    let base = image_with_full_headers(0x100).image_base();
     let tls = TlsInfo {
         directory: Some(TlsDirectory::Tls64(TlsDirectory64 {
             start_address_of_raw_data: base + 0x1000,
@@ -164,42 +231,49 @@ fn a_failed_relocation_update_leaves_the_tls_unchanged() {
         callback_rvas: vec![],
         image_base: base,
     };
+    // Measure the TLS block. Then fill `.rdata` so that the block fits at its end.
+    let mut probe = without_relocations(&image_with_full_headers(0x100));
+    probe.update_tls(&tls, Some(FULL_RDATA)).unwrap();
+    let block = probe.sections[FULL_RDATA].header.virtual_size as usize - 0x100;
+    let mut image = image_with_full_headers((0x200 - block) & !7);
+    without_relocations(&image)
+        .update_tls(&tls, Some(FULL_RDATA))
+        .unwrap();
     let before = image.clone();
-    // The TLS block fits in `.rdata`, but its relocations fit nowhere. Before the fix, the
-    // TLS directory pointed to the new block without relocations.
-    assert!(image.update_tls(&tls, Some(".rdata")).is_err());
+    // The relocations do not fit in place, and they do not fit after the TLS block in
+    // `.rdata`. The TLS directory must not point to a new block without relocations.
+    assert!(image.update_tls(&tls, Some(FULL_RDATA)).is_err());
     assert_eq!(image, before);
 }
 
 #[test]
 fn a_failed_relocation_update_leaves_the_load_config_unchanged() {
-    let mut image = image_with_full_headers();
+    let mut image = image_with_full_headers(0x168);
     let mut config = LoadConfigDirectory64::default();
     config.size = 0x94;
     config.security_cookie = image.image_base() + 0x1100;
+    let config = LoadConfigDirectory::Config64(config);
+    // The structure alone fits in `.rdata`.
+    without_relocations(&image)
+        .update_load_config(&config, Some(FULL_RDATA))
+        .unwrap();
     let before = image.clone();
-    assert!(
-        image
-            .update_load_config(&LoadConfigDirectory::Config64(config), Some(".rdata"))
-            .is_err()
-    );
+    assert!(image.update_load_config(&config, Some(FULL_RDATA)).is_err());
     assert_eq!(image, before);
 }
 
 #[test]
-fn a_failed_fallback_does_not_add_a_section() {
-    // The section table is full, so the fallback cannot add a section.
-    let mut image = image_with_full_headers();
+fn a_new_section_that_does_not_fit_in_the_headers_is_an_error() {
+    let mut image = image_with_full_headers(0x100);
     let before = image.clone();
     assert!(image.update_exports(&large_exports(), None).is_err());
     assert_eq!(image, before);
 }
 
 #[test]
-fn an_added_fallback_section_gets_the_data_at_its_start() {
+fn a_new_section_gets_the_data_at_its_start() {
     // The last section ends 0x4000 bytes before the end of the RVA range. The exports need
-    // 0x2486 bytes. Before the fix, the data started one page after the start of the added
-    // section, so it did not fit, and the empty section stayed in the image.
+    // 0x2486 bytes, so they fit only at the start of the new section.
     let mut exports = large_exports();
     exports.exports.truncate(300);
     let mut image = PeBuilder::new()
@@ -220,8 +294,9 @@ fn an_added_fallback_section_gets_the_data_at_its_start() {
     assert_eq!(rva, 0xFFFF_C000);
 }
 
-#[test]
-fn rebuild_does_not_put_tables_in_a_discardable_last_section() {
+/// Build a PE32+ image with imports and exports in `.rdata`, relocations in `.reloc` and a
+/// TLS directory.
+fn image_with_tables() -> PeImage {
     let mut image = PeBuilder::new()
         .machine(MachineType::Amd64)
         .add_section(".text", vec![0xc3; 0x100], characteristics::CODE)
@@ -242,16 +317,14 @@ fn rebuild_does_not_put_tables_in_a_discardable_last_section() {
             name: "ExitProcess".to_string(),
         }],
     );
-    image.update_imports(&imports, Some(".rdata")).unwrap();
+    image.update_imports(&imports, Some(1)).unwrap();
     let mut exports = ExportTable::default();
     exports.set_dll_name("rebuild.dll");
     exports.add_export(Some("Function"), 0x1000);
-    image.update_exports(&exports, Some(".rdata")).unwrap();
+    image.update_exports(&exports, Some(1)).unwrap();
     let mut relocations = RelocationTable::default();
     relocations.add_dir64(0x1010);
-    image
-        .update_relocations(&relocations, Some(".reloc"))
-        .unwrap();
+    image.update_relocations(&relocations, Some(3)).unwrap();
     let base = image.image_base();
     let tls = TlsInfo {
         directory: Some(TlsDirectory::Tls64(TlsDirectory64 {
@@ -261,32 +334,45 @@ fn rebuild_does_not_put_tables_in_a_discardable_last_section() {
         callback_rvas: vec![0x1000],
         image_base: base,
     };
-    image.update_tls(&tls, Some(".rdata")).unwrap();
-    let mut image = PeImage::parse(&image.try_build().unwrap()).unwrap();
+    image.update_tls(&tls, Some(1)).unwrap();
+    PeImage::parse(&image.try_build().unwrap()).unwrap()
+}
 
-    // Before the fix, the rebuild put every table in the last section, `.reloc`. The base
-    // relocations can stay in `.reloc`: the loader uses them only while it loads the image.
+#[test]
+fn rebuild_without_a_section_puts_the_appended_tables_in_one_new_section() {
+    let mut image = image_with_tables();
     image.rebuild_supported_directories(None).unwrap();
     let image = PeImage::parse(&image.try_build().unwrap()).unwrap();
+    // The TLS directory has no in-place update, so it goes to a new section. Before the
+    // change, the rebuild put it in the last section, `.reloc`.
     assert_eq!(image.sections.len(), 5);
     assert_eq!(image.sections[4].name(), ".portex");
-    for directory in [
-        DataDirectoryType::Import,
-        DataDirectoryType::Iat,
-        DataDirectoryType::Export,
-        DataDirectoryType::Tls,
-    ] {
-        let rva = image.data_directory(directory).unwrap().virtual_address;
-        let section = image.section_by_rva(rva).unwrap();
-        assert_eq!(
-            section.header.characteristics & characteristics::DISCARDABLE,
-            0,
-            "{directory:?} is in section '{}'",
-            section.name()
-        );
-    }
+    let tls = image.data_directory(DataDirectoryType::Tls).unwrap();
+    assert_eq!(
+        image.section_by_rva(tls.virtual_address).unwrap().name(),
+        ".portex"
+    );
     assert_eq!(image.exports().unwrap().exports.len(), 1);
     assert_eq!(image.tls().unwrap().unwrap().callback_rvas, [0x1000]);
+
+    // A second rebuild adds one more section. It does not reuse the first `.portex`.
+    let mut image = image;
+    image.rebuild_supported_directories(None).unwrap();
+    assert_eq!(image.sections.len(), 6);
+    assert_eq!(image.sections[5].name(), ".portex");
+}
+
+#[test]
+fn rebuild_with_a_section_index_uses_that_section() {
+    let mut image = image_with_tables();
+    image.rebuild_supported_directories(Some(2)).unwrap();
+    let image = PeImage::parse(&image.try_build().unwrap()).unwrap();
+    assert_eq!(image.sections.len(), 4);
+    let tls = image.data_directory(DataDirectoryType::Tls).unwrap();
+    assert_eq!(
+        image.section_by_rva(tls.virtual_address).unwrap().name(),
+        ".data"
+    );
 }
 
 /// Build `.text` and a last `.data` section with 16 bytes of data and a 32 MiB `VirtualSize`.
@@ -305,20 +391,10 @@ fn image_with_large_bss() -> PeImage {
 }
 
 #[test]
-fn an_append_to_a_named_section_does_not_write_a_large_zero_fill() {
+fn an_append_does_not_write_a_large_zero_fill() {
     let mut image = image_with_large_bss();
-    // Before the fix, the append wrote 32 MiB of zeros before the data.
-    assert!(image.try_append_to_section(".data", &[1; 16]).is_err());
-    assert_eq!(image.sections[1].data.len(), 16);
-}
-
-#[test]
-fn an_append_without_a_named_section_skips_a_large_zero_fill() {
-    let mut image = image_with_large_bss();
-    // Before the fix, the table went after the 32 MiB `VirtualSize` of `.data`.
-    let rva = image.update_exports(&large_exports(), None).unwrap();
-    assert_eq!(image.sections[1].data.len(), 16);
-    assert_eq!(image.section_by_rva(rva).unwrap().name(), ".portex");
-    let rebuilt = PeImage::parse(&image.try_build().unwrap()).unwrap();
-    assert_eq!(rebuilt.exports().unwrap().exports.len(), 400);
+    let before = image.clone();
+    assert!(image.try_append_to_section(1, &[1; 16]).is_err());
+    assert!(image.update_exports(&large_exports(), Some(1)).is_err());
+    assert_eq!(image, before);
 }

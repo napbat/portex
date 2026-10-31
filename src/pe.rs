@@ -170,27 +170,29 @@ pub const MAX_NUMBER_OF_SECTIONS: usize = 65535;
 /// # Directory updates
 ///
 /// Some `update_*` methods (for example [`Self::update_imports`]) first try to write the new
-/// table over the current one. When an `update_*` method appends a table to a section, these
-/// rules apply:
+/// table over the current one. If an `update_*` method appends the table, its
+/// `target_section` argument selects the section:
 ///
-/// - The data starts at an 8-byte aligned RVA after the `VirtualSize` of the section and
-///   after the last nonzero byte of the section data. Thus zero raw padding after
-///   `VirtualSize` can hold the data. The method fills the space before the data with zeros,
-///   up to 16 MiB. A section that needs more zero fill does not get the data.
-/// - The method never moves a section. If you named the target section, the method returns
-///   an error if the data does not fit before the next section or needs more than 16 MiB of
-///   zero fill. It also returns an error if the data needs a writable section and the section
-///   is not writable (see [`Self::update_imports`] and [`Self::update_delay_imports`]).
-/// - If you did not name a section, the method uses a fallback when the data does not fit,
-///   when it needs more than 16 MiB of zero fill, when the table cannot be built at the RVA
-///   in that section (for example because a kept import address table is in the way), or
-///   when the section is not writable and the data needs a writable section. The fallback is
-///   the last section. The method does not use the last section if it is not readable, has
-///   uninitialized data, is discardable (a driver can free it after the load) or is `.rsrc`
-///   (resource editors write it again). Then the method adds a new `.portex` section. This
-///   section is writable only if the data needs it.
-/// - If an `update_*` method returns an error, the image does not change. The exception is
-///   a data directory table that the method extended to hold the new directory.
+/// - `Some(index)`: the table goes to the section with that index in [`Self::sections`]. The
+///   data starts at an 8-byte aligned RVA after the `VirtualSize` of the section and after
+///   the last nonzero byte of the section data. Thus zero raw padding after `VirtualSize`
+///   can hold the data. The method fills the space before the data with zeros. The method
+///   never moves a section. It returns an error if the data does not fit before the next
+///   section, if it needs more than 16 MiB of zero fill, or if it needs a writable section
+///   and the section is not writable (see [`Self::update_imports`] and
+///   [`Self::update_delay_imports`]).
+/// - `None`: the method adds a new section after the last section, and the table goes to its
+///   start. The new section is readable and has initialized data. It is writable only if
+///   the data needs it. Its name is [`Self::append_section_name`] (`.portex` by default).
+///
+/// Portex does not select a section by its name, and it does not reuse a section that it
+/// added before. Thus each update with `None` that appends a table adds one section, and two
+/// sections can have the same name. The added section is the last entry of
+/// [`Self::sections`]. To put more tables in that section, give its index to the next
+/// updates.
+///
+/// If an `update_*` method returns an error, the image does not change. The exception is a
+/// data directory table that the method extended to hold the new directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeImage {
     /// The DOS header (`IMAGE_DOS_HEADER`).
@@ -214,6 +216,9 @@ pub struct PeImage {
     ///
     /// A file can put other data there, for example the raw data of a section.
     pub(crate) optional_padding: HeaderBytes,
+    /// The name of the section that an update adds when the caller selects no section, if it
+    /// is not the default name. See [`Self::append_section_name`].
+    pub(crate) append_section_name: Option<String>,
 }
 
 /// Raw header bytes that no header structure describes.

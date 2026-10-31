@@ -158,9 +158,7 @@ fn moving_bound_imports_removes_the_old_table_from_the_headers() {
     let mut image = PeImage::parse(&bound_import_file()).unwrap();
     let directory = image.bound_imports().unwrap().unwrap();
     // The table cannot be written in place in the headers, so it moves to `.rdata`.
-    image
-        .update_bound_imports(&directory, Some(".rdata"))
-        .unwrap();
+    image.update_bound_imports(&directory, Some(1)).unwrap();
 
     let output = image.try_build().unwrap();
     assert_eq!(count_module_names(&output), 1);

@@ -279,6 +279,7 @@ impl PeBuilder {
             runtime_image_base: None,
             header_tail: crate::pe::HeaderBytes::default(),
             optional_padding: crate::pe::HeaderBytes::default(),
+            append_section_name: None,
         };
 
         pe.try_update_layout()?;

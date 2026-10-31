@@ -13,15 +13,17 @@ use crate::{Error, Result};
 /// PE32+ `IMAGE_TLS_DIRECTORY64` and `IMAGE_LOAD_CONFIG_DIRECTORY64`).
 const APPEND_ALIGNMENT: u32 = 8;
 
-/// The name of the section that an edit adds for data that fits in no existing section.
-const APPEND_SECTION_NAME: &str = ".portex";
+/// The default name of the section that an update adds when the caller selects no section.
+const DEFAULT_APPEND_SECTION_NAME: &str = ".portex";
+
+/// The size of the `Name` field of `IMAGE_SECTION_HEADER`, in bytes.
+const SECTION_NAME_SIZE: usize = 8;
 
 /// The largest zero fill that an append writes before its data, in bytes.
 ///
 /// An append after a large `VirtualSize` writes the uninitialized data of the section to the
 /// file as zeros. `VirtualSize` comes from the file, so this limit stops a header value from
-/// selecting the size of an allocation. Above the limit, an append uses another section or
-/// returns an error.
+/// selecting the size of an allocation. Above the limit, the append returns an error.
 const MAX_APPEND_ZERO_FILL: usize = 16 * 1024 * 1024;
 
 /// The result of one append attempt in one section.
@@ -40,6 +42,53 @@ enum Attempt<T> {
 }
 
 impl PeImage {
+    /// Return the name of the section that an `update_*` method adds when you select no
+    /// section.
+    ///
+    /// The default name is `.portex`. See [Directory updates](PeImage#directory-updates).
+    #[must_use]
+    pub fn append_section_name(&self) -> &str {
+        self.append_section_name
+            .as_deref()
+            .unwrap_or(DEFAULT_APPEND_SECTION_NAME)
+    }
+
+    /// Set the name of the section that an `update_*` method adds when you select no section.
+    ///
+    /// `None` sets the default name `.portex`. The name only labels each new section. Portex
+    /// does not look for a section by this name, so two sections can have the same name. The
+    /// file does not store this setting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `name` is empty, is longer than 8 bytes or contains a null byte.
+    /// Then the setting does not change.
+    pub fn try_set_append_section_name(&mut self, name: Option<&str>) -> Result<()> {
+        let Some(name) = name else {
+            self.append_section_name = None;
+            return Ok(());
+        };
+        if name.is_empty() || name.len() > SECTION_NAME_SIZE || name.as_bytes().contains(&0) {
+            return Err(Error::invalid_section(format!(
+                "'{}' is not a valid section name: use 1 to {SECTION_NAME_SIZE} bytes without \
+                 a null byte",
+                name.escape_debug()
+            )));
+        }
+        self.append_section_name = (name != DEFAULT_APPEND_SECTION_NAME).then(|| name.to_string());
+        Ok(())
+    }
+
+    /// Set the name of the section that an `update_*` method adds when you select no section.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`Self::try_set_append_section_name`] returns an error.
+    pub fn set_append_section_name(&mut self, name: Option<&str>) {
+        self.try_set_append_section_name(name)
+            .expect("invalid section name: use try_set_append_section_name() to handle it");
+    }
+
     /// Run `update` on a copy of the image, and keep the copy only if `update` succeeds.
     ///
     /// Use this method for an update that changes the image in more than one step. If a step
@@ -93,21 +142,20 @@ impl PeImage {
             .ok_or_else(|| Error::invalid_section("appended section-data RVA overflow"))
     }
 
-    /// Append `data` to a section at the RVA that [`Self::prepare_section_append`] returns.
-    ///
-    /// This is the append of [`Self::try_append_to_section`]: the caller named the section.
+    /// Append `data` to the section at `section_index`, at the RVA that
+    /// [`Self::prepare_section_append`] returns.
     ///
     /// # Errors
     ///
-    /// Returns an error if the layout update fails, or if the data does not fit before the next
-    /// section. Then the image does not change.
+    /// Returns an error if the index is out of range, if the layout update fails, or if the
+    /// data does not fit before the next section. Then the image does not change.
     pub(super) fn append_to_section_at(
         &mut self,
         section_index: usize,
         data: &[u8],
     ) -> Result<u32> {
         let (rva, ()) =
-            self.append_section_data(section_index, true, |_| Ok((data.to_vec(), ())))?;
+            self.append_section_data(Some(section_index), |_| Ok((data.to_vec(), ())))?;
         Ok(rva)
     }
 
@@ -116,11 +164,10 @@ impl PeImage {
     /// See [`Self::append_section_data_with`]. The data does not need a writable section.
     pub(super) fn append_section_data<T>(
         &mut self,
-        section_index: usize,
-        explicit_target: bool,
+        target_section: Option<usize>,
         build: impl FnMut(u32) -> Result<(Vec<u8>, T)>,
     ) -> Result<(u32, T)> {
-        self.append_section_data_with(section_index, explicit_target, build, |_, _, _| false)
+        self.append_section_data_with(target_section, build, |_, _, _| false)
     }
 
     /// Build data for an RVA in a section, and append it there.
@@ -129,72 +176,45 @@ impl PeImage {
     /// `needs_write` gets the image, the index of the section and the value of `build`. It
     /// returns `true` if the data needs a writable section there.
     ///
-    /// If the data does not fit before the next section, if it starts after more than
-    /// [`MAX_APPEND_ZERO_FILL`] bytes of zero fill, if `build` fails, or if the section is not
-    /// writable and the data needs a writable section, the result depends on
-    /// `explicit_target`:
-    ///
-    /// - If the caller named the section (`true`), the method returns an error.
-    /// - Otherwise, the method appends the data to the last section. It does not use the last
-    ///   section if that section is not readable, has uninitialized data, is discardable or is
-    ///   `.rsrc`. It also does not use it if the data needs a writable section and the last
-    ///   section is not writable. Then the method adds a new section for the data. The new
-    ///   section is writable only if the data needs a writable section.
-    ///
-    /// The method calls `build` again for each new RVA. A `build` error in the last section or
-    /// in the new section is the result.
+    /// - If `target_section` is the index of a section, the data goes to that section. The
+    ///   method returns an error if `build` fails, if the data does not fit before the next
+    ///   section, if it starts after more than [`MAX_APPEND_ZERO_FILL`] bytes of zero fill,
+    ///   or if the data needs a writable section and the section is not writable.
+    /// - If `target_section` is `None`, the method adds a new section after the last section,
+    ///   and the data goes there (see [`Self::add_append_section`]). The new section is
+    ///   writable only if the data needs a writable section.
     ///
     /// The method never moves a section. If it returns an error, the image does not change.
     /// Returns the RVA of the data and the value of `build`.
     pub(super) fn append_section_data_with<T>(
         &mut self,
-        section_index: usize,
-        explicit_target: bool,
+        target_section: Option<usize>,
         mut build: impl FnMut(u32) -> Result<(Vec<u8>, T)>,
         needs_write: impl Fn(&Self, usize, &T) -> bool,
     ) -> Result<(u32, T)> {
-        let mut needs_writable_section = false;
-        match self.try_append_at(section_index, &mut build, &needs_write)? {
-            Attempt::Done(image, rva, value) => {
-                *self = *image;
-                return Ok((rva, value));
+        if let Some(index) = target_section {
+            if index >= self.sections.len() {
+                return Err(Error::invalid_section(format!(
+                    "section index {index} is out of range: the image has {} sections",
+                    self.sections.len()
+                )));
             }
-            Attempt::BuildFailed(error) if explicit_target => return Err(error),
-            Attempt::NoFit if explicit_target => {
-                return Err(self.moved_section_error(section_index));
-            }
-            Attempt::LargeZeroFill if explicit_target => {
-                return Err(self.zero_fill_error(section_index));
-            }
-            Attempt::NotWritable if explicit_target => {
-                return Err(self.not_writable_error(section_index));
-            }
-            Attempt::NotWritable => needs_writable_section = true,
-            Attempt::BuildFailed(_) | Attempt::NoFit | Attempt::LargeZeroFill => {}
-        }
-
-        if let Some(last) = self.fallback_section_index()
-            && last != section_index
-        {
-            match self.try_append_at(last, &mut build, &needs_write)? {
+            return match self.try_append_at(index, &mut build, &needs_write)? {
                 Attempt::Done(image, rva, value) => {
                     *self = *image;
-                    return Ok((rva, value));
+                    Ok((rva, value))
                 }
-                Attempt::BuildFailed(error) => return Err(error),
-                Attempt::NotWritable => needs_writable_section = true,
-                Attempt::NoFit | Attempt::LargeZeroFill => {}
-            }
+                Attempt::BuildFailed(error) => Err(error),
+                Attempt::NoFit => Err(self.moved_section_error(index)),
+                Attempt::LargeZeroFill => Err(self.zero_fill_error(index)),
+                Attempt::NotWritable => Err(self.not_writable_error(index)),
+            };
         }
 
+        let mut writable = false;
         loop {
-            let mut flags = characteristics::INITIALIZED_DATA | characteristics::READ;
-            if needs_writable_section {
-                flags |= characteristics::WRITE;
-            }
             let mut candidate = self.clone();
-            candidate.try_add_section_with_data(APPEND_SECTION_NAME, Vec::new(), flags)?;
-            let index = candidate.sections.len() - 1;
+            let index = candidate.add_append_section(writable)?;
             match candidate.try_append_at(index, &mut build, &needs_write)? {
                 Attempt::Done(image, rva, value) => {
                     *self = *image;
@@ -203,7 +223,7 @@ impl PeImage {
                 Attempt::BuildFailed(error) => return Err(error),
                 Attempt::NoFit => return Err(candidate.moved_section_error(index)),
                 Attempt::LargeZeroFill => return Err(candidate.zero_fill_error(index)),
-                Attempt::NotWritable if !needs_writable_section => needs_writable_section = true,
+                Attempt::NotWritable if !writable => writable = true,
                 Attempt::NotWritable => return Err(candidate.not_writable_error(index)),
             }
         }
@@ -259,53 +279,39 @@ impl PeImage {
         Ok(Attempt::Done(Box::new(candidate), rva, value))
     }
 
-    /// Return the index of the section that gets appended tables when the caller names no
-    /// section and the tables go to one section.
+    /// Add a new empty section for appended data after the last section, and return its index.
     ///
-    /// This is the last section, if the fallback of an append can use it (see
-    /// [`Self::append_section_data_with`]). Otherwise the method adds a new readable
-    /// `.portex` section, and returns its index.
+    /// The section has the name [`Self::append_section_name`]. It is readable and has
+    /// initialized data. It is writable if `writable` is `true`. The method does not look at
+    /// the names of the other sections.
     ///
     /// # Errors
     ///
-    /// Returns an error if the method cannot add the section. Then the image does not change.
-    pub(super) fn default_append_section(&mut self) -> Result<usize> {
-        if let Some(index) = self.fallback_section_index() {
-            return Ok(index);
+    /// Returns an error if the image cannot hold one more section (see
+    /// [`Self::try_add_section`]). Then the image does not change.
+    pub(super) fn add_append_section(&mut self, writable: bool) -> Result<usize> {
+        let mut flags = characteristics::INITIALIZED_DATA | characteristics::READ;
+        if writable {
+            flags |= characteristics::WRITE;
         }
-        self.try_add_section_with_data(
-            APPEND_SECTION_NAME,
-            Vec::new(),
-            characteristics::INITIALIZED_DATA | characteristics::READ,
-        )?;
+        let name = self.append_section_name().to_string();
+        self.try_add_section_with_data(&name, Vec::new(), flags)?;
         Ok(self.sections.len() - 1)
     }
 
-    /// Return the index of the last section in RVA order, if an append can use it as the
-    /// fallback.
-    ///
-    /// The section must be readable and have no uninitialized data after its data. It must not
-    /// be discardable: a driver can free a discardable section after the load. It must not be
-    /// `.rsrc`: resource editors write that section again, and they remove other data in it.
-    fn fallback_section_index(&self) -> Option<usize> {
-        let (index, section) = self
-            .sections
+    /// Return the index of the section that [`Self::section_by_rva`] finds for `rva`.
+    pub(super) fn section_index_at(&self, rva: u32) -> Option<usize> {
+        let section = self.section_by_rva(rva)?;
+        self.sections
             .iter()
-            .enumerate()
-            .max_by_key(|(_, section)| section.header.virtual_address)?;
-        let header = &section.header;
-        let usable = header.is_readable()
-            && header.virtual_size as usize <= section.data.len()
-            && header.characteristics & characteristics::DISCARDABLE == 0
-            && section.name() != ".rsrc";
-        usable.then_some(index)
+            .position(|candidate| core::ptr::eq(candidate, section))
     }
 
     /// Return the error for an append to a section that moves another section.
     fn moved_section_error(&self, section_index: usize) -> Error {
         Error::invalid_section(format!(
-            "the data does not fit in section '{}' before the next section; \
-             an append must not move a section",
+            "the data does not fit in section {section_index} ('{}') before the next \
+             section; an append must not move a section",
             self.section_name_at(section_index)
         ))
     }
@@ -315,7 +321,7 @@ impl PeImage {
     fn zero_fill_error(&self, section_index: usize) -> Error {
         Error::invalid_section(format!(
             "the data starts after more than {MAX_APPEND_ZERO_FILL} bytes of uninitialized \
-             data in section '{}'",
+             data in section {section_index} ('{}')",
             self.section_name_at(section_index)
         ))
     }
@@ -323,7 +329,8 @@ impl PeImage {
     /// Return the error for an append that needs a writable section.
     fn not_writable_error(&self, section_index: usize) -> Error {
         Error::invalid_section(format!(
-            "the data needs a writable section, and section '{}' is not writable",
+            "the data needs a writable section, and section {section_index} ('{}') is not \
+             writable",
             self.section_name_at(section_index)
         ))
     }

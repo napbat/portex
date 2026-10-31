@@ -42,7 +42,7 @@ fn image_with_imports(machine: MachineType) -> PeImage {
         "USER32.dll",
         vec![named("MessageBoxA"), ImportThunk::Ordinal(7)],
     );
-    image.update_imports(&imports, Some(".rdata")).unwrap();
+    image.update_imports(&imports, Some(1)).unwrap();
     reparse(&image)
 }
 
@@ -104,7 +104,8 @@ fn only_new_and_changed_dlls_get_a_new_iat() {
         imports.add_named_import("USER32.dll", "MessageBoxW", 0);
         imports.add_dll("ADVAPI32.dll", vec![named("RegCloseKey")]);
 
-        image.update_imports(&imports, None).unwrap();
+        // `.rdata` holds the kept IATs and has space for the new data.
+        image.update_imports(&imports, Some(1)).unwrap();
         let after = first_thunks(&reparse(&image));
         assert_eq!(after.len(), 3);
         // KERNEL32 is unchanged and keeps its IAT.
@@ -154,14 +155,10 @@ fn image_with_delay_imports(machine: MachineType) -> PeImage {
             dll("b.dll", vec![named("B1")]),
         ],
     };
-    image
-        .update_delay_imports(&directory, Some(".data"))
-        .unwrap();
+    image.update_delay_imports(&directory, Some(2)).unwrap();
     let mut image = reparse(&image);
     let directory = image.delay_imports().unwrap();
-    let rva = image
-        .update_delay_imports(&directory, Some(".rdata"))
-        .unwrap();
+    let rva = image.update_delay_imports(&directory, Some(1)).unwrap();
     for (index, value) in [0x3000u32, 0x3100].into_iter().enumerate() {
         let descriptor = rva + u32::try_from(index * DelayLoadDescriptor::SIZE).unwrap();
         let fields: Vec<u8> = [value, value + 0x40, 0x5EED_0000 + value]
@@ -262,11 +259,12 @@ fn new_iats_outside_the_section_of_the_kept_iats_are_writable() {
 
         // A named target that is not writable cannot hold the new IAT.
         let before = image.clone();
-        assert!(image.update_imports(&imports, Some(".rsrc")).is_err());
+        assert!(image.update_imports(&imports, Some(3)).is_err());
         assert_eq!(image, before);
 
         // Before the fix, the new IAT went to the read-only last section, and the IAT data
         // directory was cleared. The loader then failed to write the kept IATs and the new IAT.
+        // Now the new IAT goes to a new writable section.
         image.update_imports(&imports, None).unwrap();
         let image = reparse(&image);
         let parsed = image.imports().unwrap();
@@ -294,7 +292,7 @@ fn a_named_writable_target_gets_the_new_iats() {
         let mut imports = image.imports().unwrap();
         imports.add_dll("ADVAPI32.dll", vec![named("RegCloseKey")]);
 
-        image.update_imports(&imports, Some(".data")).unwrap();
+        image.update_imports(&imports, Some(2)).unwrap();
         let image = reparse(&image);
         let new_iat = image.imports().unwrap().dlls[2].descriptor.first_thunk;
         assert_eq!(section_of(&image, new_iat).name(), ".data");
@@ -343,37 +341,38 @@ fn image_with_delay_tables_after_rdata(machine: MachineType) -> PeImage {
             })
             .collect(),
     };
-    image
-        .update_delay_imports(&directory, Some(".data"))
-        .unwrap();
+    image.update_delay_imports(&directory, Some(2)).unwrap();
     let mut image = reparse(&image);
     let directory = image.delay_imports().unwrap();
-    let rva = image
-        .update_delay_imports(&directory, Some(".rdata"))
-        .unwrap();
+    let rva = image.update_delay_imports(&directory, Some(1)).unwrap();
     let rdata = image.section_by_name(".rdata").unwrap();
     let used = rdata.header.virtual_size.next_multiple_of(8);
     let filler = vec![0xAA; usize::try_from(0x1000 - used - 0x20).unwrap()];
-    image.try_append_to_section(".rdata", &filler).unwrap();
+    image.try_append_to_section(1, &filler).unwrap();
     let descriptors = u32::try_from(3 * DelayLoadDescriptor::SIZE).unwrap();
     image.set_data_directory(DataDirectoryType::DelayImport, rva, descriptors);
     reparse(&image)
 }
 
 #[test]
-fn a_kept_delay_table_after_the_target_section_uses_the_fallback() {
+fn a_kept_delay_table_after_the_selected_section_is_an_error() {
     for machine in MACHINES {
         let mut image = image_with_delay_tables_after_rdata(machine);
         let before = kept_fields(&image);
         assert_eq!(section_of(&image, before[0][1]).name(), ".data");
         let directory = image.delay_imports().unwrap();
 
-        // Each DLL keeps its tables, so the data needs no writable section. Before the fix,
-        // the build at the end of `.rdata` covered the kept IATs in `.data`. The error
-        // stopped the update before the fallback.
+        // The data at the end of `.rdata` would cover the kept IATs in `.data`.
+        let unchanged = image.clone();
+        assert!(image.update_delay_imports(&directory, Some(1)).is_err());
+        assert_eq!(image, unchanged);
+
+        // Each DLL keeps its tables, so the new section for the data is not writable.
         let rva = image.update_delay_imports(&directory, None).unwrap();
         let image = reparse(&image);
-        assert_eq!(section_of(&image, rva).name(), ".data");
+        let section = section_of(&image, rva);
+        assert_eq!(section.name(), ".portex");
+        assert!(!section.header.is_writable());
         assert_eq!(kept_fields(&image), before);
     }
 }
@@ -390,17 +389,14 @@ fn new_delay_tables_need_a_writable_section() {
             imports: vec![named("C1")],
         });
 
-        // A named target that is not writable cannot hold the new IAT and module handle.
+        // A selected section that is not writable cannot hold the new IAT and module handle.
         let unchanged = image.clone();
-        assert!(
-            image
-                .update_delay_imports(&directory, Some(".rdata"))
-                .is_err()
-        );
+        assert!(image.update_delay_imports(&directory, Some(1)).is_err());
         assert_eq!(image, unchanged);
 
         // Before the fix, the new tables went to the read-only `.rdata`. The delay-load helper
-        // then failed to write the IAT slot and the module handle.
+        // then failed to write the IAT slot and the module handle. Now they go to a new
+        // writable section.
         image.update_delay_imports(&directory, None).unwrap();
         let image = reparse(&image);
         assert_eq!(kept_fields(&image)[..2], before[..]);
@@ -412,16 +408,16 @@ fn new_delay_tables_need_a_writable_section() {
 }
 
 #[test]
-fn a_kept_iat_after_the_target_section_uses_the_fallback() {
+fn a_kept_iat_after_the_selected_section_is_an_error() {
     for machine in MACHINES {
         // Put the IATs in `.data`, then move the descriptors to `.rdata`.
         let mut image = base_image(machine);
         let mut imports = ImportTable::default();
         imports.add_dll("KERNEL32.dll", vec![named("ExitProcess")]);
-        image.update_imports(&imports, Some(".data")).unwrap();
+        image.update_imports(&imports, Some(2)).unwrap();
         let mut image = reparse(&image);
         let imports = image.imports().unwrap();
-        image.update_imports(&imports, Some(".rdata")).unwrap();
+        image.update_imports(&imports, Some(1)).unwrap();
         let mut image = reparse(&image);
         let kept = first_thunks(&image);
         assert_eq!(section_of(&image, kept[0].1).name(), ".data");
@@ -430,10 +426,14 @@ fn a_kept_iat_after_the_target_section_uses_the_fallback() {
         for (name, functions) in many_dlls(40) {
             imports.add_dll(&name, functions);
         }
-        // Before the fix, the build at the end of `.rdata` covered the kept IAT in `.data`.
+        // The data at the end of `.rdata` would cover the kept IAT in `.data`.
+        let unchanged = image.clone();
+        assert!(image.update_imports(&imports, Some(1)).is_err());
+        assert_eq!(image, unchanged);
+
         let rva = image.update_imports(&imports, None).unwrap();
         let image = reparse(&image);
-        assert_eq!(section_of(&image, rva).name(), ".data");
+        assert_eq!(section_of(&image, rva).name(), ".portex");
         assert_eq!(first_thunks(&image)[0], kept[0]);
     }
 }

@@ -10,11 +10,9 @@ impl PeImage {
     /// Update the exports.
     ///
     /// The function first tries to replace the data in place. If the data does not fit, the
-    /// function appends it to the target section. If `target_section` is `None`, the function
-    /// uses one of these sections, in this order:
-    /// 1. The section that contains the existing exports.
-    /// 2. `.rdata`.
-    /// 3. The last section.
+    /// function appends it to the section with the index `target_section` in
+    /// [`Self::sections`]. If `target_section` is `None`, the function adds a new section for
+    /// the data. See [Directory updates](crate::PeImage#directory-updates).
     ///
     /// Returns the RVA of the export directory. Returns 0 if `exports` has no functions and no
     /// DLL name; then the function clears the export data directory.
@@ -27,13 +25,13 @@ impl PeImage {
     ///   ordinal or the same name, a name is empty, or a named export has RVA 0 (see
     ///   [`crate::export::ExportTableBuilder::try_calculate_size`]). The function does not
     ///   change the image in this condition.
-    /// - The target section does not exist.
-    /// - The layout update fails, or the data does not fit in the target section that you
-    ///   named. See [Directory updates](crate::PeImage#directory-updates).
+    /// - `target_section` is not the index of a section.
+    /// - The layout update fails, or the data does not fit in the selected section. See
+    ///   [Directory updates](crate::PeImage#directory-updates).
     pub fn update_exports(
         &mut self,
         exports: &crate::export::ExportTable,
-        target_section: Option<&str>,
+        target_section: Option<usize>,
     ) -> Result<u32> {
         use crate::data_dir::DataDirectoryType;
         use crate::export::ExportTableBuilder;
@@ -66,43 +64,10 @@ impl PeImage {
             }
         }
 
-        // Find the target section for the append, in this order:
-        // 1. The section that the caller specified.
-        // 2. The section that contains the existing exports, if there are exports.
-        // 3. `.rdata`.
-        // 4. The last section.
-        let section_name: String = target_section
-            .map(str::to_string)
-            .or_else(|| {
-                // Find the section that contains the existing export directory.
-                if let Some(ref dir) = existing_dir
-                    && dir.is_present()
-                    && let Some(section) = self.section_by_rva(dir.virtual_address)
-                {
-                    return Some(section.name().to_string());
-                }
-                None
-            })
-            .or_else(|| {
-                if self.section_by_name(".rdata").is_some() {
-                    Some(".rdata".to_string())
-                } else {
-                    self.sections.last().map(|s| s.name().to_string())
-                }
-            })
-            .unwrap_or_else(|| ".rdata".to_string());
-
-        // Find the section index. An index prevents borrow problems.
-        let section_idx = self.sections.iter().position(|s| s.name() == section_name);
-        let Some(section_idx) = section_idx else {
-            return Err(crate::Error::invalid_section(section_name));
-        };
-
         // Build the export data at the RVA of the append, and append it.
-        let (append_rva, export_size) =
-            self.append_section_data(section_idx, target_section.is_some(), |rva| {
-                ExportTableBuilder::new(rva).try_build(exports)
-            })?;
+        let (append_rva, export_size) = self.append_section_data(target_section, |rva| {
+            ExportTableBuilder::new(rva).try_build(exports)
+        })?;
 
         // Update the data directory.
         self.set_data_directory(DataDirectoryType::Export, append_rva, export_size);

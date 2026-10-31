@@ -42,27 +42,23 @@ fn section_rvas(image: &PeImage) -> Vec<u32> {
 }
 
 #[test]
-fn append_to_a_named_section_that_does_not_fit_is_an_error() {
+fn append_to_a_section_that_does_not_fit_is_an_error() {
     let mut image = three_sections();
     let before = image.clone();
-    assert!(
-        image
-            .update_exports(&large_exports(), Some(".rdata"))
-            .is_err()
-    );
+    assert!(image.update_exports(&large_exports(), Some(1)).is_err());
     assert_eq!(image, before);
-    assert!(image.try_append_to_section(".rdata", &[0; 0x2000]).is_err());
+    assert!(image.try_append_to_section(1, &[0; 0x2000]).is_err());
     assert_eq!(image, before);
 }
 
 #[test]
-fn append_to_the_default_section_falls_back_to_the_last_section() {
+fn an_update_without_a_section_does_not_move_a_section() {
     let mut image = three_sections();
     let rva = image.update_exports(&large_exports(), None).unwrap();
-    assert_eq!(section_rvas(&image), [0x1000, 0x2000, 0x3000]);
-    assert!(rva >= 0x3000);
+    assert_eq!(section_rvas(&image), [0x1000, 0x2000, 0x3000, 0x4000]);
+    assert_eq!(rva, 0x4000);
     let rebuilt = PeImage::parse(&image.try_build().unwrap()).unwrap();
-    assert_eq!(section_rvas(&rebuilt), [0x1000, 0x2000, 0x3000]);
+    assert_eq!(section_rvas(&rebuilt), [0x1000, 0x2000, 0x3000, 0x4000]);
     assert_eq!(rebuilt.exports().unwrap().exports.len(), 400);
 }
 
@@ -80,7 +76,7 @@ fn append_goes_after_uninitialized_data() {
     let mut exports = ExportTable::default();
     exports.set_dll_name("bss.dll");
     exports.add_export(Some("Function"), 0x1000);
-    let rva = image.update_exports(&exports, Some(".data")).unwrap();
+    let rva = image.update_exports(&exports, Some(1)).unwrap();
     assert_eq!(rva, 0x5000);
     let data = &image.sections[1];
     assert!(data.header.virtual_size > 0x3000);
@@ -109,9 +105,9 @@ fn appended_directories_are_8_byte_aligned() {
     let mut exports = ExportTable::default();
     exports.set_dll_name("odd.dll");
     exports.add_export(Some("Function"), 0x1000);
-    let rva = image.update_exports(&exports, Some(".odd")).unwrap();
+    let rva = image.update_exports(&exports, Some(1)).unwrap();
     assert_eq!(rva, 0x2008);
-    assert_eq!(image.try_append_to_section(".odd", &[7]).unwrap() % 8, 0);
+    assert_eq!(image.try_append_to_section(1, &[7]).unwrap() % 8, 0);
 }
 
 #[test]

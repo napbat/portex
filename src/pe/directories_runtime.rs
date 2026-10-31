@@ -51,28 +51,30 @@ impl PeImage {
 
     /// Write a new TLS directory (`IMAGE_TLS_DIRECTORY32` or `IMAGE_TLS_DIRECTORY64`).
     ///
-    /// This function creates the TLS directory, or replaces the current one. If
-    /// `target_section` is `None`, the function uses ".rdata". If ".rdata" does not exist, it
-    /// uses the last section. See [Directory updates](crate::PeImage#directory-updates) for
-    /// the fallback if the data does not fit.
+    /// This function creates the TLS directory, or replaces the current one. It appends the
+    /// TLS data to the section with the index `target_section` in [`Self::sections`]. If
+    /// `target_section` is `None`, the function adds a new section for the data. See
+    /// [Directory updates](crate::PeImage#directory-updates).
     ///
     /// The function keeps the original TLS index (`AddressOfIndex`); see
     /// [`TlsBuilder::try_build_from_info`](crate::tls::TlsBuilder::try_build_from_info).
     ///
     /// The new block holds VAs. If the image has a base relocation directory, the function
     /// adds a `HIGHLOW` (PE32) or `DIR64` (PE32+) relocation for each VA that is not zero.
-    /// These are the directory VA fields and the callback array entries.
+    /// These are the directory VA fields and the callback array entries. If the relocation
+    /// table does not fit in place, it goes to the section that gets the TLS data.
     ///
     /// # Arguments
     /// * `tls_info` - The TLS data to write.
-    /// * `target_section` - The name of the section that gets the TLS data (optional).
+    /// * `target_section` - The index of the section that gets the TLS data, or `None` for a
+    ///   new section.
     ///
     /// Returns the RVA of the new TLS directory.
     ///
     /// # Errors
     ///
     /// Returns an error if the data-directory table has no TLS slot and cannot
-    /// be extended, if the target section does not exist, if the TLS data
+    /// be extended, if `target_section` is not the index of a section, if the TLS data
     /// cannot be serialized, or if the append fails (see
     /// [Directory updates](crate::PeImage#directory-updates)). Also returns an
     /// error if the base relocations cannot be parsed or written. If an error occurs, the
@@ -80,7 +82,7 @@ impl PeImage {
     pub fn update_tls(
         &mut self,
         tls_info: &crate::tls::TlsInfo,
-        target_section: Option<&str>,
+        target_section: Option<usize>,
     ) -> Result<u32> {
         self.transact(|image| image.update_tls_in(tls_info, target_section))
     }
@@ -90,28 +92,11 @@ impl PeImage {
     fn update_tls_in(
         &mut self,
         tls_info: &crate::tls::TlsInfo,
-        target_section: Option<&str>,
+        target_section: Option<usize>,
     ) -> Result<u32> {
         use crate::data_dir::DataDirectoryType;
         use crate::tls::TlsBuilder;
         self.ensure_data_directory_slot(DataDirectoryType::Tls)?;
-
-        // Find the target section.
-        let section_name: String = target_section
-            .map(str::to_string)
-            .or_else(|| {
-                if self.section_by_name(".rdata").is_some() {
-                    Some(".rdata".to_string())
-                } else {
-                    self.sections.last().map(|s| s.name().to_string())
-                }
-            })
-            .unwrap_or_else(|| ".rdata".to_string());
-
-        let section_idx = self.sections.iter().position(|s| s.name() == section_name);
-        let Some(section_idx) = section_idx else {
-            return Err(crate::Error::invalid_section(&section_name));
-        };
 
         // Parse the relocations before the image changes.
         let relocations = self.relocations_for_new_vas()?;
@@ -119,14 +104,15 @@ impl PeImage {
         // Build the TLS data at the RVA of the append, and append it.
         let (image_base, is_64bit) = (self.image_base(), self.is_64bit());
         let (append_rva, (dir_size, va_offsets)) =
-            self.append_section_data(section_idx, target_section.is_some(), |rva| {
+            self.append_section_data(target_section, |rva| {
                 let builder = TlsBuilder::new(rva, image_base, is_64bit);
                 let (data, dir_size) = builder.try_build_from_info(tls_info)?;
                 let va_offsets = builder.va_offsets(&data);
                 Ok((data, (dir_size, va_offsets)))
             })?;
         self.set_data_directory(DataDirectoryType::Tls, append_rva, dir_size);
-        self.add_va_relocations(relocations, append_rva, &va_offsets)?;
+        let section = self.section_index_at(append_rva);
+        self.add_va_relocations(relocations, append_rva, &va_offsets, section)?;
 
         Ok(append_rva)
     }
@@ -169,53 +155,37 @@ impl PeImage {
     /// Write a debug directory with one CodeView entry that points to a PDB.
     ///
     /// This is the most common debug directory format. The function writes one CodeView RSDS
-    /// entry. If `target_section` is `None`, the function uses ".rdata". If ".rdata" does not
-    /// exist, it uses the last section.
+    /// entry. It appends the debug data to the section with the index `target_section` in
+    /// [`Self::sections`]. If `target_section` is `None`, the function adds a new section for
+    /// the data. See [Directory updates](crate::PeImage#directory-updates).
     ///
     /// # Arguments
     /// * `codeview` - The `CodeView` data, with the PDB path and the GUID.
-    /// * `target_section` - The name of the section that gets the debug data (optional).
+    /// * `target_section` - The index of the section that gets the debug data, or `None` for
+    ///   a new section.
     ///
     /// Returns the RVA of the new debug directory.
     ///
     /// # Errors
     ///
     /// Returns an error if the data-directory table has no debug slot and
-    /// cannot be extended, if the target section does not exist, if the
+    /// cannot be extended, if `target_section` is not the index of a section, if the
     /// `CodeView` record cannot be serialized, or if the append fails (see
     /// [Directory updates](crate::PeImage#directory-updates)).
     pub fn update_debug_codeview(
         &mut self,
         codeview: &crate::debug::CodeViewRsds,
-        target_section: Option<&str>,
+        target_section: Option<usize>,
     ) -> Result<u32> {
         use crate::data_dir::DataDirectoryType;
         use crate::debug::DebugBuilder;
         self.ensure_data_directory_slot(DataDirectoryType::Debug)?;
 
-        // Find the target section.
-        let section_name: String = target_section
-            .map(str::to_string)
-            .or_else(|| {
-                if self.section_by_name(".rdata").is_some() {
-                    Some(".rdata".to_string())
-                } else {
-                    self.sections.last().map(|s| s.name().to_string())
-                }
-            })
-            .unwrap_or_else(|| ".rdata".to_string());
-
-        let section_idx = self.sections.iter().position(|s| s.name() == section_name);
-        let Some(section_idx) = section_idx else {
-            return Err(crate::Error::invalid_section(&section_name));
-        };
-
         // Build the debug data at the RVA of the append, and append it.
-        let (append_rva, dir_size) =
-            self.append_section_data(section_idx, target_section.is_some(), |rva| {
-                let (data, dir_size, _) = DebugBuilder::new(rva).try_build_codeview(codeview)?;
-                Ok((data, dir_size))
-            })?;
+        let (append_rva, dir_size) = self.append_section_data(target_section, |rva| {
+            let (data, dir_size, _) = DebugBuilder::new(rva).try_build_codeview(codeview)?;
+            Ok((data, dir_size))
+        })?;
         self.set_data_directory(DataDirectoryType::Debug, append_rva, dir_size);
         // The builder writes no file offset. Set it for the current layout.
         self.synchronize_debug_file_offsets();
@@ -225,19 +195,22 @@ impl PeImage {
 
     /// Write the debug directory from a `DebugInfo` structure.
     ///
-    /// Returns the RVA of the new debug directory. If `debug_info` has no entries, the
-    /// function clears the directory and returns 0.
+    /// The function appends the debug data to the section with the index `target_section` in
+    /// [`Self::sections`]. If `target_section` is `None`, the function adds a new section for
+    /// the data. See [Directory updates](crate::PeImage#directory-updates). Returns the RVA
+    /// of the new debug directory. If `debug_info` has no entries, the function clears the
+    /// directory and returns 0.
     ///
     /// # Errors
     ///
     /// Returns an error if the data-directory table has no debug slot and
-    /// cannot be extended, if the target section does not exist, if the debug
+    /// cannot be extended, if `target_section` is not the index of a section, if the debug
     /// entries cannot be serialized, or if the append fails (see
     /// [Directory updates](crate::PeImage#directory-updates)).
     pub fn update_debug(
         &mut self,
         debug_info: &crate::debug::DebugInfo,
-        target_section: Option<&str>,
+        target_section: Option<usize>,
     ) -> Result<u32> {
         use crate::data_dir::DataDirectoryType;
         use crate::debug::DebugBuilder;
@@ -249,29 +222,11 @@ impl PeImage {
         }
         self.ensure_data_directory_slot(DataDirectoryType::Debug)?;
 
-        // Find the target section.
-        let section_name: String = target_section
-            .map(str::to_string)
-            .or_else(|| {
-                if self.section_by_name(".rdata").is_some() {
-                    Some(".rdata".to_string())
-                } else {
-                    self.sections.last().map(|s| s.name().to_string())
-                }
-            })
-            .unwrap_or_else(|| ".rdata".to_string());
-
-        let section_idx = self.sections.iter().position(|s| s.name() == section_name);
-        let Some(section_idx) = section_idx else {
-            return Err(crate::Error::invalid_section(&section_name));
-        };
-
         // Rebuild each entry together with its kept raw payload, at the RVA of the append.
-        let (append_rva, dir_size) =
-            self.append_section_data(section_idx, target_section.is_some(), |rva| {
-                let (data, dir_size, _) = DebugBuilder::new(rva).try_build(debug_info)?;
-                Ok((data, dir_size))
-            })?;
+        let (append_rva, dir_size) = self.append_section_data(target_section, |rva| {
+            let (data, dir_size, _) = DebugBuilder::new(rva).try_build(debug_info)?;
+            Ok((data, dir_size))
+        })?;
         self.set_data_directory(DataDirectoryType::Debug, append_rva, dir_size);
         // The builder writes no file offset. Set it for the current layout.
         self.synchronize_debug_file_offsets();
@@ -421,8 +376,10 @@ impl PeImage {
 
     /// Write an exception table for the image's architecture.
     ///
-    /// The function appends the table to `target_section`. If `target_section` is `None`, it
-    /// uses ".pdata", then ".rdata", then the last section. Returns the RVA of the table.
+    /// The function appends the table to the section with the index `target_section` in
+    /// [`Self::sections`]. If `target_section` is `None`, the function adds a new section for
+    /// the table. See [Directory updates](crate::PeImage#directory-updates). Returns the RVA
+    /// of the table.
     ///
     /// # Errors
     ///
@@ -431,13 +388,13 @@ impl PeImage {
     /// - The data-directory table has no exception slot, and cannot be extended.
     /// - The table encoding does not match the PE machine type.
     /// - The table cannot be serialized, or its size exceeds `u32`.
-    /// - No target section exists.
-    /// - The layout update fails, or the table does not fit in the target section that you
-    ///   named. See [Directory updates](crate::PeImage#directory-updates).
+    /// - `target_section` is not the index of a section.
+    /// - The layout update fails, or the table does not fit in the selected section. See
+    ///   [Directory updates](crate::PeImage#directory-updates).
     pub fn update_exception_table(
         &mut self,
         table: &crate::exception::ExceptionTable,
-        target_section: Option<&str>,
+        target_section: Option<usize>,
     ) -> Result<u32> {
         use crate::data_dir::DataDirectoryType;
         self.ensure_data_directory_slot(DataDirectoryType::Exception)?;
@@ -470,25 +427,7 @@ impl PeImage {
         let data = table.try_to_bytes()?;
         let size = u32::try_from(data.len())
             .map_err(|_| Error::invalid_data_directory("exception table exceeds u32"))?;
-        let section_name = target_section
-            .map(str::to_string)
-            .or_else(|| self.section_by_name(".pdata").map(|_| ".pdata".to_string()))
-            .or_else(|| self.section_by_name(".rdata").map(|_| ".rdata".to_string()))
-            .or_else(|| {
-                self.sections
-                    .last()
-                    .map(|section| section.name().to_string())
-            })
-            .ok_or_else(|| Error::invalid_section("no section available for exception data"))?;
-        let section_index = self
-            .sections
-            .iter()
-            .position(|section| section.name() == section_name)
-            .ok_or_else(|| Error::invalid_section(&section_name))?;
-        let (rva, ()) =
-            self.append_section_data(section_index, target_section.is_some(), |_| {
-                Ok((data.clone(), ()))
-            })?;
+        let (rva, ()) = self.append_section_data(target_section, |_| Ok((data.clone(), ())))?;
         self.set_data_directory(DataDirectoryType::Exception, rva, size);
         Ok(rva)
     }
@@ -496,16 +435,16 @@ impl PeImage {
     /// Write the exception directory (the `.pdata` array of `RUNTIME_FUNCTION`).
     ///
     /// This function creates the exception directory with the new function entries, or replaces
-    /// the current one. The function sorts a copy of the entries by `begin_address`. If
-    /// `target_section` is `None`, the function uses ".pdata", then ".rdata", then the last
-    /// section.
+    /// the current one. The function sorts a copy of the entries by `begin_address`. It
+    /// appends the table as [`Self::update_exception_table`] does.
     ///
     /// The entries are AMD64 `RUNTIME_FUNCTION` records. For an image of other machine
     /// types, use [`Self::update_exception_table`].
     ///
     /// # Arguments
     /// * `directory` - The exception directory to write.
-    /// * `target_section` - The name of the section that gets the exception data (optional).
+    /// * `target_section` - The index of the section that gets the exception data, or `None`
+    ///   for a new section.
     ///
     /// Returns the RVA of the new exception directory.
     ///
@@ -516,7 +455,7 @@ impl PeImage {
     pub fn update_exception(
         &mut self,
         directory: &crate::exception::ExceptionDirectory,
-        target_section: Option<&str>,
+        target_section: Option<usize>,
     ) -> Result<u32> {
         let mut sorted = directory.clone();
         sorted.sort();
@@ -571,26 +510,28 @@ impl PeImage {
     /// Write the load config directory (`IMAGE_LOAD_CONFIG_DIRECTORY32` or
     /// `IMAGE_LOAD_CONFIG_DIRECTORY64`).
     ///
-    /// This function creates the `LoadConfig` directory, or replaces the current one. If
-    /// `target_section` is `None`, the function uses ".rdata". If ".rdata" does not exist, it
-    /// uses the last section. See [Directory updates](crate::PeImage#directory-updates) for
-    /// the fallback if the data does not fit.
+    /// This function creates the `LoadConfig` directory, or replaces the current one. It
+    /// appends the structure to the section with the index `target_section` in
+    /// [`Self::sections`]. If `target_section` is `None`, the function adds a new section for
+    /// the structure. See [Directory updates](crate::PeImage#directory-updates).
     ///
     /// The structure holds VAs, for example `SecurityCookie` and the CFG pointers. If the image
     /// has a base relocation directory, the function adds a `HIGHLOW` (PE32) or `DIR64`
     /// (PE32+) relocation for each VA field that is not zero. This includes the VA fields in
-    /// `trailing_data`, up to `GuardMemcpyFunctionPointer`.
+    /// `trailing_data`, up to `GuardMemcpyFunctionPointer`. If the relocation table does not
+    /// fit in place, it goes to the section that gets the structure.
     ///
     /// # Arguments
     /// * `config` - The `LoadConfig` directory to write.
-    /// * `target_section` - The name of the section that gets the `LoadConfig` data (optional).
+    /// * `target_section` - The index of the section that gets the `LoadConfig` data, or
+    ///   `None` for a new section.
     ///
     /// Returns the RVA of the new `LoadConfig` directory.
     ///
     /// # Errors
     ///
     /// Returns an error if the data-directory table has no load config slot
-    /// and cannot be extended, if the target section does not exist, if the
+    /// and cannot be extended, if `target_section` is not the index of a section, if the
     /// structure cannot be serialized, or if the append fails (see
     /// [Directory updates](crate::PeImage#directory-updates)). Also returns an error if the
     /// base relocations cannot be parsed or written. If an error occurs, the image does not
@@ -598,7 +539,7 @@ impl PeImage {
     pub fn update_load_config(
         &mut self,
         config: &crate::loadconfig::LoadConfigDirectory,
-        target_section: Option<&str>,
+        target_section: Option<usize>,
     ) -> Result<u32> {
         self.transact(|image| image.update_load_config_in(config, target_section))
     }
@@ -608,28 +549,11 @@ impl PeImage {
     fn update_load_config_in(
         &mut self,
         config: &crate::loadconfig::LoadConfigDirectory,
-        target_section: Option<&str>,
+        target_section: Option<usize>,
     ) -> Result<u32> {
         use crate::data_dir::DataDirectoryType;
         use crate::loadconfig::LoadConfigBuilder;
         self.ensure_data_directory_slot(DataDirectoryType::LoadConfig)?;
-
-        // Find the target section.
-        let section_name: String = target_section
-            .map(str::to_string)
-            .or_else(|| {
-                if self.section_by_name(".rdata").is_some() {
-                    Some(".rdata".to_string())
-                } else {
-                    self.sections.last().map(|s| s.name().to_string())
-                }
-            })
-            .unwrap_or_else(|| ".rdata".to_string());
-
-        let section_idx = self.sections.iter().position(|s| s.name() == section_name);
-        let Some(section_idx) = section_idx else {
-            return Err(crate::Error::invalid_section(&section_name));
-        };
 
         // Build the LoadConfig data.
         let builder = LoadConfigBuilder::new(self.is_64bit());
@@ -641,11 +565,10 @@ impl PeImage {
 
         // Append the data to the section.
         let (append_rva, ()) =
-            self.append_section_data(section_idx, target_section.is_some(), |_| {
-                Ok((data.clone(), ()))
-            })?;
+            self.append_section_data(target_section, |_| Ok((data.clone(), ())))?;
         self.set_data_directory(DataDirectoryType::LoadConfig, append_rva, dir_size);
-        self.add_va_relocations(relocations, append_rva, &va_offsets)?;
+        let section = self.section_index_at(append_rva);
+        self.add_va_relocations(relocations, append_rva, &va_offsets, section)?;
 
         Ok(append_rva)
     }
@@ -666,13 +589,16 @@ impl PeImage {
 
     /// Add a `HIGHLOW` (PE32) or `DIR64` (PE32+) relocation for the VA at each `rva + offset`.
     ///
-    /// Then write `relocations` with [`Self::update_relocations`]. If `relocations` is `None`,
-    /// the image has no base relocation directory, and the function does nothing.
+    /// Then write `relocations` with [`Self::update_relocations`]. If the table does not fit
+    /// in place, it goes to the section at `section`, or to a new section if `section` is
+    /// `None`. If `relocations` is `None`, the image has no base relocation directory, and the
+    /// function does nothing.
     fn add_va_relocations(
         &mut self,
         relocations: Option<crate::reloc::RelocationTable>,
         rva: u32,
         offsets: &[usize],
+        section: Option<usize>,
     ) -> Result<()> {
         let Some(mut relocations) = relocations else {
             return Ok(());
@@ -691,7 +617,7 @@ impl PeImage {
                 relocations.add_highlow(target);
             }
         }
-        self.update_relocations(&relocations, None)?;
+        self.update_relocations(&relocations, section)?;
         Ok(())
     }
 

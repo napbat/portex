@@ -37,9 +37,7 @@ fn relocatable_image(machine: MachineType) -> PeImage {
     } else {
         relocations.add_highlow(0x1010);
     }
-    image
-        .update_relocations(&relocations, Some(".reloc"))
-        .unwrap();
+    image.update_relocations(&relocations, Some(2)).unwrap();
     image
 }
 
@@ -81,7 +79,7 @@ fn moved_pe32_plus_tls_gets_relocations_and_keeps_its_index() {
         callback_rvas: vec![0x1000, 0x1020],
         image_base: base,
     };
-    let tls_rva = image.update_tls(&tls, Some(".rdata")).unwrap();
+    let tls_rva = image.update_tls(&tls, Some(1)).unwrap();
 
     let relocations = relocation_rvas(&image);
     assert!(relocations.contains(&(0x1010, RelocationType::Dir64)));
@@ -166,7 +164,7 @@ fn moved_load_config_gets_relocations() {
     config.se_handler_count = 1;
     config.guard_cf_check_function_pointer = base + 0x2020;
     let rva = image
-        .update_load_config(&LoadConfigDirectory::Config32(config), Some(".rdata"))
+        .update_load_config(&LoadConfigDirectory::Config32(config), Some(1))
         .unwrap();
 
     let relocations = relocation_rvas(&image);

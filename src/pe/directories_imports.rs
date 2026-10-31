@@ -1,6 +1,5 @@
 use super::PeImage;
 use crate::data_dir::DataDirectoryType;
-use crate::prelude::*;
 use crate::{Error, Result};
 
 /// The IAT ranges of an import table that `update_imports` wrote. Each range is
@@ -17,12 +16,9 @@ impl PeImage {
     /// Update the imports.
     ///
     /// The function first tries to replace the data in place. If the data does not fit, the
-    /// function appends it to the target section. If `target_section` is `None`, the function
-    /// uses one of these sections, in this order:
-    /// 1. The section that contains the existing imports.
-    /// 2. `.rdata`.
-    /// 3. The last section, or a new section. See
-    ///    [Directory updates](crate::PeImage#directory-updates).
+    /// function appends it to the section with the index `target_section` in
+    /// [`Self::sections`]. If `target_section` is `None`, the function adds a new section for
+    /// the data. See [Directory updates](crate::PeImage#directory-updates).
     ///
     /// The function keeps the import address table (IAT) of each DLL whose function list is
     /// unchanged: the descriptor keeps its `FirstThunk`. Only the import lookup table, the
@@ -42,10 +38,9 @@ impl PeImage {
     /// - If one section holds all IATs, the directory gets the range from the first IAT to the
     ///   end of the last IAT.
     /// - If the new IATs are in a different section than the kept IATs, the directory gets the
-    ///   range of the kept IATs. The section of the new IATs must then be writable. If the
-    ///   target section is not writable, the function uses the fallback of an unnamed target.
-    ///   The new section of the fallback is writable. If you named the target section, the
-    ///   function returns an error.
+    ///   range of the kept IATs. The section of the new IATs must then be writable. A new
+    ///   section for the data is writable in this case. If `target_section` selects a section
+    ///   that is not writable, the function returns an error.
     /// - If the kept IATs are in more than one section, the IAT data directory does not
     ///   change.
     ///
@@ -57,15 +52,14 @@ impl PeImage {
     /// Returns an error in these conditions. Then the image does not change.
     /// - The data directory table has no IAT slot and cannot be extended.
     /// - The import table cannot be serialized, or its descriptor table does not fit in `u32`.
-    /// - The target section does not exist.
-    /// - The layout update fails, or the data does not fit in the target section that you
-    ///   named. See [Directory updates](crate::PeImage#directory-updates).
-    /// - The new IATs need a writable section, and the target section that you named is not
-    ///   writable.
+    /// - `target_section` is not the index of a section.
+    /// - The layout update fails, or the data does not fit in the selected section. See
+    ///   [Directory updates](crate::PeImage#directory-updates).
+    /// - The new IATs need a writable section, and the selected section is not writable.
     pub fn update_imports(
         &mut self,
         imports: &crate::import::ImportTable,
-        target_section: Option<&str>,
+        target_section: Option<usize>,
     ) -> Result<u32> {
         if imports.is_empty() {
             self.clear_data_directory(DataDirectoryType::Import);
@@ -79,7 +73,7 @@ impl PeImage {
     fn update_imports_in(
         &mut self,
         imports: &crate::import::ImportTable,
-        target_section: Option<&str>,
+        target_section: Option<usize>,
     ) -> Result<u32> {
         use crate::import::ImportTableBuilder;
 
@@ -118,53 +112,15 @@ impl PeImage {
             return Ok(dir.virtual_address);
         }
 
-        // Find the target section for the append, in this order:
-        // 1. The section that the caller specified.
-        // 2. The section that contains the existing imports, if there are imports.
-        // 3. `.rdata`.
-        // 4. The last section.
-        let section_name: String = target_section
-            .map(str::to_string)
-            .or_else(|| {
-                existing_dir
-                    .filter(|dir| dir.is_present())
-                    .and_then(|dir| self.section_by_rva(dir.virtual_address))
-                    .map(|section| section.name().to_string())
-            })
-            .or_else(|| {
-                if self.section_by_name(".rdata").is_some() {
-                    Some(".rdata".to_string())
-                } else {
-                    self.sections.last().map(|s| s.name().to_string())
-                }
-            })
-            .unwrap_or_else(|| ".rdata".to_string());
-
-        // Find the section index. An index prevents borrow problems.
-        let section_idx = self.sections.iter().position(|s| s.name() == section_name);
-        let Some(section_idx) = section_idx else {
-            return Err(Error::invalid_section(section_name));
-        };
-
         // Build the import data at the append RVA, and append it to the section.
-        let (append_rva, ranges) = self.append_section_data_with(
-            section_idx,
-            target_section.is_some(),
-            build_at,
-            |image, index, ranges| needs_writable_iats(image, index, *ranges),
-        )?;
+        let (append_rva, ranges) =
+            self.append_section_data_with(target_section, build_at, |image, index, ranges| {
+                needs_writable_iats(image, index, *ranges)
+            })?;
 
         self.set_data_directory(DataDirectoryType::Import, append_rva, import_size);
         set_iat_directory(self, ranges);
         Ok(append_rva)
-    }
-
-    /// Return the index of the section that [`Self::section_by_rva`] finds for `rva`.
-    fn section_index_at(&self, rva: u32) -> Option<usize> {
-        let section = self.section_by_rva(rva)?;
-        self.sections
-            .iter()
-            .position(|candidate| core::ptr::eq(candidate, section))
     }
 }
 

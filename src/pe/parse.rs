@@ -206,6 +206,7 @@ impl PeImage {
             runtime_image_base: options.runtime_image_base,
             header_tail,
             optional_padding,
+            append_section_name: None,
         })
     }
 

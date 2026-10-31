@@ -1,5 +1,4 @@
 use super::PeImage;
-use crate::prelude::*;
 use crate::{Error, Result};
 
 impl PeImage {
@@ -38,8 +37,11 @@ impl PeImage {
     /// Update the bound imports.
     ///
     /// The function first tries to replace the data in place. If the data does not fit, the
-    /// function appends it to the target section. If the old table is in the header bytes after
-    /// the section table, the function also removes it from these bytes.
+    /// function appends it to the section with the index `target_section` in
+    /// [`Self::sections`]. If `target_section` is `None`, the function adds a new section for
+    /// the data. See [Directory updates](crate::PeImage#directory-updates). If the old table is
+    /// in the header bytes after the section table, the function also removes it from these
+    /// bytes.
     ///
     /// Bound imports are a legacy optimization: the linker resolves the import addresses at link
     /// time. Returns the RVA of the written bound import data. Returns 0 if `directory` has no
@@ -50,13 +52,13 @@ impl PeImage {
     /// Returns an error in these conditions:
     /// - The data directory table has no bound import slot and cannot be extended.
     /// - The descriptors cannot be serialized.
-    /// - The target section does not exist.
-    /// - The layout update fails, or the data does not fit in the target section that you
-    ///   named. See [Directory updates](crate::PeImage#directory-updates).
+    /// - `target_section` is not the index of a section.
+    /// - The layout update fails, or the data does not fit in the selected section. See
+    ///   [Directory updates](crate::PeImage#directory-updates).
     pub fn update_bound_imports(
         &mut self,
         directory: &crate::bound_import::BoundImportDirectory,
-        target_section: Option<&str>,
+        target_section: Option<usize>,
     ) -> Result<u32> {
         use crate::data_dir::DataDirectoryType;
 
@@ -84,36 +86,8 @@ impl PeImage {
             return Ok(dir.virtual_address);
         }
 
-        // Find the target section.
-        let section_name: String = target_section
-            .map(str::to_string)
-            .or_else(|| {
-                if let Some(ref dir) = existing_dir
-                    && dir.is_present()
-                    && let Some(section) = self.section_by_rva(dir.virtual_address)
-                {
-                    return Some(section.name().to_string());
-                }
-                None
-            })
-            .or_else(|| {
-                if self.section_by_name(".rdata").is_some() {
-                    Some(".rdata".to_string())
-                } else {
-                    self.sections.last().map(|s| s.name().to_string())
-                }
-            })
-            .unwrap_or_else(|| ".rdata".to_string());
-
-        let section_idx = self.sections.iter().position(|s| s.name() == section_name);
-        let Some(section_idx) = section_idx else {
-            return Err(crate::Error::invalid_section(section_name));
-        };
-
         let (append_rva, ()) =
-            self.append_section_data(section_idx, target_section.is_some(), |_| {
-                Ok((data.clone(), ()))
-            })?;
+            self.append_section_data(target_section, |_| Ok((data.clone(), ())))?;
         // The old table can be in the header bytes after the section table. Remove it there.
         if let Some(dir) = existing_dir {
             self.header_tail
@@ -182,7 +156,9 @@ impl PeImage {
     /// Update the delay-load imports.
     ///
     /// The function first tries to replace the data in place. If the data does not fit, the
-    /// function appends it to the target section.
+    /// function appends it to the section with the index `target_section` in
+    /// [`Self::sections`]. If `target_section` is `None`, the function adds a new section for
+    /// the data. See [Directory updates](crate::PeImage#directory-updates).
     ///
     /// With delay-load imports, the loader loads a DLL on first use and not at startup.
     /// Returns the RVA of the written delay import data. Returns 0 if `directory` has no DLLs;
@@ -196,10 +172,9 @@ impl PeImage {
     ///
     /// A new DLL, or a DLL whose function list changed, gets a new IAT and a new module handle
     /// in the written data. The delay-load helper writes these slots at run time, without a
-    /// change of protection. Thus the written data then needs a writable section. If the
-    /// target section is not writable, the function uses the fallback of an unnamed target,
-    /// and the new section of the fallback is writable. If you named the target section, the
-    /// function returns an error. Kept tables stay where they are.
+    /// change of protection. Thus the written data then needs a writable section. A new
+    /// section for the data is writable in this case. If `target_section` selects a section
+    /// that is not writable, the function returns an error. Kept tables stay where they are.
     ///
     /// # Caution
     ///
@@ -212,15 +187,15 @@ impl PeImage {
     ///
     /// Returns an error in these conditions:
     /// - The data directory table has no delay import slot and cannot be extended.
-    /// - The target section does not exist.
+    /// - `target_section` is not the index of a section.
     /// - The descriptors cannot be serialized.
-    /// - The layout update fails, or the data does not fit in the target section that you
-    ///   named. See [Directory updates](crate::PeImage#directory-updates).
-    /// - The data has new tables, and the target section that you named is not writable.
+    /// - The layout update fails, or the data does not fit in the selected section. See
+    ///   [Directory updates](crate::PeImage#directory-updates).
+    /// - The data has new tables, and the selected section is not writable.
     pub fn update_delay_imports(
         &mut self,
         directory: &crate::delay_import::DelayImportDirectory,
-        target_section: Option<&str>,
+        target_section: Option<usize>,
     ) -> Result<u32> {
         use crate::data_dir::DataDirectoryType;
 
@@ -243,35 +218,7 @@ impl PeImage {
                 .keep_unchanged(&current)
         };
 
-        // Find the target section first, to get the base RVA.
         let existing_dir = self.data_directory(DataDirectoryType::DelayImport).copied();
-        let section_name: String = target_section
-            .map(str::to_string)
-            .or_else(|| {
-                if let Some(ref dir) = existing_dir
-                    && dir.is_present()
-                    && let Some(section) = self.section_by_rva(dir.virtual_address)
-                {
-                    return Some(section.name().to_string());
-                }
-                None
-            })
-            .or_else(|| {
-                if self.section_by_name(".rdata").is_some() {
-                    Some(".rdata".to_string())
-                } else if self.section_by_name(".didat").is_some() {
-                    Some(".didat".to_string())
-                } else {
-                    self.sections.last().map(|s| s.name().to_string())
-                }
-            })
-            .unwrap_or_else(|| ".rdata".to_string());
-
-        let section_idx = self.sections.iter().position(|s| s.name() == section_name);
-        let Some(section_idx) = section_idx else {
-            return Err(crate::Error::invalid_section(section_name));
-        };
-
         // The delay-load helper writes a new IAT and a new module handle at run time, without
         // a change of protection. Thus new tables need a writable section.
         let needs_write = builder_at(0).has_new_tables(&directory.dlls);
@@ -301,8 +248,7 @@ impl PeImage {
 
         // Build the data at the append RVA, and append it to the section.
         let (base_rva, encoded_size) = self.append_section_data_with(
-            section_idx,
-            target_section.is_some(),
+            target_section,
             |rva| builder_at(rva).try_build(&directory.dlls),
             |_, _, _| needs_write,
         )?;
@@ -381,7 +327,9 @@ impl PeImage {
     /// Update the base relocations.
     ///
     /// The function first tries to replace the data in place. If the data does not fit, the
-    /// function appends it to the target section.
+    /// function appends it to the section with the index `target_section` in
+    /// [`Self::sections`]. If `target_section` is `None`, the function adds a new section for
+    /// the data. See [Directory updates](crate::PeImage#directory-updates).
     ///
     /// Returns the RVA of the written base relocation blocks. Returns 0 if `relocs` has no
     /// blocks; then the function clears the data directory.
@@ -391,13 +339,13 @@ impl PeImage {
     /// Returns an error in these conditions:
     /// - The data directory table has no base relocation slot and cannot be extended.
     /// - The blocks cannot be serialized, or their size does not fit in `u32`.
-    /// - The target section does not exist.
-    /// - The layout update fails, or the data does not fit in the target section that you
-    ///   named. See [Directory updates](crate::PeImage#directory-updates).
+    /// - `target_section` is not the index of a section.
+    /// - The layout update fails, or the data does not fit in the selected section. See
+    ///   [Directory updates](crate::PeImage#directory-updates).
     pub fn update_relocations(
         &mut self,
         relocs: &crate::reloc::RelocationTable,
-        target_section: Option<&str>,
+        target_section: Option<usize>,
     ) -> Result<u32> {
         use crate::data_dir::DataDirectoryType;
 
@@ -427,38 +375,8 @@ impl PeImage {
             return Ok(dir.virtual_address);
         }
 
-        // Find the target section.
-        let section_name: String = target_section
-            .map(str::to_string)
-            .or_else(|| {
-                if let Some(ref dir) = existing_dir
-                    && dir.is_present()
-                    && let Some(section) = self.section_by_rva(dir.virtual_address)
-                {
-                    return Some(section.name().to_string());
-                }
-                None
-            })
-            .or_else(|| {
-                if self.section_by_name(".reloc").is_some() {
-                    Some(".reloc".to_string())
-                } else if self.section_by_name(".rdata").is_some() {
-                    Some(".rdata".to_string())
-                } else {
-                    self.sections.last().map(|s| s.name().to_string())
-                }
-            })
-            .unwrap_or_else(|| ".reloc".to_string());
-
-        let section_idx = self.sections.iter().position(|s| s.name() == section_name);
-        let Some(section_idx) = section_idx else {
-            return Err(crate::Error::invalid_section(section_name));
-        };
-
         let (append_rva, ()) =
-            self.append_section_data(section_idx, target_section.is_some(), |_| {
-                Ok((data.clone(), ()))
-            })?;
+            self.append_section_data(target_section, |_| Ok((data.clone(), ())))?;
         self.set_data_directory(DataDirectoryType::BaseReloc, append_rva, encoded_size);
 
         Ok(append_rva)
@@ -467,7 +385,9 @@ impl PeImage {
     /// Update the resources.
     ///
     /// The function first tries to replace the data in place. If the data does not fit, the
-    /// function appends it to the target section.
+    /// function appends it to the section with the index `target_section` in
+    /// [`Self::sections`]. If `target_section` is `None`, the function adds a new section for
+    /// the data. See [Directory updates](crate::PeImage#directory-updates).
     ///
     /// Parse `directory` with `resources_with_data()`, so that the resource data is available.
     /// Returns the RVA of the written resource directory. Returns 0 if `directory` has no
@@ -479,13 +399,13 @@ impl PeImage {
     /// - The data directory table has no resource slot and cannot be extended.
     /// - The resource data is not loaded.
     /// - The tree cannot be serialized.
-    /// - The target section does not exist.
-    /// - The layout update fails, or the data does not fit in the target section that you
-    ///   named. See [Directory updates](crate::PeImage#directory-updates).
+    /// - `target_section` is not the index of a section.
+    /// - The layout update fails, or the data does not fit in the selected section. See
+    ///   [Directory updates](crate::PeImage#directory-updates).
     pub fn update_resources(
         &mut self,
         directory: &crate::resource::ResourceDirectory,
-        target_section: Option<&str>,
+        target_section: Option<usize>,
     ) -> Result<u32> {
         use crate::data_dir::DataDirectoryType;
 
@@ -515,38 +435,8 @@ impl PeImage {
             }
         }
 
-        // Find the target section.
-        let section_name: String = target_section
-            .map(str::to_string)
-            .or_else(|| {
-                if let Some(ref dir) = existing_dir
-                    && dir.is_present()
-                    && let Some(section) = self.section_by_rva(dir.virtual_address)
-                {
-                    return Some(section.name().to_string());
-                }
-                None
-            })
-            .or_else(|| {
-                if self.section_by_name(".rsrc").is_some() {
-                    Some(".rsrc".to_string())
-                } else if self.section_by_name(".rdata").is_some() {
-                    Some(".rdata".to_string())
-                } else {
-                    self.sections.last().map(|s| s.name().to_string())
-                }
-            })
-            .unwrap_or_else(|| ".rsrc".to_string());
-
-        let section_idx = self.sections.iter().position(|s| s.name() == section_name);
-        let Some(section_idx) = section_idx else {
-            return Err(crate::Error::invalid_section(section_name));
-        };
-
         let (append_rva, size) =
-            self.append_section_data(section_idx, target_section.is_some(), |rva| {
-                builder.try_build(rva)
-            })?;
+            self.append_section_data(target_section, |rva| builder.try_build(rva))?;
         self.set_data_directory(DataDirectoryType::Resource, append_rva, size);
 
         Ok(append_rva)
@@ -558,21 +448,24 @@ impl PeImage {
     /// `update_resources()` with a parsed `ResourceDirectory`.
     ///
     /// The function first tries to replace the data in place. If the data does not fit, the
-    /// function appends it to the target section. Returns the RVA of the written resource
-    /// directory. Returns 0 if the builder is empty; then the function clears the data directory.
+    /// function appends it to the section with the index `target_section` in
+    /// [`Self::sections`]. If `target_section` is `None`, the function adds a new section for
+    /// the data. See [Directory updates](crate::PeImage#directory-updates). Returns the RVA of
+    /// the written resource directory. Returns 0 if the builder is empty; then the function
+    /// clears the data directory.
     ///
     /// # Errors
     ///
     /// Returns an error in these conditions:
     /// - The data directory table has no resource slot and cannot be extended.
     /// - The tree cannot be serialized.
-    /// - The target section does not exist.
-    /// - The layout update fails, or the data does not fit in the target section that you
-    ///   named. See [Directory updates](crate::PeImage#directory-updates).
+    /// - `target_section` is not the index of a section.
+    /// - The layout update fails, or the data does not fit in the selected section. See
+    ///   [Directory updates](crate::PeImage#directory-updates).
     pub fn update_resources_from_builder(
         &mut self,
         builder: &crate::resource::ResourceBuilder,
-        target_section: Option<&str>,
+        target_section: Option<usize>,
     ) -> Result<u32> {
         use crate::data_dir::DataDirectoryType;
 
@@ -596,38 +489,8 @@ impl PeImage {
             }
         }
 
-        // Find the target section.
-        let section_name: String = target_section
-            .map(str::to_string)
-            .or_else(|| {
-                if let Some(ref dir) = existing_dir
-                    && dir.is_present()
-                    && let Some(section) = self.section_by_rva(dir.virtual_address)
-                {
-                    return Some(section.name().to_string());
-                }
-                None
-            })
-            .or_else(|| {
-                if self.section_by_name(".rsrc").is_some() {
-                    Some(".rsrc".to_string())
-                } else if self.section_by_name(".rdata").is_some() {
-                    Some(".rdata".to_string())
-                } else {
-                    self.sections.last().map(|s| s.name().to_string())
-                }
-            })
-            .unwrap_or_else(|| ".rsrc".to_string());
-
-        let section_idx = self.sections.iter().position(|s| s.name() == section_name);
-        let Some(section_idx) = section_idx else {
-            return Err(crate::Error::invalid_section(section_name));
-        };
-
         let (append_rva, size) =
-            self.append_section_data(section_idx, target_section.is_some(), |rva| {
-                builder.try_build(rva)
-            })?;
+            self.append_section_data(target_section, |rva| builder.try_build(rva))?;
         self.set_data_directory(DataDirectoryType::Resource, append_rva, size);
 
         Ok(append_rva)

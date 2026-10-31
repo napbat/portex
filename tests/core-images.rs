@@ -269,7 +269,7 @@ fn relocation_materializes_a_rebased_mapped_image() {
                     }],
                 }],
             },
-            Some(".reloc"),
+            Some(1),
         )
         .unwrap();
     let runtime = preferred + 0x20_0000;
@@ -316,7 +316,7 @@ fn relocated_mapped_tls_uses_the_runtime_base() {
         callback_rvas: vec![0x1000],
         image_base: preferred,
     };
-    let tls_rva = image.update_tls(&tls, Some(".rdata")).unwrap();
+    let tls_rva = image.update_tls(&tls, Some(1)).unwrap();
     let page = tls_rva & !0xfff;
     let offsets = [0u32, 8, 16, 24, 48]
         .into_iter()
@@ -334,7 +334,7 @@ fn relocated_mapped_tls_uses_the_runtime_base() {
                     entries: offsets,
                 }],
             },
-            Some(".reloc"),
+            Some(2),
         )
         .unwrap();
 
