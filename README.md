@@ -65,6 +65,12 @@ Without `std`, parsing, building, mapped images, validation, in-memory readers a
 are still available. `nostdio` then supplies its own traits and error type. An I/O error is an
 `ErrorKind::Io` in both builds.
 
+The `std` feature is not fully additive. It changes the types that `portex::io` re-exports and
+the type in `ErrorKind::Io`. Cargo unifies features, so a different crate in the dependency
+graph can enable `std` for your crate too. Thus `no_std` code must not match on the variants
+of the `no_std` `IoError`. Use `portex::io::is_unexpected_eof` and
+`portex::io::is_interrupted` to examine an I/O error.
+
 ## Core types
 
 | Type | Use it for |
@@ -127,9 +133,11 @@ assert_eq!(relocated.runtime_image_base(), 0x0000_7ff6_0000_0000);
 # Ok::<(), portex::Error>(())
 ```
 
-`PeImage::to_mapped_image()` makes loader-style bytes at the preferred image base.
-`to_mapped_image_at(base)` makes them at a different runtime base. It also applies the
-supported base relocations.
+`PeImage::to_mapped_image()` makes loader-style bytes at the runtime image base of the image
+(`runtime_image_base()`). This is the base that you gave to the parser, for example to
+`parse_mapped_at`, or to `set_runtime_image_base`. If you gave no base, it is the preferred
+image base. `to_mapped_image_at(base)` makes the bytes at a different runtime base. It also
+applies the supported base relocations.
 
 For a remote process or a different random-access source, implement `ReadAt`. Then use one of
 these functions:
@@ -335,16 +343,20 @@ mise run precommit
 The hooks run rustfmt and Clippy on all targets of the crate. They do this with all features
 and with `no_std + alloc`. They also lint the separate fuzz package.
 
-CI runs the same checks. CI also runs the tests and rustdoc with both feature sets.
+CI runs the same checks. CI also runs the tests and rustdoc with both feature sets, builds for
+the `thumbv7em-none-eabi` target without `std`, builds the fuzz targets, and runs
+`cargo-semver-checks`.
 
 Each package manifest denies warnings, the Clippy pedantic group, missing docs and unsafe code.
 The only unsafe code is `BaseAddressReader`. Direct Cargo commands thus apply the same policy.
 The Rust examples in this README compile as doctests.
 
-The fuzz targets are in `fuzz/`. Run them with `cargo-fuzz` on Linux, macOS or WSL:
+The fuzz targets are in `fuzz/`. Run them with `cargo-fuzz` and a nightly toolchain. This works
+on Linux, macOS and Windows (MSVC):
 
 ```bash
 cargo +nightly fuzz run fuzz-pe-headers
+cargo +nightly fuzz run fuzz-pe-image
 cargo +nightly fuzz run fuzz-pe-parse
 ```
 

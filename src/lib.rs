@@ -28,7 +28,8 @@
 //! - **Stream I/O**: `nostdio` supplies the `Read`, `Write` and `Seek` traits and the
 //!   `nostdio::IoError` type. With the `std` feature, these are the `std::io` items. An
 //!   [`ErrorKind::Io`] error holds a `nostdio::IoError` in every build, and [`Error`]
-//!   implements `core::error::Error`.
+//!   implements `core::error::Error`. The `std` feature thus changes these types. See the
+//!   caution in [`io`].
 //!
 //! ## Architecture
 //!
@@ -73,6 +74,7 @@
 //! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 extern crate alloc;
 
 #[cfg(feature = "std")]
@@ -167,6 +169,7 @@ pub use raw::{
     RawResourceDirectory, RawResourceEntry, RawRuntimeFunction, RawRuntimeFunctions, RawUnwindInfo,
 };
 #[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub use reader::FileReader;
 pub use reader::{BaseAddressReader, ReadAt, SeekReader, SliceReader, VecReader};
 pub use reloc::{

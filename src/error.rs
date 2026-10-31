@@ -27,7 +27,11 @@ use core::fmt;
 pub type Result<T> = core::result::Result<T, Error>;
 
 /// Information about the location of an error.
+///
+/// The type is `#[non_exhaustive]`, so that a later release can add fields. Use
+/// [`ErrorContext::new`] and the builder methods to make a context.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ErrorContext {
     /// File offset where the error occurred (if known).
     pub file_offset: Option<u64>,
@@ -115,7 +119,11 @@ impl fmt::Display for ErrorContext {
 }
 
 /// An error from parsing or writing a PE file.
+///
+/// The type is `#[non_exhaustive]`, so that a later release can add fields. Use
+/// [`Error::new`] or a constructor such as [`Error::generic`] to make an error.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Error {
     /// The error kind.
     pub kind: ErrorKind,
@@ -127,22 +135,32 @@ pub struct Error {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ErrorKind {
-    /// I/O error from a `nostdio` stream. With the `std` feature, this is `std::io::Error`.
+    /// I/O error from a `nostdio` stream.
+    ///
+    /// # Caution
+    ///
+    /// The type of the payload depends on the `std` feature. Without `std`, it is the
+    /// `nostdio` error type. With `std`, it is `std::io::Error`. Cargo unifies features, so
+    /// a different crate in the dependency graph can enable `std` and change this type. Thus
+    /// do not match on the variants of the payload. Use
+    /// [`io::is_unexpected_eof`](crate::io::is_unexpected_eof),
+    /// [`io::is_interrupted`](crate::io::is_interrupted) or the [`fmt::Display`] output.
     Io(nostdio::IoError),
     /// Invalid DOS signature (expected "MZ").
     InvalidDosSignature,
     /// Invalid PE signature (expected "PE\0\0").
     InvalidPeSignature,
-    /// Invalid or unsupported machine type.
-    InvalidMachineType(u16),
+    /// Invalid DOS, NT or section-table header, for example an `e_lfanew` value that is not
+    /// valid.
+    InvalidHeader(String),
     /// Invalid optional header magic.
     InvalidOptionalHeaderMagic(u16),
     /// The buffer is too small for the expected data.
     BufferTooSmall {
         /// Number of bytes required.
-        expected: usize,
+        expected: u64,
         /// Number of bytes available.
-        actual: usize,
+        actual: u64,
     },
     /// Invalid section data.
     InvalidSection(String),
@@ -151,9 +169,9 @@ pub enum ErrorKind {
     /// Offset out of bounds.
     OffsetOutOfBounds {
         /// The offset that is out of bounds.
-        offset: usize,
+        offset: u64,
         /// Size of the region that the check used.
-        size: usize,
+        size: u64,
     },
     /// Invalid RVA (the data at this address cannot be read).
     InvalidRva(u32),
@@ -230,10 +248,9 @@ impl Error {
         Self::new(ErrorKind::InvalidPeSignature)
     }
 
-    /// Create an `InvalidMachineType` error.
-    #[must_use]
-    pub fn invalid_machine_type(machine: u16) -> Self {
-        Self::new(ErrorKind::InvalidMachineType(machine))
+    /// Create an `InvalidHeader` error.
+    pub fn invalid_header(msg: impl Into<String>) -> Self {
+        Self::new(ErrorKind::InvalidHeader(msg.into()))
     }
 
     /// Create an `InvalidOptionalHeaderMagic` error.
@@ -242,9 +259,15 @@ impl Error {
         Self::new(ErrorKind::InvalidOptionalHeaderMagic(magic))
     }
 
-    /// Create a `BufferTooSmall` error.
+    /// Create a `BufferTooSmall` error from in-memory sizes.
     #[must_use]
     pub fn buffer_too_small(expected: usize, actual: usize) -> Self {
+        Self::buffer_too_small_u64(usize_to_u64(expected), usize_to_u64(actual))
+    }
+
+    /// Create a `BufferTooSmall` error from source sizes.
+    #[must_use]
+    pub fn buffer_too_small_u64(expected: u64, actual: u64) -> Self {
         Self::new(ErrorKind::BufferTooSmall { expected, actual })
     }
 
@@ -258,9 +281,15 @@ impl Error {
         Self::new(ErrorKind::InvalidDataDirectory(msg.into()))
     }
 
-    /// Create an `OffsetOutOfBounds` error.
+    /// Create an `OffsetOutOfBounds` error from an in-memory offset and size.
     #[must_use]
     pub fn offset_out_of_bounds(offset: usize, size: usize) -> Self {
+        Self::offset_out_of_bounds_u64(usize_to_u64(offset), usize_to_u64(size))
+    }
+
+    /// Create an `OffsetOutOfBounds` error from a source offset and size.
+    #[must_use]
+    pub fn offset_out_of_bounds_u64(offset: u64, size: u64) -> Self {
         Self::new(ErrorKind::OffsetOutOfBounds { offset, size })
     }
 
@@ -282,6 +311,12 @@ impl Error {
     }
 }
 
+/// Convert an in-memory size to a `u64`. Each supported target has a `usize` of at most 64
+/// bits, so the fallback value never occurs.
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 impl fmt::Display for ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -290,7 +325,7 @@ impl fmt::Display for ErrorKind {
             ErrorKind::InvalidPeSignature => {
                 write!(f, "Invalid PE signature (expected 'PE\\0\\0')")
             }
-            ErrorKind::InvalidMachineType(m) => write!(f, "Invalid machine type: {m:#06x}"),
+            ErrorKind::InvalidHeader(msg) => write!(f, "Invalid header: {msg}"),
             ErrorKind::InvalidOptionalHeaderMagic(m) => {
                 write!(f, "Invalid optional header magic: {m:#06x}")
             }
