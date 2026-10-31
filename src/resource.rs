@@ -444,7 +444,11 @@ impl Resource {
 }
 
 /// Parsed resource directory.
+///
+/// Later versions can add fields, for example the headers of the other directories. Start
+/// from [`Self::default`] or a parse result.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ResourceDirectory {
     /// The header of the root `IMAGE_RESOURCE_DIRECTORY`, as the parser read it.
     ///
