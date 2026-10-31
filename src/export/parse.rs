@@ -19,10 +19,13 @@ impl ExportTable {
     /// Returns an error in these conditions:
     /// - `export_size` is smaller than `IMAGE_EXPORT_DIRECTORY`.
     /// - The parser cannot read the directory, a table, a name or a forwarder string.
-    /// - The function count is more than the safety limit, or less than the name count.
+    /// - The function count is more than the safety limit.
     /// - A table is outside the export directory range.
     /// - An RVA or an ordinal overflows.
     /// - A name refers to an empty slot in the address table.
+    /// - The names and aliases together hold more bytes than `export_size`. Valid names are
+    ///   in the export directory range and do not share bytes, so this limit stops a
+    ///   malformed table that points many names at one string.
     pub fn parse<F>(export_rva: u32, export_size: u32, read_at_rva: F) -> Result<Self>
     where
         F: Fn(u32, usize) -> Option<Vec<u8>>,
@@ -105,6 +108,10 @@ impl ExportTable {
         Self::validate_tables(dir, export_rva, export_size)?;
         let mut exports =
             Self::read_address_table(read_at_rva, dir, export_rva, export_size, export_end)?;
+        let mut binder = NameBinder {
+            slots: eat_slot_map(dir, &exports)?,
+            remaining: export_size as usize,
+        };
         for index in 0..dir.number_of_names {
             Self::read_name_entry(
                 read_at_rva,
@@ -112,6 +119,7 @@ impl ExportTable {
                 index,
                 export_rva,
                 export_size,
+                &mut binder,
                 &mut exports,
             )?;
         }
@@ -224,6 +232,7 @@ impl ExportTable {
         index: u32,
         export_rva: u32,
         export_size: u32,
+        binder: &mut NameBinder,
         exports: &mut [ExportedFunction],
     ) -> Result<()>
     where
@@ -259,15 +268,15 @@ impl ExportTable {
             export_size,
             "export function name",
         )?;
+        binder.take(&name)?;
 
-        // Find the export that has this ordinal.
-        let ordinal = dir
-            .base
-            .checked_add(u32::from(ord_index))
-            .ok_or_else(|| Error::invalid_data_directory("export ordinal overflow"))?;
-        let export = exports
-            .iter_mut()
-            .find(|export| export.ordinal == ordinal)
+        // Find the export that has this EAT index.
+        let export = binder
+            .slots
+            .get(usize::from(ord_index))
+            .copied()
+            .flatten()
+            .and_then(|position| exports.get_mut(position as usize))
             .ok_or_else(|| {
                 Error::invalid_data_directory(format!(
                     "export name references empty function slot {ord_index}"
@@ -280,6 +289,55 @@ impl ExportTable {
         }
         Ok(())
     }
+}
+
+/// The state that binds names to exports.
+struct NameBinder {
+    /// The position in the export list of each EAT index. See [`eat_slot_map`].
+    slots: Vec<Option<u32>>,
+    /// The number of name bytes that the parser can still read.
+    remaining: usize,
+}
+
+impl NameBinder {
+    /// Subtract the size of `name` and its NUL terminator from the budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the budget is too small.
+    fn take(&mut self, name: &str) -> Result<()> {
+        self.remaining = name
+            .len()
+            .checked_add(1)
+            .and_then(|size| self.remaining.checked_sub(size))
+            .ok_or_else(|| {
+                Error::invalid_data_directory(
+                    "export names hold more bytes than the export directory",
+                )
+            })?;
+        Ok(())
+    }
+}
+
+/// Map each EAT index that a name can refer to (0 to `u16::MAX`) to the position of its export.
+///
+/// Empty EAT slots map to `None`.
+fn eat_slot_map(dir: &ExportDirectory, exports: &[ExportedFunction]) -> Result<Vec<Option<u32>>> {
+    let len = dir.number_of_functions.min(u32::from(u16::MAX) + 1) as usize;
+    let mut slots = vec![None; len];
+    for (position, export) in exports.iter().enumerate() {
+        let index = export
+            .ordinal
+            .checked_sub(dir.base)
+            .ok_or_else(|| Error::invalid_data_directory("export ordinal underflow"))?;
+        if let Some(slot) = slots.get_mut(index as usize) {
+            *slot = Some(
+                u32::try_from(position)
+                    .map_err(|_| Error::invalid_data_directory("export count exceeds u32"))?,
+            );
+        }
+    }
+    Ok(slots)
 }
 
 /// Read exactly `N` bytes at `rva` through `read_at_rva`.

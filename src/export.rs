@@ -222,13 +222,17 @@ impl ExportTable {
 
     /// Add an exported function at an RVA.
     ///
-    /// The new export gets the ordinal after the highest existing ordinal.
-    /// If the table has no exports, the new export gets the ordinal base.
+    /// The new export gets the ordinal after the ordinal of the last export in
+    /// [`Self::exports`]. If the table has no exports, the new export gets the ordinal base.
+    /// The function does not examine the other exports, so a sequence of N additions takes
+    /// O(N) time. If you change or reorder [`Self::exports`] so that the last export does not
+    /// have the highest ordinal, two exports can get the same ordinal;
+    /// [`ExportTableBuilder::try_build`] then returns an error.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::invalid_data_directory`] if the highest existing
-    /// ordinal is `u32::MAX`.
+    /// Returns [`Error::invalid_data_directory`] if the ordinal of the last
+    /// export is `u32::MAX`.
     pub fn try_add_export(&mut self, name: Option<&str>, rva: u32) -> Result<()> {
         self.push_export(name, ExportAddress::Rva(rva))
     }
@@ -245,22 +249,27 @@ impl ExportTable {
 
     /// Add a forwarded export.
     ///
-    /// The new export gets the ordinal after the highest existing ordinal.
-    /// If the table has no exports, the new export gets the ordinal base.
+    /// The new export gets the ordinal after the ordinal of the last export in
+    /// [`Self::exports`]. If the table has no exports, the new export gets the ordinal base.
+    /// The function does not examine the other exports, so a sequence of N additions takes
+    /// O(N) time. If you change or reorder [`Self::exports`] so that the last export does not
+    /// have the highest ordinal, two exports can get the same ordinal;
+    /// [`ExportTableBuilder::try_build`] then returns an error.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::invalid_data_directory`] if the highest existing
-    /// ordinal is `u32::MAX`.
+    /// Returns [`Error::invalid_data_directory`] if the ordinal of the last
+    /// export is `u32::MAX`.
     pub fn try_add_forwarder(&mut self, name: Option<&str>, forward_to: &str) -> Result<()> {
         self.push_export(name, ExportAddress::Forwarder(forward_to.to_string()))
     }
 
-    /// Push an export with the next free ordinal.
+    /// Push an export with the ordinal after the ordinal of the last export.
     fn push_export(&mut self, name: Option<&str>, address: ExportAddress) -> Result<()> {
-        let ordinal = match self.exports.iter().map(|e| e.ordinal).max() {
+        let ordinal = match self.exports.last() {
             None => self.directory.base,
-            Some(highest) => highest
+            Some(last) => last
+                .ordinal
                 .checked_add(1)
                 .ok_or_else(|| Error::invalid_data_directory("export ordinal overflow"))?,
         };

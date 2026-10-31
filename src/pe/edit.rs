@@ -179,8 +179,10 @@ impl PeImage {
     ///
     /// Returns an error in these conditions:
     /// - The data directory table has no export slot and cannot be extended.
-    /// - The export table cannot be serialized (see
-    ///   [`crate::export::ExportTableBuilder::try_build`]).
+    /// - The export table cannot be serialized, for example because two exports have the same
+    ///   ordinal or the same name, a name is empty, or a named export has RVA 0 (see
+    ///   [`crate::export::ExportTableBuilder::try_calculate_size`]). The function does not
+    ///   change the image in this condition.
     /// - The target section does not exist.
     /// - The append breaks the image layout.
     pub fn update_exports(
@@ -195,10 +197,9 @@ impl PeImage {
             self.clear_data_directory(DataDirectoryType::Export);
             return Ok(0);
         }
-        self.ensure_data_directory_slot(DataDirectoryType::Export)?;
-
-        // Calculate the required size.
+        // Calculate the required size. This also validates the table before the image changes.
         let required_size = ExportTableBuilder::try_calculate_size(exports)?;
+        self.ensure_data_directory_slot(DataDirectoryType::Export)?;
 
         // Try to replace the data in place.
         let existing_dir = self.data_directory(DataDirectoryType::Export).copied();

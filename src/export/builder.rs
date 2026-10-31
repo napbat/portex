@@ -38,6 +38,10 @@ impl ExportTableBuilder {
     /// Returns an error in these conditions:
     /// - An export ordinal is below the ordinal base, or two exports have the same ordinal.
     /// - The ordinal index of a named export does not fit in `u16`.
+    /// - A named export has the address `ExportAddress::Rva(0)`. The parser reads RVA 0 as an
+    ///   empty slot.
+    /// - A name or an alias is empty, or two names or aliases are equal. The loader finds a
+    ///   name with a binary search, so each name must be unique.
     /// - The sparse address table is larger than the safety limit.
     /// - A name or a forwarder contains a NUL byte.
     /// - A size overflows.
@@ -354,6 +358,7 @@ struct ExportDimensions {
 
 fn export_dimensions(table: &ExportTable) -> Result<ExportDimensions> {
     let mut ordinals = BTreeSet::new();
+    let mut names = BTreeSet::new();
     let mut function_count = 0usize;
     let mut named_count = 0usize;
     for export in &table.exports {
@@ -387,6 +392,25 @@ fn export_dimensions(table: &ExportTable) -> Result<ExportDimensions> {
                 "named export ordinal {} is too far above base {}",
                 export.ordinal, table.directory.base
             )));
+        }
+        if names_for_export != 0 && export.address == ExportAddress::Rva(0) {
+            return Err(Error::invalid_data_directory(format!(
+                "named export ordinal {} has RVA 0, which is an empty address-table slot",
+                export.ordinal
+            )));
+        }
+        for name in export.name.iter().chain(export.aliases.iter()) {
+            if name.is_empty() {
+                return Err(Error::invalid_data_directory(format!(
+                    "export ordinal {} has an empty name",
+                    export.ordinal
+                )));
+            }
+            if !names.insert(name.as_str()) {
+                return Err(Error::invalid_data_directory(format!(
+                    "duplicate export name {name:?}"
+                )));
+            }
         }
         named_count = named_count
             .checked_add(names_for_export)
