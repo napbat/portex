@@ -166,6 +166,20 @@ pub const MAX_NUMBER_OF_SECTIONS: usize = 65535;
 /// A parsed PE file that owns its section data.
 ///
 /// This is the main type to read, change, and write PE files.
+///
+/// # Directory updates
+///
+/// Some `update_*` methods (for example [`Self::update_imports`]) first try to write the new
+/// table over the current one. When an `update_*` method appends a table to a section, these
+/// rules apply:
+///
+/// - The data starts at an 8-byte aligned RVA after the `VirtualSize` of the section. The
+///   method fills the space before it with zeros.
+/// - The method never moves a section. If the data does not fit before the next section and
+///   you named the target section, the method returns an error.
+/// - If you did not name a section, the method appends the data to the last section. If the
+///   last section is not readable or has uninitialized data, the method adds a new `.portex`
+///   section.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeImage {
     /// The DOS header (`IMAGE_DOS_HEADER`).

@@ -197,7 +197,8 @@ impl PeImage {
     /// - The data directory table has no IAT slot and cannot be extended.
     /// - The import table cannot be serialized, or its descriptor table does not fit in `u32`.
     /// - The target section does not exist.
-    /// - The append breaks the image layout.
+    /// - The layout update fails, or the data does not fit in the target section that you
+    ///   named. See [Directory updates](crate::PeImage#directory-updates).
     pub fn update_imports(
         &mut self,
         imports: &crate::import::ImportTable,
@@ -303,7 +304,8 @@ impl PeImage {
     ///   [`crate::export::ExportTableBuilder::try_calculate_size`]). The function does not
     ///   change the image in this condition.
     /// - The target section does not exist.
-    /// - The append breaks the image layout.
+    /// - The layout update fails, or the data does not fit in the target section that you
+    ///   named. See [Directory updates](crate::PeImage#directory-updates).
     pub fn update_exports(
         &mut self,
         exports: &crate::export::ExportTable,

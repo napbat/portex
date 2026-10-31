@@ -51,7 +51,8 @@ impl PeImage {
     /// - The data directory table has no bound import slot and cannot be extended.
     /// - The descriptors cannot be serialized.
     /// - The target section does not exist.
-    /// - The append breaks the image layout.
+    /// - The layout update fails, or the data does not fit in the target section that you
+    ///   named. See [Directory updates](crate::PeImage#directory-updates).
     pub fn update_bound_imports(
         &mut self,
         directory: &crate::bound_import::BoundImportDirectory,
@@ -206,7 +207,8 @@ impl PeImage {
     /// - The data directory table has no delay import slot and cannot be extended.
     /// - The target section does not exist.
     /// - The descriptors cannot be serialized.
-    /// - The append breaks the image layout.
+    /// - The layout update fails, or the data does not fit in the target section that you
+    ///   named. See [Directory updates](crate::PeImage#directory-updates).
     pub fn update_delay_imports(
         &mut self,
         directory: &crate::delay_import::DelayImportDirectory,
@@ -372,7 +374,8 @@ impl PeImage {
     /// - The data directory table has no base relocation slot and cannot be extended.
     /// - The blocks cannot be serialized, or their size does not fit in `u32`.
     /// - The target section does not exist.
-    /// - The append breaks the image layout.
+    /// - The layout update fails, or the data does not fit in the target section that you
+    ///   named. See [Directory updates](crate::PeImage#directory-updates).
     pub fn update_relocations(
         &mut self,
         relocs: &crate::reloc::RelocationTable,
@@ -459,7 +462,8 @@ impl PeImage {
     /// - The resource data is not loaded.
     /// - The tree cannot be serialized.
     /// - The target section does not exist.
-    /// - The append breaks the image layout.
+    /// - The layout update fails, or the data does not fit in the target section that you
+    ///   named. See [Directory updates](crate::PeImage#directory-updates).
     pub fn update_resources(
         &mut self,
         directory: &crate::resource::ResourceDirectory,
@@ -545,7 +549,8 @@ impl PeImage {
     /// - The data directory table has no resource slot and cannot be extended.
     /// - The tree cannot be serialized.
     /// - The target section does not exist.
-    /// - The append breaks the image layout.
+    /// - The layout update fails, or the data does not fit in the target section that you
+    ///   named. See [Directory updates](crate::PeImage#directory-updates).
     pub fn update_resources_from_builder(
         &mut self,
         builder: &crate::resource::ResourceBuilder,

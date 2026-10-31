@@ -72,7 +72,8 @@ impl PeImage {
     ///
     /// Returns an error if the data-directory table has no TLS slot and cannot
     /// be extended, if the target section does not exist, if the TLS data
-    /// cannot be serialized, or if appending it breaks the image layout. Also returns an
+    /// cannot be serialized, or if the append fails (see
+    /// [Directory updates](crate::PeImage#directory-updates)). Also returns an
     /// error if the base relocations cannot be parsed or written.
     pub fn update_tls(
         &mut self,
@@ -169,8 +170,8 @@ impl PeImage {
     ///
     /// Returns an error if the data-directory table has no debug slot and
     /// cannot be extended, if the target section does not exist, if the
-    /// `CodeView` record cannot be serialized, or if appending it breaks the
-    /// image layout.
+    /// `CodeView` record cannot be serialized, or if the append fails (see
+    /// [Directory updates](crate::PeImage#directory-updates)).
     pub fn update_debug_codeview(
         &mut self,
         codeview: &crate::debug::CodeViewRsds,
@@ -217,8 +218,8 @@ impl PeImage {
     ///
     /// Returns an error if the data-directory table has no debug slot and
     /// cannot be extended, if the target section does not exist, if the debug
-    /// entries cannot be serialized, or if appending them breaks the image
-    /// layout.
+    /// entries cannot be serialized, or if the append fails (see
+    /// [Directory updates](crate::PeImage#directory-updates)).
     pub fn update_debug(
         &mut self,
         debug_info: &crate::debug::DebugInfo,
@@ -415,7 +416,8 @@ impl PeImage {
     /// - The table encoding does not match the PE machine type.
     /// - The table cannot be serialized, or its size exceeds `u32`.
     /// - No target section exists.
-    /// - Appending the table breaks the image layout.
+    /// - The layout update fails, or the table does not fit in the target section that you
+    ///   named. See [Directory updates](crate::PeImage#directory-updates).
     pub fn update_exception_table(
         &mut self,
         table: &crate::exception::ExceptionTable,
@@ -572,8 +574,9 @@ impl PeImage {
     ///
     /// Returns an error if the data-directory table has no load config slot
     /// and cannot be extended, if the target section does not exist, if the
-    /// structure cannot be serialized, or if appending it breaks the image
-    /// layout. Also returns an error if the base relocations cannot be parsed or written.
+    /// structure cannot be serialized, or if the append fails (see
+    /// [Directory updates](crate::PeImage#directory-updates)). Also returns an error if the
+    /// base relocations cannot be parsed or written.
     pub fn update_load_config(
         &mut self,
         config: &crate::loadconfig::LoadConfigDirectory,
