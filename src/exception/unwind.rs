@@ -5,8 +5,12 @@ use crate::prelude::*;
 use crate::{Error, Result};
 
 /// An x64 unwind operation code (`UWOP_*`).
+///
+/// The enum is `#[non_exhaustive]`: the 4-bit code space has unused values 11 to 15, which a
+/// later version of the format can define.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum UnwindOpCode {
     /// Push a nonvolatile integer register.
     PushNonVol = 0,
@@ -20,9 +24,12 @@ pub enum UnwindOpCode {
     SaveNonVol = 4,
     /// Save a nonvolatile integer register on the stack with a far offset.
     SaveNonVolFar = 5,
-    /// Describe the function epilog.
+    /// Describe the function epilog (`UWOP_EPILOG`).
+    ///
+    /// Only version 2 of `UNWIND_INFO` defines this code. [`Self::from_u8`] decodes the value
+    /// 6 for every version. Check [`UnwindInfo::version`] before you use it.
     Epilog = 6,
-    /// Reserved.
+    /// Reserved (`UWOP_SPARE_CODE`).
     SpareCode = 7,
     /// Save an XMM(128) register on the stack.
     SaveXmm128 = 8,
@@ -55,7 +62,11 @@ impl UnwindOpCode {
     }
 }
 
-/// One x64 unwind code entry (`UNWIND_CODE`).
+/// One x64 unwind code slot (`UNWIND_CODE`).
+///
+/// An operation uses one, two or three slots. `AllocLarge`, `SaveNonVol`, `SaveNonVolFar`,
+/// `SaveXmm128` and `SaveXmm128Far` keep their operand in the slots that follow. In such a
+/// data slot, [`Self::op_code`] and [`Self::op_info`] have no meaning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnwindCode {
     /// Offset in the prolog of the end of the instruction for this operation.
@@ -93,32 +104,38 @@ pub const UNW_FLAG_CHAININFO: u8 = 4;
 const HANDLER_RVA_SIZE: usize = 4;
 
 /// An x64 unwind information record (`UNWIND_INFO`).
+///
+/// The record has no separate field for `CountOfCodes`: the serializer writes the length of
+/// `unwind_codes`. The record has no separate field for the chained `RUNTIME_FUNCTION`
+/// either: `chained_function` holds it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UnwindInfo {
     /// Version (3 bits) and flags (5 bits).
     pub version_flags: u8,
     /// Size of the prolog in bytes.
     pub size_of_prolog: u8,
-    /// Number of unwind codes.
-    pub count_of_codes: u8,
     /// Frame register (4 bits) and frame register offset (4 bits).
     pub frame_reg_and_offset: u8,
-    /// Array of unwind codes.
+    /// The unwind code slots. `CountOfCodes` is the length of this array.
+    ///
+    /// The array holds slots, not operations. See [`UnwindCode`].
     pub unwind_codes: Vec<UnwindCode>,
     /// Exception handler RVA (if `UNW_FLAG_EHANDLER` or `UNW_FLAG_UHANDLER`).
     pub exception_handler: Option<u32>,
-    /// RVA of the chained unwind information (if `UNW_FLAG_CHAININFO`).
-    pub chained_info: Option<u32>,
-    /// The complete chained runtime function entry (if `UNW_FLAG_CHAININFO`).
+    /// The chained `RUNTIME_FUNCTION` entry (if `UNW_FLAG_CHAININFO`).
     pub chained_function: Option<RuntimeFunction>,
     /// Language-specific bytes that follow the exception handler RVA.
+    ///
+    /// The format does not give the length of these bytes. Thus [`Self::parse`] keeps all
+    /// bytes of its input after the handler RVA. Give `parse` a slice that ends where the
+    /// language-specific data ends.
     pub handler_data: Vec<u8>,
 }
 
 impl UnwindInfo {
     /// Minimum size in bytes.
     ///
-    /// The header has `version_flags`, `size_of_prolog`, `count_of_codes` and
+    /// The header has `version_flags`, `size_of_prolog`, `CountOfCodes` and
     /// `frame_reg_and_offset`.
     pub const MIN_SIZE: usize = 4;
 
@@ -160,6 +177,9 @@ impl UnwindInfo {
     }
 
     /// Parse an `UNWIND_INFO` record from the bytes at its RVA.
+    ///
+    /// If the record has a handler, [`Self::handler_data`] gets all bytes of `data` after the
+    /// handler RVA. Thus `data` must end where the language-specific data ends.
     ///
     /// # Errors
     /// Returns an error in these conditions:
@@ -204,7 +224,6 @@ impl UnwindInfo {
         let flags = version_flags >> 3;
 
         let mut exception_handler = None;
-        let mut chained_info = None;
         let mut chained_function = None;
         let mut handler_data = Vec::new();
 
@@ -215,9 +234,7 @@ impl UnwindInfo {
                     data.len(),
                 ));
             }
-            let function = RuntimeFunction::parse(trailer)?;
-            chained_info = Some(function.begin_address);
-            chained_function = Some(function);
+            chained_function = Some(RuntimeFunction::parse(trailer)?);
         } else if (flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER)) != 0 {
             let Some((handler, language_data)) = trailer.split_first_chunk::<HANDLER_RVA_SIZE>()
             else {
@@ -233,11 +250,9 @@ impl UnwindInfo {
         let info = Self {
             version_flags,
             size_of_prolog,
-            count_of_codes,
             frame_reg_and_offset,
             unwind_codes,
             exception_handler,
-            chained_info,
             chained_function,
             handler_data,
         };
@@ -352,7 +367,7 @@ impl UnwindInfo {
                     "chained unwind info cannot contain exception-handler data",
                 ));
             }
-        } else if self.chained_function.is_some() || self.chained_info.is_some() {
+        } else if self.chained_function.is_some() {
             return Err(Error::invalid_data_directory(
                 "chained runtime function present without UNW_FLAG_CHAININFO",
             ));
@@ -422,5 +437,28 @@ mod tests {
             ..UnwindInfo::default()
         };
         assert!(unhandled.try_to_bytes_with_handler_data(&[1]).is_err());
+    }
+
+    /// Before the fix, `count_of_codes` and `chained_info` were fields that serialization
+    /// ignored. A value with default fields did not survive a round trip.
+    #[test]
+    fn serialized_record_round_trips_without_redundant_fields() {
+        let info = UnwindInfo {
+            version_flags: 1 | (UNW_FLAG_CHAININFO << 3),
+            size_of_prolog: 4,
+            unwind_codes: vec![UnwindCode {
+                code_offset: 4,
+                op_and_info: 0x32,
+            }],
+            chained_function: Some(RuntimeFunction {
+                begin_address: 0x1000,
+                end_address: 0x1100,
+                unwind_info_address: 0x2000,
+            }),
+            ..UnwindInfo::default()
+        };
+        let bytes = info.try_to_bytes().unwrap();
+        assert_eq!(bytes[2], 1);
+        assert_eq!(UnwindInfo::parse(&bytes).unwrap(), info);
     }
 }
