@@ -461,3 +461,19 @@ fn a_checksum_that_windows_accepts_stays() {
     assert_eq!(result.kept, []);
     assert_eq!(file.try_build().unwrap(), raw);
 }
+
+#[test]
+fn a_large_size_of_image_stays() {
+    let mut raw = test_image().try_build().unwrap();
+    let field = optional_offset(&raw) + 56;
+    let size_of_image = u32::from_le_bytes(raw[field..field + 4].try_into().unwrap()) + 0x1_0000;
+    put32(&mut raw, field, size_of_image);
+
+    // The loader reserves the extra pages, and code can use them.
+    let mut file = PeFile::parse(&raw).unwrap();
+    let result = file.normalize().unwrap();
+    assert_eq!(result.changes, []);
+    assert_eq!(result.kept, []);
+    assert_eq!(file.optional_header.size_of_image(), size_of_image);
+    assert_eq!(file.try_build().unwrap(), raw);
+}

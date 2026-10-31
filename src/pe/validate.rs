@@ -14,6 +14,11 @@ impl PeImage {
     /// Returns a collection of validation issues (errors and warnings). An empty result means
     /// that the image passed all validation checks.
     ///
+    /// The checksum check covers only the file that [`Self::try_build`] makes. It does not cover
+    /// a file overlay or a certificate table. Thus a correct checksum of a signed file or of a
+    /// file with an overlay gives an `InvalidChecksum` warning here. For a complete raw file,
+    /// use [`crate::PeFile::validate`].
+    ///
     /// # Example
     ///
     /// ```no_run
@@ -31,6 +36,14 @@ impl PeImage {
     /// ```
     #[must_use]
     pub fn validate(&self) -> ValidationResult {
+        self.validate_with_checksum(|| self.try_calculate_checksum())
+    }
+
+    /// Validate the image, and compare a nonzero `CheckSum` with the value from `checksum`.
+    pub(crate) fn validate_with_checksum(
+        &self,
+        checksum: impl FnOnce() -> crate::Result<u32>,
+    ) -> ValidationResult {
         let mut result = ValidationResult::new();
 
         self.validate_header_fields(&mut result);
@@ -46,7 +59,7 @@ impl PeImage {
         self.validate_section_placement(&mut result, file_align, section_align);
         self.validate_section_virtual_overlaps(&mut result);
         self.validate_data_directories(&mut result);
-        self.validate_checksum(&mut result);
+        self.validate_checksum(&mut result, checksum);
 
         result
     }
@@ -564,7 +577,7 @@ impl PeImage {
                 }
                 if dir_type == DataDirectoryType::Security {
                     // Its address is a file offset, and `PeImage` intentionally does not own
-                    // overlay bytes. `PeFile` validates the actual range.
+                    // overlay bytes. `PeFile::validate` checks the certificate table.
                     continue;
                 }
                 let rva = dir.virtual_address;
@@ -591,8 +604,12 @@ impl PeImage {
         }
     }
 
-    /// Check a nonzero `CheckSum` against the computed checksum.
-    fn validate_checksum(&self, result: &mut ValidationResult) {
+    /// Check a nonzero `CheckSum` against the value from `checksum`.
+    fn validate_checksum(
+        &self,
+        result: &mut ValidationResult,
+        checksum: impl FnOnce() -> crate::Result<u32>,
+    ) {
         // Warn only if the checksum is nonzero and does not match.
         let stored_checksum = match &self.optional_header {
             OptionalHeader::Pe32(h) => h.check_sum,
@@ -601,8 +618,8 @@ impl PeImage {
         if stored_checksum == 0 {
             return;
         }
-        // The checksum covers the serialized image. Malformed file data can stop the build.
-        match self.try_calculate_checksum() {
+        // The checksum covers a built file. Malformed file data can stop the build.
+        match checksum() {
             Ok(computed) if computed != stored_checksum => {
                 result.push(ValidationIssue::warning(
                     ValidationCode::InvalidChecksum,

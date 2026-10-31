@@ -24,6 +24,10 @@ const DEBUG_POINTER_OFFSET: usize = 24;
 /// The size of the `PointerToRawData` field in an `IMAGE_DEBUG_DIRECTORY` entry.
 const DEBUG_POINTER_SIZE: usize = 4;
 
+/// The largest number of thunks that [`followed_ranges`] follows in the name tables of the
+/// `Import` and `DelayImport` tables together. Each name table counts once.
+const MAX_FOLLOWED_THUNKS: usize = 1 << 17;
+
 /// The loader view of a raw file that [`PeFile::try_build`](crate::PeFile::try_build) made.
 pub(crate) struct LoaderView<'a> {
     /// The raw file.
@@ -506,11 +510,16 @@ fn range_at(rva: u32, len: usize) -> Range<usize> {
 ///
 /// The walk ignores the directory sizes, because the loader reads up to the null entries. The
 /// parsers of the crate give the limits of the walk: 65,536 descriptors, 1,048,576 thunks per
-/// array, and 65,536 TLS callbacks. If the `Import` or `DelayImport` parse fails, the range
-/// from the directory RVA to the end of the address space is followed. A failed TLS parse gives
-/// no range.
+/// array, and 65,536 TLS callbacks. The walk follows the hint/name entries of a name table only
+/// once, also if many descriptors share the table. It follows at most [`MAX_FOLLOWED_THUNKS`]
+/// thunks in name tables at different RVAs.
+///
+/// If the `Import` or `DelayImport` parse fails, or the walk of its thunks goes past the limit,
+/// the range from the directory RVA to the end of the address space is followed. A failed TLS
+/// parse gives no range.
 fn followed_ranges(image: &PeImage) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
+    let mut walk = ThunkWalk::default();
     let is_64bit = image.is_64bit();
     let thunk_size = if is_64bit { 8 } else { 4 };
     let reader = image.rva_reader();
@@ -522,21 +531,29 @@ fn followed_ranges(image: &PeImage) -> Vec<Range<usize>> {
             .filter(|rva| *rva != 0)
     };
     if let Some(rva) = directory_rva(DataDirectoryType::Import) {
+        let start = ranges.len();
         let walked = ImportTable::parse(rva, is_64bit, read)
             .ok()
-            .and_then(|table| push_import_ranges(&mut ranges, &read, rva, &table, thunk_size));
+            .and_then(|table| {
+                push_import_ranges(&mut ranges, &mut walk, &read, rva, &table, thunk_size)
+            });
         if walked.is_none() {
+            ranges.truncate(start);
             ranges.push(rva as usize..usize::MAX);
         }
     }
     if let Some(rva) = directory_rva(DataDirectoryType::DelayImport) {
+        let start = ranges.len();
+        // A failed import walk can leave name tables whose entries are not in the ranges.
+        walk.name_tables.clear();
         let image_base = image.runtime_image_base();
         let walked = DelayImportDirectory::parse_with_image_base(rva, image_base, is_64bit, read)
             .ok()
             .and_then(|table| {
-                push_delay_import_ranges(&mut ranges, &read, rva, &table, thunk_size)
+                push_delay_import_ranges(&mut ranges, &mut walk, &read, rva, &table, thunk_size)
             });
         if walked.is_none() {
+            ranges.truncate(start);
             ranges.push(rva as usize..usize::MAX);
         }
     }
@@ -557,10 +574,29 @@ fn followed_ranges(image: &PeImage) -> Vec<Range<usize>> {
     merge_ranges(ranges)
 }
 
+/// The state of the thunk walk of [`followed_ranges`]: the name tables that the walk followed,
+/// and the number of thunks that it can still follow.
+struct ThunkWalk {
+    /// The RVAs of the name tables whose hint/name entries are in the ranges.
+    name_tables: BTreeSet<u32>,
+    /// The number of thunks that the walk can still follow.
+    budget: usize,
+}
+
+impl Default for ThunkWalk {
+    fn default() -> Self {
+        Self {
+            name_tables: BTreeSet::new(),
+            budget: MAX_FOLLOWED_THUNKS,
+        }
+    }
+}
+
 /// Add the followed ranges of the import table `table` at `rva` to `ranges`. Return `None`
-/// if a thunk array cannot be read again.
+/// if a thunk array cannot be read again, or if `walk` has no budget for the thunks.
 fn push_import_ranges(
     ranges: &mut Vec<Range<usize>>,
+    walk: &mut ThunkWalk,
     read: &impl Fn(u32, usize) -> Option<Vec<u8>>,
     rva: u32,
     table: &ImportTable,
@@ -587,6 +623,7 @@ fn push_import_ranges(
         });
         push_thunk_ranges(
             ranges,
+            walk,
             read,
             [name_table, descriptor.first_thunk],
             thunk_size,
@@ -597,9 +634,11 @@ fn push_import_ranges(
 }
 
 /// Add the followed ranges of the delay-load import table `table` at `rva` to `ranges`.
-/// Return `None` if a thunk array cannot be read again.
+/// Return `None` if a thunk array cannot be read again, or if `walk` has no budget for the
+/// thunks.
 fn push_delay_import_ranges(
     ranges: &mut Vec<Range<usize>>,
+    walk: &mut ThunkWalk,
     read: &impl Fn(u32, usize) -> Option<Vec<u8>>,
     rva: u32,
     table: &DelayImportDirectory,
@@ -620,6 +659,7 @@ fn push_delay_import_ranges(
         });
         push_thunk_ranges(
             ranges,
+            walk,
             read,
             [
                 descriptor.import_name_table_rva,
@@ -637,10 +677,14 @@ fn push_delay_import_ranges(
 /// `tables` holds the RVA of the name table, from which the parser read `names`, and the RVA
 /// of the address table. Each array has one thunk of `thunk_size` bytes for each item of
 /// `names`, and the null thunk. An RVA of 0 has no array. `names` holds the name length of
-/// each import by name, and `None` for each import by ordinal. Return `None` if the name table
-/// cannot be read again.
+/// each import by name, and `None` for each import by ordinal.
+///
+/// The function adds the hint/name entries of a name table only once. `walk` holds the name
+/// tables that it added. Return `None` if the name table cannot be read again, or if `walk` has
+/// no budget for its thunks.
 fn push_thunk_ranges(
     ranges: &mut Vec<Range<usize>>,
+    walk: &mut ThunkWalk,
     read: &impl Fn(u32, usize) -> Option<Vec<u8>>,
     tables: [u32; 2],
     thunk_size: usize,
@@ -651,9 +695,11 @@ fn push_thunk_ranges(
     for table in tables.into_iter().filter(|table| *table != 0) {
         ranges.push(range_at(table, array_len));
     }
-    if count == 0 {
+    // The parser reads the same names for the same name table.
+    if count == 0 || !walk.name_tables.insert(tables[0]) {
         return Some(());
     }
+    walk.budget = walk.budget.checked_sub(count)?;
     let values = read(tables[0], count.checked_mul(thunk_size)?)?;
     for (value, name_len) in values.chunks_exact(thunk_size).zip(names) {
         let Some(name_len) = name_len else {
@@ -665,4 +711,83 @@ fn push_thunk_ranges(
         ranges.push(range_at(hint_rva, name_len.checked_add(3)?));
     }
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PeBuilder;
+    use crate::coff::MachineType;
+    use crate::section::characteristics::{INITIALIZED_DATA, READ};
+
+    /// The offset of the DLL name in the import section.
+    const NAME: u32 = 0;
+    /// The offset of the thunk array in the import section.
+    const THUNKS: u32 = 0x10;
+    /// The offset of the import descriptor array in the import section.
+    const DESCRIPTORS: u32 = 0x2300;
+    /// The RVA of the import section.
+    const SECTION_RVA: u32 = 0x1000;
+
+    /// Return a PE32+ image with an import table of `count` descriptors. Each descriptor has
+    /// the DLL name at `NAME` and the name table and the address table at the offset that
+    /// `table` returns for it. The thunk array at `THUNKS` has `thunks` imports by ordinal.
+    fn import_image(count: u32, thunks: u64, table: impl Fn(u32) -> u32) -> PeImage {
+        let mut data = vec![0u8; DESCRIPTORS as usize];
+        data[..6].copy_from_slice(b"a.dll\0");
+        for ordinal in 1..=thunks {
+            let offset = (THUNKS as usize) + usize::try_from(ordinal - 1).unwrap() * 8;
+            data[offset..offset + 8].copy_from_slice(&(ordinal | 1 << 63).to_le_bytes());
+        }
+        for index in 0..count {
+            let thunk_rva = SECTION_RVA + table(index);
+            for field in [thunk_rva, 0, 0, SECTION_RVA + NAME, thunk_rva] {
+                data.extend_from_slice(&field.to_le_bytes());
+            }
+        }
+        data.extend_from_slice(&[0; ImportDescriptor::SIZE]);
+        let mut image = PeBuilder::new()
+            .machine(MachineType::Amd64)
+            .add_section(".idata", data, INITIALIZED_DATA | READ)
+            .try_build()
+            .unwrap();
+        assert_eq!(image.sections[0].header.virtual_address, SECTION_RVA);
+        image.set_data_directory(
+            DataDirectoryType::Import,
+            SECTION_RVA + DESCRIPTORS,
+            u32::try_from(ImportDescriptor::SIZE).unwrap(),
+        );
+        image
+    }
+
+    #[test]
+    fn a_shared_thunk_array_counts_once() {
+        let thunks = 1000;
+        let count = u32::try_from(MAX_FOLLOWED_THUNKS / 1000 + 1).unwrap();
+        let image = import_image(count, thunks, |_| THUNKS);
+
+        let rva = |offset: u32| (SECTION_RVA + offset) as usize;
+        let descriptors = rva(DESCRIPTORS);
+        let array_end = rva(THUNKS) + usize::try_from(thunks + 1).unwrap() * 8;
+        assert_eq!(
+            followed_ranges(&image),
+            [
+                rva(NAME)..rva(NAME) + 6,
+                rva(THUNKS)..array_end,
+                descriptors..descriptors + (count as usize + 1) * ImportDescriptor::SIZE,
+            ]
+        );
+    }
+
+    #[test]
+    fn too_many_thunks_protect_the_rest_of_the_address_space() {
+        // Each descriptor uses a different tail of one array, so no name table is shared.
+        let count = 300;
+        let image = import_image(count, 1100, |index| THUNKS + index * 8);
+
+        let descriptors = (SECTION_RVA + DESCRIPTORS) as usize;
+        let ranges = followed_ranges(&image);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], descriptors..usize::MAX);
+    }
 }

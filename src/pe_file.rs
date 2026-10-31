@@ -1,17 +1,20 @@
 //! Lossless raw-file container for PE images, overlays, and certificates.
 
+mod checksum;
+mod normalize;
+mod raw_layout;
+
 use core::ops::{Deref, DerefMut, Range};
 
-use crate::checksum::{calculate_checksum, checksum_field_offset};
 use crate::data_dir::{DataDirectory, DataDirectoryType};
-use crate::pe::{
-    LoaderView, Normalization, NormalizeChange, NormalizeKept, check_sum, normalize_changes,
-    set_check_sum,
-};
 use crate::prelude::*;
 use crate::reader::ReadAt;
 use crate::security::{SecurityBuilder, SecurityDirectory};
 use crate::{Error, PeImage, Result};
+use raw_layout::{
+    PreservedRegion, RawLayoutFingerprint, align_up_usize, certificate_range,
+    collect_preserved_regions, padding_for, raw_image_end, restore_preserved_regions,
+};
 
 #[cfg(feature = "std")]
 use std::fs::File;
@@ -25,34 +28,25 @@ use std::path::Path;
 /// file overlay and the attribute certificate table.
 ///
 /// Use this type if you must keep the overlay byte for byte or keep Authenticode certificates.
+///
+/// `PeFile` dereferences to its [`PeImage`]. The checksum and validation methods of `PeFile`
+/// shadow the methods of [`PeImage`], because they cover the complete file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeFile {
     /// Parsed executable image.
-    pub image: PeImage,
+    image: PeImage,
     overlay: Vec<u8>,
     certificate_range: Option<Range<usize>>,
     /// The Security directory entry of the source, if it does not give a valid certificate table.
-    /// The loader does not use this entry, so the build keeps it as it is.
+    /// The loader does not use this entry. See [`Self::parse`] for the build rules.
     invalid_security: Option<DataDirectory>,
+    /// The file offset where the overlay of the source starts.
+    source_image_end: usize,
     source_layout: RawLayoutFingerprint,
     /// The length of the source, if its headers or raw section data go past its end. The build
     /// of the source layout then keeps this length.
     source_end: Option<usize>,
     preserved_regions: Vec<PreservedRegion>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RawLayoutFingerprint {
-    pe_offset: usize,
-    optional_header_size: usize,
-    size_of_headers: usize,
-    sections: Vec<(u32, u32)>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PreservedRegion {
-    range: Range<usize>,
-    data: Vec<u8>,
 }
 
 impl PeFile {
@@ -70,6 +64,7 @@ impl PeFile {
             overlay: Vec::new(),
             certificate_range: None,
             invalid_security: None,
+            source_image_end: 0,
             source_layout,
             source_end: None,
             preserved_regions: Vec::new(),
@@ -99,7 +94,14 @@ impl PeFile {
     ///   build writes the section data at the rounded offset.
     ///
     /// The loader does not use the Security directory. If it does not give a valid certificate
-    /// table in the overlay, the method ignores it. The build keeps the entry as it is.
+    /// table in the overlay, the method ignores it. The build then uses these rules for the
+    /// entry:
+    ///
+    /// - If the build keeps the layout and the overlay position, it keeps the entry as it is.
+    /// - If the overlay moves, the build moves an entry that points into or after the overlay
+    ///   by the same distance.
+    /// - If the build makes a new layout, it clears an entry that points into the headers or the
+    ///   section data. It also clears an entry whose moved offset does not fit in a `u32`.
     ///
     /// # Errors
     ///
@@ -121,6 +123,7 @@ impl PeFile {
             overlay: data[image_end..].to_vec(),
             certificate_range,
             invalid_security,
+            source_image_end: image_end,
             source_layout,
             source_end: (declared_end > data.len()).then_some(data.len()),
             preserved_regions,
@@ -201,8 +204,15 @@ impl PeFile {
         self.image.clear_security();
     }
 
-    /// Return `true` if the next build can still safely restore the raw gaps in the headers and
-    /// sections of the parsed source.
+    /// Return `true` if the raw layout fields still have the values of the parsed source.
+    ///
+    /// The raw layout fields are `e_lfanew`, `SizeOfOptionalHeader`, `SizeOfHeaders`, and the
+    /// `PointerToRawData` and `SizeOfRawData` of each section. If they do not change, the next
+    /// build tries to keep the source layout and the raw gaps in the headers and sections.
+    ///
+    /// A `true` result does not make sure that the build keeps the layout. The build makes a new
+    /// layout if the current layout cannot hold the edited data. For example, edited header
+    /// bytes can disagree with section data that covers the headers.
     #[must_use]
     pub fn preserves_source_gaps(&self) -> bool {
         RawLayoutFingerprint::from_image(&self.image)
@@ -343,10 +353,75 @@ impl PeFile {
         self.image.clear_security();
     }
 
-    /// Clear the Security directory entry of `pe`, unless it is the invalid entry of the source.
-    fn clear_security_entry(&self, pe: &mut PeImage) {
-        if pe.data_directory(DataDirectoryType::Security).copied() != self.invalid_security {
-            pe.clear_security();
+    /// Return the size of the certificate table, or `None` if the file has no table.
+    fn certificate_size(&self) -> Result<Option<u32>> {
+        let Some(range) = &self.certificate_range else {
+            return Ok(None);
+        };
+        if range.start > range.end || range.end > self.overlay.len() {
+            return Err(Error::invalid_data_directory(
+                "stored certificate range exceeds the overlay",
+            ));
+        }
+        u32::try_from(range.len())
+            .map(Some)
+            .map_err(|_| Error::invalid_data_directory("certificate table size exceeds u32"))
+    }
+
+    /// Set the Security entry of `pe` for a build whose image part ends at the file offset
+    /// `file_end`. `keeps_layout` is `true` if the build keeps the layout of the source.
+    ///
+    /// Return the number of padding bytes before the overlay, which align the certificate
+    /// table to 8 bytes.
+    fn set_security_entry(
+        &self,
+        pe: &mut PeImage,
+        file_end: usize,
+        keeps_layout: bool,
+    ) -> Result<usize> {
+        if let (Some(range), Some(size)) = (&self.certificate_range, self.certificate_size()?) {
+            let position = file_end
+                .checked_add(range.start)
+                .ok_or_else(|| Error::invalid_data_directory("certificate offset overflow"))?;
+            let padding = padding_for(position, 8);
+            let offset = position
+                .checked_add(padding)
+                .and_then(|offset| u32::try_from(offset).ok())
+                .ok_or_else(|| Error::invalid_data_directory("certificate offset exceeds u32"))?;
+            pe.set_data_directory(DataDirectoryType::Security, offset, size);
+            return Ok(padding);
+        }
+        let moved = self
+            .invalid_security
+            .filter(|entry| self.image.data_directory(DataDirectoryType::Security) == Some(entry))
+            .and_then(|entry| {
+                self.moved_invalid_entry(entry, file_end, keeps_layout)
+                    .map(|offset| (offset, entry.size))
+            });
+        match moved {
+            Some((offset, size)) => {
+                pe.set_data_directory(DataDirectoryType::Security, offset, size);
+            }
+            None => pe.clear_security(),
+        }
+        Ok(0)
+    }
+
+    /// Return the file offset of the invalid Security entry `entry` of the source, in a build
+    /// whose image part ends at `file_end`. Return `None` if the build must clear the entry.
+    ///
+    /// An entry that points into or after the overlay moves with the overlay. An entry that
+    /// points into the image stays only if the build keeps the layout.
+    fn moved_invalid_entry(
+        &self,
+        entry: DataDirectory,
+        file_end: usize,
+        keeps_layout: bool,
+    ) -> Option<u32> {
+        let offset = usize::try_from(entry.virtual_address).ok()?;
+        match offset.checked_sub(self.source_image_end) {
+            Some(distance) => u32::try_from(distance.checked_add(file_end)?).ok(),
+            None => keeps_layout.then_some(entry.virtual_address),
         }
     }
 
@@ -364,32 +439,30 @@ impl PeFile {
     ///   raw data goes past the end of the output. Then the appended bytes would be section data.
     pub fn try_build(&self) -> Result<Vec<u8>> {
         let mut pe = self.image.clone();
-        let certificate_size = self
-            .certificate_range
-            .as_ref()
-            .map(|range| {
-                u32::try_from(range.len()).map_err(|_| {
-                    Error::invalid_data_directory("certificate table size exceeds u32")
-                })
-            })
-            .transpose()?;
+        let certificate_size = self.certificate_size()?;
         if let Some(size) = certificate_size {
-            // Reserve the entry before the layout update. The source can have fewer than the
-            // five directory slots that Security needs.
-            pe.set_data_directory(DataDirectoryType::Security, 1, size);
-        } else {
-            self.clear_security_entry(&mut pe);
+            // Reserve the entry before the layout calculations. The source can have fewer than
+            // the five directory slots that Security needs.
+            pe.set_data_directory(DataDirectoryType::Security, 0, size);
         }
         // A layout whose raw data goes past the end of the source can keep the source length
         // only without bytes after it. Otherwise make a new layout.
-        let appends_data = !self.overlay.is_empty() || self.certificate_range.is_some();
+        let appends_data = !self.overlay.is_empty() || certificate_size.is_some();
         let keeps_source_end = self.source_end.is_none() || !appends_data;
-        let preserved_pass =
-            if keeps_source_end && RawLayoutFingerprint::from_image(&pe)? == self.source_layout {
-                pe.try_build_current_layout(self.source_end)?
-            } else {
-                None
-            };
+        let keeps_layout =
+            keeps_source_end && RawLayoutFingerprint::from_image(&pe)? == self.source_layout;
+        // Section data that covers the headers holds the Security entry of the source. Thus set
+        // the entry for the expected end of the image before the first build.
+        let expected_end = match (keeps_layout, self.source_end) {
+            (true, Some(end)) => end,
+            _ => raw_image_end(&pe).unwrap_or_default(),
+        };
+        self.set_security_entry(&mut pe, expected_end, keeps_layout)?;
+        let preserved_pass = if keeps_layout {
+            pe.try_build_current_layout(self.source_end)?
+        } else {
+            None
+        };
         let preserve_layout = preserved_pass.is_some();
         let first_pass = if let Some(bytes) = preserved_pass {
             bytes
@@ -407,39 +480,11 @@ impl PeFile {
             ));
         }
 
-        let prefix_padding = if let Some(range) = &self.certificate_range {
-            if range.start > range.end || range.end > self.overlay.len() {
-                return Err(Error::invalid_data_directory(
-                    "stored certificate range exceeds the overlay",
-                ));
-            }
-            let certificate_position = base_size
-                .checked_add(range.start)
-                .ok_or_else(|| Error::invalid_data_directory("certificate offset overflow"))?;
-            padding_for(certificate_position, 8)
-        } else {
-            0
-        };
-
-        if let Some(range) = &self.certificate_range {
-            let certificate_offset = base_size
-                .checked_add(prefix_padding)
-                .and_then(|offset| offset.checked_add(range.start))
-                .and_then(|offset| u32::try_from(offset).ok())
-                .ok_or_else(|| Error::invalid_data_directory("certificate offset exceeds u32"))?;
-            let certificate_size = certificate_size.ok_or_else(|| {
-                Error::invalid_data_directory("certificate range is missing its encoded size")
-            })?;
-            pe.set_data_directory(
-                DataDirectoryType::Security,
-                certificate_offset,
-                certificate_size,
-            );
-        } else {
-            self.clear_security_entry(&mut pe);
-        }
-
-        let mut output = if preserve_layout {
+        let first_entry = pe.data_directory(DataDirectoryType::Security).copied();
+        let prefix_padding = self.set_security_entry(&mut pe, base_size, preserve_layout)?;
+        let mut output = if pe.data_directory(DataDirectoryType::Security).copied() == first_entry {
+            first_pass
+        } else if preserve_layout {
             pe.try_build_current_layout(self.source_end)?
                 .ok_or_else(|| {
                     Error::invalid_section(
@@ -474,151 +519,6 @@ impl PeFile {
     pub fn build(&self) -> Vec<u8> {
         self.try_build()
             .expect("PeFile build failed: use PeFile::try_build() to handle invalid structures")
-    }
-
-    /// Set malformed header fields and the file layout to normal values, and keep the loader
-    /// view of the image.
-    ///
-    /// The method makes these changes:
-    ///
-    /// - It moves NT headers that overlap the DOS header to offset 0x40. It grows
-    ///   `SizeOfOptionalHeader`, so that the section table follows the optional header.
-    /// - It sets an unknown `Magic`, invalid alignments, `NumberOfRvaAndSizes` and the
-    ///   reserved data directories to valid values.
-    /// - It lays out the raw section data again, so that each section has its own aligned raw
-    ///   range. It also calculates `SizeOfHeaders`, `SizeOfImage` and the code and data size
-    ///   fields again.
-    /// - It corrects a wrong checksum. A checksum of 0 stays 0.
-    ///
-    /// The method builds each fixed copy, called a candidate, and parses it again. It keeps a
-    /// candidate only if the built file keeps the loader view of the built original. The loader
-    /// view covers these items:
-    ///
-    /// - the section RVAs, virtual sizes and characteristics;
-    /// - the section bytes that the loader maps, from the raw offset up to the
-    ///   `FileAlignment`-aligned raw end, limited to the aligned virtual size;
-    /// - the aligned size of the headers, if `SectionAlignment` is valid;
-    /// - the header bytes at the entry point and at each data directory;
-    /// - the header bytes that the followed structures refer to;
-    /// - the nonzero header bytes after the section table.
-    ///
-    /// The followed structures are the structures that the loader reads through RVAs:
-    ///
-    /// - the import descriptor array, up to and including the null descriptor;
-    /// - for each import descriptor, the DLL name with its NUL, and the `OriginalFirstThunk`
-    ///   and `FirstThunk` arrays, up to and including the null thunk;
-    /// - each hint/name entry: 2 bytes, the name and the NUL;
-    /// - the same items for the delay-import table;
-    /// - the TLS callback array, up to and including the null entry.
-    ///
-    /// The method checks only these indirect references. If the import or delay-import table
-    /// does not parse, the bytes from the RVA of that directory to the end of the address
-    /// space are protected.
-    ///
-    /// The only accepted change to section bytes is the rebase of the `PointerToRawData` file
-    /// offsets of the `IMAGE_DEBUG_DIRECTORY` entries. The entries must be in a section without
-    /// `IMAGE_SCN_CNT_CODE` or `IMAGE_SCN_MEM_EXECUTE`, outside other data directories, and
-    /// outside the followed structures.
-    /// [`Normalization::changes`] reports it as [`NormalizeChange::DebugPointers`].
-    ///
-    /// The method corrects a wrong nonzero checksum only if the fix keeps the loader view and
-    /// builds. It does not use a candidate that would make a valid checksum wrong.
-    /// [`Normalization::kept`] names the fixes that the method does not make. The overlay and
-    /// the certificate table stay.
-    ///
-    /// A change invalidates an Authenticode signature. A new layout also drops the file bytes
-    /// between the raw ranges of the sections, which the loader does not map.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if [`Self::try_build`] fails for the file, or if the built file does not
-    /// parse. The file then does not change.
-    pub fn normalize(&mut self) -> Result<Normalization> {
-        let original_bytes = self.try_build()?;
-        let original_view = LoaderView::parse(&original_bytes)?;
-        let original = self.image.clone();
-        let stored = check_sum(&original.optional_header);
-        let valid_checksum = stored != 0
-            && checksum_field_offset(&original_bytes)
-                .is_some_and(|offset| calculate_checksum(&original_bytes, offset) == stored);
-        let (candidates, mut kept) = original.normalize_candidates();
-        let mut moves_debug_offsets = !original_view.keeps_section_data(&original);
-        let mut accepted = false;
-        for candidate in candidates {
-            let (bytes, moved) = match self.try_normalized(candidate, &original_view) {
-                Ok(result) => result,
-                Err(reason) => {
-                    add_kept(&mut kept, reason);
-                    continue;
-                }
-            };
-            if self.normalize_checksum(&bytes, &original_view).is_err() {
-                add_kept(&mut kept, NormalizeKept::Checksum);
-                if valid_checksum {
-                    self.image = original.clone();
-                    continue;
-                }
-            }
-            moves_debug_offsets |= moved;
-            accepted = true;
-            break;
-        }
-        if !accepted
-            && self
-                .normalize_checksum(&original_bytes, &original_view)
-                .is_err()
-        {
-            add_kept(&mut kept, NormalizeKept::Checksum);
-        }
-        let mut changes = normalize_changes(&original, &self.image);
-        if moves_debug_offsets {
-            changes.push(NormalizeChange::DebugPointers);
-        }
-        Ok(Normalization { changes, kept })
-    }
-
-    /// Use `candidate` if its built file keeps the loader view of `original`. Return the built
-    /// file and `true` if the debug file offsets moved. On an error, the image does not change.
-    fn try_normalized(
-        &mut self,
-        candidate: PeImage,
-        original: &LoaderView<'_>,
-    ) -> core::result::Result<(Vec<u8>, bool), NormalizeKept> {
-        let previous = core::mem::replace(&mut self.image, candidate);
-        let result = self
-            .try_build()
-            .map_err(|error| NormalizeKept::Build(error.to_string()))
-            .and_then(|bytes| {
-                let view = LoaderView::parse(&bytes)
-                    .map_err(|error| NormalizeKept::Build(error.to_string()))?;
-                let moved = original.check(&view)?;
-                drop(view);
-                Ok((bytes, moved))
-            });
-        if result.is_err() {
-            self.image = previous;
-        }
-        result
-    }
-
-    /// Correct a wrong nonzero checksum of the file `bytes`, if the fix keeps the loader view
-    /// of `original`. Return the reason if the fix is not made. The image then does not change.
-    fn normalize_checksum(
-        &mut self,
-        bytes: &[u8],
-        original: &LoaderView<'_>,
-    ) -> core::result::Result<(), NormalizeKept> {
-        let stored = check_sum(&self.image.optional_header);
-        let Some(offset) = checksum_field_offset(bytes).filter(|_| stored != 0) else {
-            return Ok(());
-        };
-        let computed = calculate_checksum(bytes, offset);
-        if computed == stored {
-            return Ok(());
-        }
-        let mut candidate = self.image.clone();
-        set_check_sum(&mut candidate.optional_header, computed);
-        self.try_normalized(candidate, original).map(|_| ())
     }
 
     /// Write the complete raw PE file to disk.
@@ -662,183 +562,5 @@ impl Deref for PeFile {
 impl DerefMut for PeFile {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.image
-    }
-}
-
-/// Add `reason` to `kept`, if it is not there.
-fn add_kept(kept: &mut Vec<NormalizeKept>, reason: NormalizeKept) {
-    if !kept.contains(&reason) {
-        kept.push(reason);
-    }
-}
-
-/// Return the file offset after the headers and the raw data of the sections.
-///
-/// The result can be past the end of the file. The raw data starts where the loader reads it.
-fn raw_image_end(pe: &PeImage) -> Result<usize> {
-    let file_alignment = pe.optional_header.file_alignment();
-    let mut image_end = u64::from(pe.optional_header.size_of_headers());
-    for section in &pe.sections {
-        let header = &section.header;
-        if header.pointer_to_raw_data == 0 || header.size_of_raw_data == 0 {
-            continue;
-        }
-        let start = crate::layout::loader_raw_offset(header.pointer_to_raw_data, file_alignment);
-        image_end = image_end.max(u64::from(start) + u64::from(header.size_of_raw_data));
-    }
-    Ok(usize::try_from(image_end)
-        .unwrap_or(usize::MAX)
-        .max(nt_headers_end(pe)?))
-}
-
-/// Return the range of the certificate table, as offsets from the start of the overlay.
-///
-/// The result is `None` if the Security directory is absent, or if it does not give a valid
-/// certificate table in the overlay: inside the file, after `image_end`, aligned to 8 bytes, and
-/// with entries that parse.
-fn certificate_range(pe: &PeImage, data: &[u8], image_end: usize) -> Option<Range<usize>> {
-    let directory = pe
-        .data_directory(DataDirectoryType::Security)
-        .filter(|directory| directory.is_present())?;
-    let start = directory.virtual_address as usize;
-    let end = start.checked_add(directory.size as usize)?;
-    let valid = directory.virtual_address != 0
-        && directory.size != 0
-        && start >= image_end
-        && start.is_multiple_of(8)
-        && data
-            .get(start..end)
-            .is_some_and(|table| SecurityDirectory::parse(table).is_ok());
-    valid.then(|| (start - image_end)..(end - image_end))
-}
-
-/// Return the file offset of the end of the NT headers.
-///
-/// The loader reads the complete section table and optional header, also if they end after
-/// `SizeOfHeaders`.
-fn nt_headers_end(image: &PeImage) -> Result<usize> {
-    image
-        .nt_headers_end()
-        .ok_or_else(|| Error::invalid_section("NT header offset overflow"))
-}
-
-impl RawLayoutFingerprint {
-    fn from_image(image: &PeImage) -> Result<Self> {
-        let pe_offset = usize::try_from(image.dos_header.e_lfanew)
-            .map_err(|_| Error::invalid_section("e_lfanew is negative"))?;
-        Ok(Self {
-            pe_offset,
-            optional_header_size: usize::from(image.coff_header.size_of_optional_header),
-            size_of_headers: image.optional_header.size_of_headers() as usize,
-            sections: image
-                .sections
-                .iter()
-                .map(|section| {
-                    (
-                        section.header.pointer_to_raw_data,
-                        section.header.size_of_raw_data,
-                    )
-                })
-                .collect(),
-        })
-    }
-}
-
-fn collect_preserved_regions(
-    data: &[u8],
-    image: &PeImage,
-    image_end: usize,
-) -> Result<Vec<PreservedRegion>> {
-    // The image keeps the header bytes after the section table and the padding before it, so
-    // the gaps start after them.
-    let headers_end = nt_headers_end(image)?;
-    let header_data_end = image.header_data_end(headers_end).unwrap_or(headers_end);
-
-    let mut regions = Vec::new();
-
-    let file_alignment = image.optional_header.file_alignment();
-    let mut occupied: Vec<Range<usize>> = image
-        .sections
-        .iter()
-        .filter(|section| {
-            section.header.pointer_to_raw_data != 0 && section.header.size_of_raw_data != 0
-        })
-        .map(|section| {
-            // The section data starts where the loader reads it.
-            let start = crate::layout::loader_raw_offset(
-                section.header.pointer_to_raw_data,
-                file_alignment,
-            ) as usize;
-            start..start.saturating_add(section.header.size_of_raw_data as usize)
-        })
-        .collect();
-    occupied.sort_by_key(|range| range.start);
-
-    let mut cursor = header_data_end.min(image_end);
-    for range in occupied {
-        if range.end <= cursor {
-            continue;
-        }
-        if range.start > cursor {
-            push_preserved_region(&mut regions, data, cursor..range.start.min(image_end))?;
-        }
-        cursor = cursor.max(range.end.min(image_end));
-        if cursor >= image_end {
-            break;
-        }
-    }
-    if cursor < image_end {
-        push_preserved_region(&mut regions, data, cursor..image_end)?;
-    }
-    Ok(regions)
-}
-
-fn push_preserved_region(
-    regions: &mut Vec<PreservedRegion>,
-    source: &[u8],
-    range: Range<usize>,
-) -> Result<()> {
-    if range.start >= range.end {
-        return Ok(());
-    }
-    let bytes = source
-        .get(range.clone())
-        .ok_or_else(|| Error::buffer_too_small(range.end, source.len()))?;
-    regions.push(PreservedRegion {
-        range,
-        data: bytes.to_vec(),
-    });
-    Ok(())
-}
-
-fn restore_preserved_regions(output: &mut [u8], regions: &[PreservedRegion]) -> Result<()> {
-    for region in regions {
-        let target = output.get_mut(region.range.clone()).ok_or_else(|| {
-            Error::invalid_section("preserved raw-file region exceeds rebuilt image")
-        })?;
-        if target.len() != region.data.len() {
-            return Err(Error::invalid_section(
-                "preserved raw-file region changed size",
-            ));
-        }
-        target.copy_from_slice(&region.data);
-    }
-    Ok(())
-}
-
-fn align_up_usize(value: usize, alignment: usize) -> Option<usize> {
-    let padding = padding_for(value, alignment);
-    value.checked_add(padding)
-}
-
-fn padding_for(value: usize, alignment: usize) -> usize {
-    if alignment == 0 {
-        return 0;
-    }
-    let remainder = value % alignment;
-    if remainder == 0 {
-        0
-    } else {
-        alignment - remainder
     }
 }

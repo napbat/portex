@@ -25,6 +25,7 @@ use core::fmt;
 
 /// Severity level of a validation issue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum ValidationLevel {
     /// Warning: the PE can be valid, but it has suspicious characteristics.
     Warning,
@@ -47,14 +48,10 @@ impl fmt::Display for ValidationLevel {
 pub enum ValidationCode {
     /// DOS signature is invalid.
     InvalidDosSignature,
-    /// PE signature is invalid.
-    InvalidPeSignature,
     /// Optional header magic is invalid.
     InvalidOptionalMagic,
     /// The entry point is not in a section.
     EntryPointOutOfBounds,
-    /// A data directory RVA is invalid.
-    InvalidDataDirectoryRva,
     /// Sections overlap in the file or in the virtual address space.
     OverlappingSections,
     /// A section RVA or size is invalid.
@@ -95,6 +92,7 @@ impl fmt::Display for ValidationCode {
 
 /// A single validation issue.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ValidationIssue {
     /// Severity of the issue.
     pub level: ValidationLevel,
@@ -159,6 +157,7 @@ impl fmt::Display for ValidationIssue {
 
 /// Collection of validation issues.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ValidationResult {
     /// All validation issues found.
     pub issues: Vec<ValidationIssue>,
@@ -186,12 +185,6 @@ impl ValidationResult {
     #[must_use]
     pub fn has_warnings(&self) -> bool {
         self.issues.iter().any(ValidationIssue::is_warning)
-    }
-
-    /// Check if there are no issues.
-    #[must_use]
-    pub fn is_ok(&self) -> bool {
-        self.issues.is_empty()
     }
 
     /// Get only errors.

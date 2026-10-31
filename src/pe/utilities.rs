@@ -4,7 +4,11 @@ use crate::prelude::*;
 use crate::{Error, Result};
 
 impl PeImage {
-    /// Calculate and return the PE checksum.
+    /// Calculate and return the PE checksum of the image.
+    ///
+    /// The checksum covers only the file that [`Self::try_build`] makes: the headers and the
+    /// raw section data. It does not cover a file overlay or a certificate table. For a complete
+    /// raw file, use [`crate::PeFile::calculate_checksum`].
     ///
     /// # Panics
     ///
@@ -15,7 +19,12 @@ impl PeImage {
             .expect("checksum calculation failed: use try_calculate_checksum()")
     }
 
-    /// Calculate the checksum. Return an error, not a panic, for an invalid edited state.
+    /// Calculate the checksum of the image. Return an error, not a panic, for an invalid edited
+    /// state.
+    ///
+    /// The checksum covers only the file that [`Self::try_build`] makes. It does not cover a
+    /// file overlay or a certificate table. For a complete raw file, use
+    /// [`crate::PeFile::try_calculate_checksum`].
     ///
     /// # Errors
     ///
@@ -27,7 +36,10 @@ impl PeImage {
             .ok_or_else(|| Error::invalid_section("serialized image has no checksum field"))
     }
 
-    /// Update the checksum field in the optional header.
+    /// Set the `CheckSum` field of the optional header to the checksum of the image.
+    ///
+    /// The value is correct only for a file without an overlay or a certificate table. For a
+    /// complete raw file, use [`crate::PeFile::update_checksum`].
     ///
     /// # Panics
     ///
@@ -37,7 +49,11 @@ impl PeImage {
             .expect("checksum update failed: use try_update_checksum()");
     }
 
-    /// Update the `CheckSum` field of the optional header. Return an error, not a panic.
+    /// Set the `CheckSum` field of the optional header to the checksum of the image. Return an
+    /// error, not a panic.
+    ///
+    /// The value is correct only for a file without an overlay or a certificate table. For a
+    /// complete raw file, use [`crate::PeFile::try_update_checksum`].
     ///
     /// # Errors
     ///
@@ -51,7 +67,24 @@ impl PeImage {
         Ok(())
     }
 
-    /// Recalculate the derived layout fields and the checksum.
+    /// Recalculate the derived layout fields and the checksum of the image.
+    ///
+    /// The checksum is correct only for a file without an overlay or a certificate table. For a
+    /// complete raw file, use [`crate::PeFile::finalize`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`Self::try_finalize`] returns an error.
+    pub fn finalize(&mut self) {
+        self.try_finalize()
+            .expect("finalize failed: use try_finalize()");
+    }
+
+    /// Recalculate the derived layout fields and the checksum of the image. Return an error, not
+    /// a panic.
+    ///
+    /// The checksum is correct only for a file without an overlay or a certificate table. For a
+    /// complete raw file, use [`crate::PeFile::try_finalize`].
     ///
     /// # Errors
     ///

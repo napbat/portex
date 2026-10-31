@@ -20,6 +20,7 @@ const MAX_FILE_ALIGNMENT: u32 = 0x1_0000;
 
 /// The result of [`PeFile::normalize`](crate::PeFile::normalize).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Normalization {
     /// The field changes, in header order.
     pub changes: Vec<NormalizeChange>,
@@ -72,7 +73,8 @@ pub enum NormalizeChange {
         /// The new value.
         new: u32,
     },
-    /// `SizeOfImage` changed to the end of the last section.
+    /// `SizeOfImage` grew to the end of the last section. Normalization does not lower a
+    /// larger value, because the loader reserves and maps the extra pages.
     SizeOfImage {
         /// The old value.
         old: u32,
@@ -142,9 +144,12 @@ pub enum NormalizeKept {
     /// `SectionAlignment` is invalid, and no valid value keeps all section RVAs.
     Alignment,
     /// The layout update fails with this error message, for example on an overflow.
+    ///
+    /// The value is a message, not an [`Error`](crate::Error), because `Error` does not
+    /// implement `Clone` or `Eq`.
     Layout(String),
     /// The build of a fixed copy fails, or the built file does not parse. The value is the
-    /// error message.
+    /// error message, as for [`Self::Layout`].
     Build(String),
     /// The checksum fix fails the check: it changes the loader view, or it does not build. A
     /// wrong checksum then stays wrong, or the candidate that needs the fix is not used.
@@ -224,6 +229,16 @@ impl PeImage {
         }
         if let Err(error) = candidate.try_update_layout() {
             return Err(NormalizeKept::Layout(error.to_string()));
+        }
+        // The loader reserves and maps the pages up to `SizeOfImage`. Code can use them, so do
+        // not lower a larger value.
+        let size_of_image = candidate
+            .optional_header
+            .size_of_image()
+            .max(original.optional_header.size_of_image());
+        match &mut candidate.optional_header {
+            OptionalHeader::Pe32(header) => header.size_of_image = size_of_image,
+            OptionalHeader::Pe32Plus(header) => header.size_of_image = size_of_image,
         }
         if !candidate.keeps_sections_of(original) {
             return Err(NormalizeKept::SectionAddresses);
