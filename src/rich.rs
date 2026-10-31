@@ -3,6 +3,8 @@
 //! The Rich header is an undocumented structure. The Microsoft linker inserts it between the
 //! DOS stub and the PE signature. It contains information about the build tools.
 
+mod product;
+
 use crate::prelude::*;
 use crate::{Error, Result};
 
@@ -44,38 +46,17 @@ impl RichEntry {
         (u32::from(self.product_id) << 16) | u32::from(self.build_number)
     }
 
-    /// Return a description of the product, if known.
+    /// Return the name of the product from the published `prodid` table, or `"Unknown"`.
+    ///
+    /// The names come from the `prodid` enumeration of the Microsoft linker, without the
+    /// `prodid` prefix. For example, `0x0102` is `"Linker1400"` and `0x0105` is
+    /// `"Utc1900_CPP"` (the C++ compiler).
     #[must_use]
     pub fn product_name(self) -> &'static str {
-        match self.product_id {
-            0x0001 => "Import (old)",
-            0x0002 => "Linker (old)",
-            0x0004 => "CVTRES (old)",
-            0x0005 => "Import",
-            0x0006 | 0x000F => "Linker",
-            0x0007 => "Export",
-            0x000A => "CVTRES",
-            0x000B => "MASM",
-            0x0010 => "C",
-            0x0011 => "C++",
-            0x0013 => "Resource",
-            0x0040 => "MSIL",
-            0x0093 => "Linker14",
-            0x0094 => "Export14",
-            0x0095 => "MASM14",
-            0x0102 => "CVTRES14",
-            0x0103 => "C14",
-            0x0104 => "C++14",
-            0x0105 => "Import14",
-            0x0106 => "Resource14",
-            0x0109 => "CVTPGD",
-            0x0261 => "C++/CLI",
-            0x0262 => "CPPASM",
-            0x0263 => "Import16",
-            0x0264 => "Export16",
-            0x0265 => "MASM16",
-            _ => "Unknown",
-        }
+        product::PRODUCT_NAMES
+            .get(usize::from(self.product_id))
+            .copied()
+            .unwrap_or("Unknown")
     }
 }
 
@@ -105,52 +86,56 @@ impl RichHeader {
             return None;
         }
 
-        // Search backwards for the literal "Rich" marker, followed by its XOR key. Older Portex
-        // versions incorrectly XORed the marker. Accept that form when you parse, but never
-        // write it. The marker and the key must end at or before the PE header. At least the
-        // 16-byte `DanS` block must come before them.
-        for rich_offset in (0x40 + 16..=pe_offset.checked_sub(8)?).rev() {
+        // Scan the 4-byte aligned offsets one time. Record each valid `DanS` block (marker and
+        // three padding words that hold the key) by its key. Keep the last block for each
+        // parity of the dword index, because the entries between `DanS` and `Rich` must be a
+        // multiple of 8 bytes. A `Rich` marker followed by its key then needs one map look-up.
+        // Older Portex versions incorrectly XORed the marker. Accept that form when you parse,
+        // but never write it. The last match before the PE header wins.
+        let last_rich = pe_offset.checked_sub(8)?;
+        let mut dans_blocks: BTreeMap<u32, [Option<usize>; 2]> = BTreeMap::new();
+        let mut found = None;
+        let mut rich_offset: usize = 0x40 + 16;
+        while rich_offset <= last_rich {
+            let start = rich_offset.checked_sub(16)?;
+            let pad_key = read_u32(data, start.checked_add(4)?)?;
+            if read_u32(data, start)? ^ pad_key == DANS_MAGIC
+                && read_u32(data, start.checked_add(8)?)? == pad_key
+                && read_u32(data, start.checked_add(12)?)? == pad_key
+            {
+                dans_blocks.entry(pad_key).or_default()[(start / 4) % 2] = Some(start);
+            }
+
             let value = read_u32(data, rich_offset)?;
             let key = read_u32(data, rich_offset.checked_add(4)?)?;
-            if value != RICH_MAGIC && value ^ key != RICH_MAGIC {
-                continue;
+            if (value == RICH_MAGIC || value ^ key == RICH_MAGIC)
+                && let Some(start) = dans_blocks
+                    .get(&key)
+                    .and_then(|slots| slots[(rich_offset / 4) % 2])
+            {
+                found = Some((start, rich_offset, key));
             }
-            for start_offset in (0x40..=rich_offset.checked_sub(16)?).rev() {
-                let block = data.get(start_offset..rich_offset)?;
-                let (dans, rest) = block.split_first_chunk::<4>()?;
-                let (padding, entry_bytes) = rest.split_first_chunk::<12>()?;
-                if u32::from_le_bytes(*dans) ^ key != DANS_MAGIC
-                    || !entry_bytes.len().is_multiple_of(8)
-                {
-                    continue;
-                }
-                if padding
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .any(|word| u32::from_le_bytes(*word) != key)
-                {
-                    continue;
-                }
+            rich_offset = rich_offset.checked_add(4)?;
+        }
 
-                let chunks = entry_bytes.as_chunks::<8>().0;
-                let mut entries = Vec::with_capacity(chunks.len());
-                for &[c0, c1, c2, c3, n0, n1, n2, n3] in chunks {
-                    let comp_id = u32::from_le_bytes([c0, c1, c2, c3]) ^ key;
-                    let count = u32::from_le_bytes([n0, n1, n2, n3]) ^ key;
-                    if comp_id != 0 || count != 0 {
-                        entries.push(RichEntry::from_comp_id(comp_id, count));
-                    }
-                }
-                return Some(Self {
-                    key,
-                    entries,
-                    offset: start_offset,
-                    size: block.len().checked_add(8)?,
-                });
+        let (start_offset, rich_offset, key) = found?;
+        let block = data.get(start_offset..rich_offset)?;
+        let entry_bytes = block.get(16..)?;
+        let chunks = entry_bytes.as_chunks::<8>().0;
+        let mut entries = Vec::with_capacity(chunks.len());
+        for &[c0, c1, c2, c3, n0, n1, n2, n3] in chunks {
+            let comp_id = u32::from_le_bytes([c0, c1, c2, c3]) ^ key;
+            let count = u32::from_le_bytes([n0, n1, n2, n3]) ^ key;
+            if comp_id != 0 || count != 0 {
+                entries.push(RichEntry::from_comp_id(comp_id, count));
             }
         }
-        None
+        Some(Self {
+            key,
+            entries,
+            offset: start_offset,
+            size: block.len().checked_add(8)?,
+        })
     }
 
     /// Build the bytes of the Rich header.
@@ -199,19 +184,29 @@ impl RichHeader {
         Ok(buf)
     }
 
-    /// Calculate a simplified checksum from the entries, for use as the key.
+    /// Calculate the checksum key of the Microsoft linker.
     ///
-    /// A real implementation also includes the full DOS header in the calculation.
+    /// `prefix` is all the file bytes before the `DanS` marker: the DOS header and the DOS stub.
+    /// The length of `prefix` is the file offset of `DanS`. The key is that offset, plus
+    /// `rotl(byte, i)` for each byte at offset `i` of `prefix` (the `e_lfanew` bytes at
+    /// `0x3C..0x40` are not included), plus `rotl(comp_id, use_count & 31)` for each entry. All
+    /// additions wrap at 32 bits.
     #[must_use]
-    pub fn calculate_key(entries: &[RichEntry], dos_header: &[u8]) -> u32 {
-        let mut checksum = 0u32;
+    pub fn calculate_key(entries: &[RichEntry], prefix: &[u8]) -> u32 {
+        // The offset is a u32 in the linker. Keep the low 32 bits.
+        let length = prefix.len().to_le_bytes();
+        let mut checksum = length
+            .first_chunk::<4>()
+            .map_or(0, |low| u32::from_le_bytes(*low));
 
-        // Include the DOS header bytes (rotated sum).
-        for (rotation, &byte) in (0u32..).zip(dos_header.iter().take(0x3C)) {
+        for (offset, &byte) in prefix.iter().enumerate() {
+            if (0x3C..0x40).contains(&offset) {
+                continue;
+            }
+            let rotation = u32::try_from(offset & 0x1F).unwrap_or(0);
             checksum = checksum.wrapping_add(u32::from(byte).rotate_left(rotation));
         }
 
-        // Include the entries.
         for entry in entries {
             let comp_id = entry.to_comp_id();
             checksum = checksum.wrapping_add(comp_id.rotate_left(entry.use_count & 0x1F));
@@ -230,7 +225,9 @@ impl RichHeader {
 /// A builder for Rich headers.
 ///
 /// The Microsoft linker inserts a Rich header with information about the build tools. This
-/// builder creates Rich headers with the correct XOR encoding.
+/// builder creates Rich headers with the correct XOR encoding. Use
+/// [`Self::try_build_with_dos_header`] to get the checksum key of the linker. Its input is all
+/// the file bytes before the `DanS` marker.
 ///
 /// # Example
 ///
@@ -241,7 +238,7 @@ impl RichHeader {
 ///
 /// // Add build tool entries
 /// builder.add_entry(RichEntry {
-///     product_id: 0x0104,   // C++ compiler
+///     product_id: 0x0105,   // Utc1900_CPP (C++ compiler)
 ///     build_number: 30729,  // VS version
 ///     use_count: 5,
 /// });
@@ -346,25 +343,31 @@ impl RichBuilder {
         Ok((data, size))
     }
 
-    /// Build the Rich header with a key calculated from the DOS header. Returns `(data, size)`.
+    /// Build the Rich header with the checksum key of the linker. Returns `(data, size)`.
+    ///
+    /// `prefix` is all the file bytes before the `DanS` marker. See
+    /// [`RichHeader::calculate_key`].
     ///
     /// # Panics
     ///
     /// Panics if [`Self::try_build_with_dos_header`] fails.
     #[must_use]
-    pub fn build_with_dos_header(&self, dos_header: &[u8]) -> (Vec<u8>, u32) {
-        self.try_build_with_dos_header(dos_header)
+    pub fn build_with_dos_header(&self, prefix: &[u8]) -> (Vec<u8>, u32) {
+        self.try_build_with_dos_header(prefix)
             .expect("Rich-header build failed: use try_build_with_dos_header()")
     }
 
-    /// Build the Rich header with a key calculated from the DOS header. Check the encoded size.
+    /// Build the Rich header with the checksum key of the linker. Check the encoded size.
     /// Returns `(data, size)`.
+    ///
+    /// `prefix` is all the file bytes before the `DanS` marker. Put the result at offset
+    /// `prefix.len()`. See [`RichHeader::calculate_key`].
     ///
     /// # Errors
     ///
     /// Returns the errors of [`Self::try_build_with_key`].
-    pub fn try_build_with_dos_header(&self, dos_header: &[u8]) -> Result<(Vec<u8>, u32)> {
-        let key = RichHeader::calculate_key(&self.entries, dos_header);
+    pub fn try_build_with_dos_header(&self, prefix: &[u8]) -> Result<(Vec<u8>, u32)> {
+        let key = RichHeader::calculate_key(&self.entries, prefix);
         self.try_build_with_key(key)
     }
 
@@ -408,7 +411,7 @@ mod tests {
     #[test]
     fn test_rich_entry_roundtrip() {
         let entry = RichEntry {
-            product_id: 0x0104, // C++14
+            product_id: 0x0104, // Utc1900_C
             build_number: 30729,
             use_count: 5,
         };
@@ -517,5 +520,92 @@ mod tests {
         let header = builder.into_header(0x5566_7788);
         assert_eq!(header.key, 0x5566_7788);
         assert_eq!(header.entries.len(), 1);
+    }
+
+    #[test]
+    fn parse_is_linear_in_a_stub_full_of_rich_markers() {
+        // Each aligned word is "Rich", so every offset is a candidate with the key "Rich". The
+        // old nested search did about 2^38 steps for this stub. One scan needs 2^18 steps.
+        let pe_offset = 0x10_0000usize;
+        let mut data = b"Rich".repeat((pe_offset + 0x100) / 4);
+        data[0..2].copy_from_slice(b"MZ");
+        data[0x3C..0x40].copy_from_slice(&u32::try_from(pe_offset).unwrap().to_le_bytes());
+        assert_eq!(RichHeader::parse(&data), None);
+
+        // A real header near the PE header is found in the same stub.
+        let (encoded, _) = RichBuilder::new()
+            .add(0x0105, 30729, 5)
+            .try_build_with_key(0x1234_5678)
+            .unwrap();
+        let start = pe_offset - 0x40;
+        data[start..start + encoded.len()].copy_from_slice(&encoded);
+        let parsed = RichHeader::parse(&data).unwrap();
+        assert_eq!(parsed.offset, start);
+        assert_eq!(parsed.key, 0x1234_5678);
+        assert_eq!(parsed.entries.len(), 1);
+    }
+
+    #[test]
+    fn calculate_key_matches_the_linker_checksum() {
+        let mut prefix = vec![0u8; 0x80];
+        for (index, byte) in prefix.iter_mut().enumerate() {
+            *byte = u8::try_from(index * 7 % 251).unwrap();
+        }
+        prefix[0..2].copy_from_slice(b"MZ");
+        prefix[0x3C..0x40].copy_from_slice(&0x100u32.to_le_bytes());
+        let entries = [
+            RichEntry::from_comp_id(0x0105_7809, 37),
+            RichEntry::from_comp_id(0x0102_7809, 1),
+        ];
+
+        // The spec formula, written out independently.
+        let mut expected: u32 = 0x80;
+        for index in 0..0x80u32 {
+            if (0x3C..0x40).contains(&index) {
+                continue;
+            }
+            let byte = u32::from(prefix[usize::try_from(index).unwrap()]);
+            expected =
+                expected.wrapping_add((byte << (index % 32)) | (byte >> ((32 - index % 32) % 32)));
+        }
+        expected = expected.wrapping_add(0x0105_7809u32.rotate_left(37 % 32));
+        expected = expected.wrapping_add(0x0102_7809u32.rotate_left(1));
+        assert_eq!(RichHeader::calculate_key(&entries, &prefix), expected);
+
+        // The e_lfanew bytes have no effect on the key.
+        let mut other = prefix.clone();
+        other[0x3C..0x40].copy_from_slice(&0x200u32.to_le_bytes());
+        assert_eq!(RichHeader::calculate_key(&entries, &other), expected);
+
+        // The builder uses the same key, and the parser reads it back.
+        let mut builder = RichBuilder::new();
+        for entry in entries {
+            builder.add_entry(entry);
+        }
+        let (encoded, _) = builder.try_build_with_dos_header(&prefix).unwrap();
+        let mut data = prefix;
+        data.extend_from_slice(&encoded);
+        data.resize(0x100 + 4, 0);
+        assert_eq!(RichHeader::parse(&data).unwrap().key, expected);
+    }
+
+    #[test]
+    fn product_name_uses_the_published_prodid_table() {
+        let name = |product_id| {
+            RichEntry {
+                product_id,
+                build_number: 0,
+                use_count: 0,
+            }
+            .product_name()
+        };
+        assert_eq!(name(0x0102), "Linker1400");
+        assert_eq!(name(0x0104), "Utc1900_C");
+        assert_eq!(name(0x0105), "Utc1900_CPP");
+        assert_eq!(name(0x00FF), "Cvtres1400");
+        assert_eq!(name(0x0101), "Implib1400");
+        assert_eq!(name(0x0100), "Export1400");
+        assert_eq!(name(0x00E3), "Utc1800_CVTCIL_CPP");
+        assert_eq!(name(0x010F), "Unknown");
     }
 }
