@@ -42,10 +42,22 @@ jobs:
 
       - name: Check fuzz targets
         if: matrix.target == 'x86_64-pc-windows-msvc'
+        # Bash stops at the first failed command. PowerShell checks only the last one.
+        shell: bash
         run: |
           cargo fmt --manifest-path fuzz/Cargo.toml --check
           cargo check --manifest-path fuzz/Cargo.toml --all-targets
           cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+
+      - name: Build fuzz targets (cargo-fuzz, nightly)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        # A fuzz run on MSVC needs the AddressSanitizer runtime DLL, so CI only builds here.
+        # The fuzz-smoke job runs the targets on Linux.
+        shell: bash
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz --locked
+          cargo +nightly fuzz build
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -73,6 +85,50 @@ jobs:
       - name: Verify release package
         if: matrix.target == 'x86_64-pc-windows-msvc'
         run: cargo package
+
+  no-std:
+    name: no_std target (thumbv7em-none-eabi)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install mise
+        uses: jdx/mise-action@v4
+        with:
+          experimental: true
+
+      - name: Add Rust target
+        run: rustup target add thumbv7em-none-eabi
+
+      - name: Build (no_std + alloc, no standard library)
+        run: cargo build --release --no-default-features --target thumbv7em-none-eabi
+
+  fuzz-smoke:
+    name: Fuzz smoke run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install nightly Rust
+        run: rustup toolchain install nightly --profile minimal
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run each fuzz target for a short time
+        run: |
+          for target in $(cargo +nightly fuzz list); do
+            cargo +nightly fuzz run "$target" -- -max_total_time=30
+          done
+
+  semver:
+    name: Semver checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check semver against the published release
+        uses: obi1kenobi/cargo-semver-checks-action@v2
 
   msrv:
     name: MSRV (Rust 1.88)

@@ -11,7 +11,12 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/napbat/portex"
 readme = "README.md"
 keywords = ["pe", "portable-executable", "windows", "exe", "dll"]
-categories = ["parsing", "development-tools"]
+categories = ["parser-implementations", "no-std", "development-tools"]
+include = ["/src/**", "/tests/**", "/README.md", "/LICENSE-*"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["std"]
@@ -31,6 +36,8 @@ missing_docs = "deny"
 # which copies from caller-provided memory; each unsafe item is marked with
 # `#[expect(unsafe_code)]` and documented with its invariant.
 unsafe_code = "deny"
+# docs.rs builds with `--cfg docsrs` to show the feature that each item needs.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)'] }
 
 [lints.clippy]
 allow_attributes = { level = "deny", priority = -1 }

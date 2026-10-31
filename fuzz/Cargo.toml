@@ -23,6 +23,8 @@ future_incompatible = { level = "deny", priority = -1 }
 missing_docs = "deny"
 # Denied everywhere; the fuzz targets contain no unsafe code.
 unsafe_code = "deny"
+# docs.rs builds with `--cfg docsrs` to show the feature that each item needs.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)'] }
 
 [lints.clippy]
 allow_attributes = { level = "deny", priority = -1 }
