@@ -150,8 +150,9 @@ sections.
   optional header.
 - It sets an unknown `Magic`, invalid alignments, `NumberOfRvaAndSizes` and the reserved data
   directories to valid values.
-- It gives each section its own aligned raw range, and calculates `SizeOfHeaders`,
-  `SizeOfImage` and the size fields again. It corrects a wrong nonzero checksum.
+- It gives each section its own aligned raw range, and calculates `SizeOfHeaders` and the size
+  fields again. It raises a `SizeOfImage` that is too small, but does not lower a larger one.
+  It corrects a wrong nonzero checksum.
 
 The loader view stays the same. The loader view is:
 
@@ -175,6 +176,7 @@ The followed structures are the structures that the loader reads through RVAs:
 
 The method checks only these indirect references. If the import or delay-import table does not
 parse, the bytes from the RVA of that directory to the end of the address space are protected.
+The same occurs if the tables have more than 131,072 thunks in name tables at different RVAs.
 
 The loader maps `SizeOfHeaders` header bytes, or the whole file with a low `SectionAlignment`.
 
@@ -221,6 +223,10 @@ let normalized = file.try_build()?;
 ```
 
 A change invalidates an Authenticode signature. The overlay and the certificate table stay.
+
+`PeFile::validate`, `PeFile::calculate_checksum`, `PeFile::update_checksum` and
+`PeFile::finalize` cover the complete file, with the overlay and the certificate table. The
+`PeImage` methods with the same names cover only the image that `PeImage::try_build` makes.
 
 ## Sequential and positional I/O
 
