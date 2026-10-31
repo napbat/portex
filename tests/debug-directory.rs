@@ -67,8 +67,9 @@ fn is_invalid_data_directory(error: &portex::Error) -> bool {
 }
 
 #[test]
-fn many_entries_with_one_payload_exceed_the_payload_budget() {
-    // Before the fix, each entry kept its own copy of the same 1 MiB payload.
+fn many_entries_with_one_payload_stop_at_the_payload_budget() {
+    // Before the fix, each entry kept its own copy of the same 1 MiB payload. The entries
+    // after the budget keep no payload, but they stay in the table.
     let payload = 1 << 20;
     let count = DebugInfo::MAX_PAYLOAD_BYTES / payload + 1;
     let mut table = Vec::new();
@@ -78,9 +79,20 @@ fn many_entries_with_one_payload_exceed_the_payload_budget() {
     let table_size = u32::try_from(table.len()).unwrap();
     let image = debug_image(vec![0x11; 0x1000 + payload], &table, table_size);
 
-    assert!(is_invalid_data_directory(&image.debug_info().unwrap_err()));
     let file = PeFile::parse(&image.try_build().unwrap()).unwrap();
-    assert!(is_invalid_data_directory(&file.debug_info().unwrap_err()));
+    for info in [
+        image.debug_info().unwrap().unwrap(),
+        file.debug_info().unwrap().unwrap(),
+    ] {
+        assert_eq!(info.directories.len(), count);
+        assert_eq!(info.data.len(), count);
+        assert!(
+            info.data[..count - 1]
+                .iter()
+                .all(|data| { data.as_ref().is_some_and(|data| data.len() == payload) })
+        );
+        assert_eq!(info.data[count - 1], None);
+    }
 }
 
 #[test]
