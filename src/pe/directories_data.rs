@@ -295,12 +295,16 @@ impl PeImage {
     /// Parse the resource directory and the resource data.
     ///
     /// This function is slower than `resources()`. It loads the data of each resource into the
-    /// `Resource::data` field.
+    /// `Resource::data` field. Returns an empty directory if the resource data directory is
+    /// absent.
     ///
     /// # Errors
     ///
     /// Returns an error if the resource directory tree or a resource data
     /// entry cannot be read from the image, or if it is malformed.
+    ///
+    /// Also returns an invalid-data-directory error if the payloads together are larger than
+    /// the data that the image holds plus the zero-fill budget of one read.
     pub fn resources_with_data(&self) -> Result<crate::resource::ResourceDirectory> {
         use crate::data_dir::DataDirectoryType;
 
@@ -311,11 +315,16 @@ impl PeImage {
             Some(d) => {
                 let reader = self.rva_reader();
                 let read_fn = |rva: u32, len: usize| reader.read(rva, len);
-                crate::resource::ResourceDirectory::parse_with_data(
-                    d.virtual_address,
-                    d.size,
-                    read_fn,
-                )
+                let mut directory =
+                    crate::resource::ResourceDirectory::parse(d.virtual_address, d.size, read_fn)?;
+                let payload = directory.unloaded_payload_size();
+                if u32::try_from(payload).map_or(true, |size| reader.exceeds_zero_fill(size)) {
+                    return Err(crate::Error::invalid_data_directory(
+                        "resource payloads are larger than the data that the image holds",
+                    ));
+                }
+                directory.try_load_data(read_fn)?;
+                Ok(directory)
             }
             None => Ok(crate::resource::ResourceDirectory::default()),
         }

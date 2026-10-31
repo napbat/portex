@@ -35,7 +35,7 @@ impl ResourceEntry {
     /// Create a resource entry with a standard resource type.
     #[must_use]
     pub fn with_type(rt: ResourceType, id: u16, language: u16, data: Vec<u8>) -> Self {
-        Self::new(rt as u16, id, language, data)
+        Self::new(rt.as_u16(), id, language, data)
     }
 
     /// Create a manifest resource (`RT_MANIFEST`, ID 1, language 0x0409).
@@ -58,36 +58,55 @@ impl ResourceEntry {
 /// - Level 2: resource name or ID.
 /// - Level 3: language ID.
 ///
+/// `FindResourceW` converts the name that it looks for to uppercase. Then it does a binary
+/// search over the named entries, and compares UTF-16 code units. Thus the builder does these
+/// steps for type names and for resource names:
+/// - [`Self::add`] stores each name in uppercase. It converts each UTF-16 unit with its simple
+///   uppercase mapping, as Windows does. A character outside the Basic Multilingual Plane, and
+///   a character without a single-character uppercase form (for example `ß`), stay the same.
+/// - The build sorts the named entries by their UTF-16 code units.
+/// - The build rejects two names that are the same after the conversion to uppercase.
+///
+/// The uppercase table of Windows can be different for a small number of characters.
+///
 /// # Example
-/// ```ignore
+///
+/// ```
+/// use portex::{ResourceBuilder, ResourceEntry};
+///
 /// let mut builder = ResourceBuilder::new();
-/// builder.add(ResourceEntry::manifest(manifest_xml.into_bytes()));
-/// let (data, size) = builder.build(rsrc_rva);
+/// builder.add(ResourceEntry::manifest(b"<assembly/>".to_vec()));
+/// let (data, size) = builder.try_build(0x3000)?;
+/// assert_eq!(data.len(), size as usize);
+/// # Ok::<(), portex::Error>(())
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct ResourceBuilder {
     /// Resources to include.
     entries: Vec<ResourceEntry>,
+    /// The fields of the root `IMAGE_RESOURCE_DIRECTORY`. The entry counts are zero.
+    root_header: ResourceDirectoryHeader,
 }
 
 impl ResourceBuilder {
     /// Create an empty resource builder.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
+        Self::default()
     }
 
     /// Create a builder from a parsed `ResourceDirectory`.
     ///
     /// Parse the directory with `resources_with_data()` first. This sets the `Resource::data`
-    /// field.
+    /// field. The builder keeps the fields of [`ResourceDirectory::root_header`], except the
+    /// entry counts. Like [`Self::add`], it stores each name in uppercase.
     ///
-    /// Returns `None` if a resource has no data.
+    /// Returns `None` if the `data` field of a resource is `None`. The loaders set this field
+    /// to an empty vector for a zero-size resource.
     #[must_use]
     pub fn from_directory(directory: &ResourceDirectory) -> Option<Self> {
         let mut builder = Self::new();
+        builder.set_root_header(directory.root_header);
         for resource in &directory.resources {
             let data = resource.data.as_ref()?.clone();
             builder.add(ResourceEntry {
@@ -101,10 +120,36 @@ impl ResourceBuilder {
         Some(builder)
     }
 
-    /// Add a resource entry.
-    pub fn add(&mut self, entry: ResourceEntry) -> &mut Self {
+    /// Add a resource entry. Store the type name and the resource name in uppercase.
+    ///
+    /// The build rejects two entries with the same type, name and language. This also applies
+    /// to names that are the same only after the conversion to uppercase.
+    pub fn add(&mut self, mut entry: ResourceEntry) -> &mut Self {
+        uppercase_name(&mut entry.type_id);
+        uppercase_name(&mut entry.name);
         self.entries.push(entry);
         self
+    }
+
+    /// Set the `Characteristics`, `TimeDateStamp`, `MajorVersion` and `MinorVersion` fields of
+    /// the root `IMAGE_RESOURCE_DIRECTORY`.
+    ///
+    /// The builder ignores the entry counts of `header`. It calculates them. The other
+    /// directories of the tree get zero in these fields.
+    pub fn set_root_header(&mut self, header: ResourceDirectoryHeader) -> &mut Self {
+        self.root_header = ResourceDirectoryHeader {
+            number_of_named_entries: 0,
+            number_of_id_entries: 0,
+            ..header
+        };
+        self
+    }
+
+    /// Get the fields of the root `IMAGE_RESOURCE_DIRECTORY` that [`Self::set_root_header`]
+    /// set. The entry counts are zero.
+    #[must_use]
+    pub fn root_header(&self) -> ResourceDirectoryHeader {
+        self.root_header
     }
 
     /// Add a resource with a standard resource type.
@@ -148,7 +193,8 @@ impl ResourceBuilder {
     ///
     /// Returns an invalid-data-directory error if one of these conditions is true:
     /// - More than 262,144 entries were added.
-    /// - Two entries have the same type, name and language.
+    /// - Two entries have the same type, name and language. The builder compares the names in
+    ///   uppercase.
     /// - A name is longer than 65,535 UTF-16 units.
     /// - A payload is larger than `u32::MAX` bytes.
     /// - A directory level has more than 65,535 entries.
@@ -202,7 +248,7 @@ impl ResourceBuilder {
         write_table(
             &mut data,
             0,
-            id_table_header(layout.types.iter().map(|ty| &ty.id))?,
+            id_table_header(self.root_header, layout.types.iter().map(|ty| &ty.id))?,
             layout
                 .types
                 .iter()
@@ -213,7 +259,10 @@ impl ResourceBuilder {
             write_table(
                 &mut data,
                 ty.dir_offset,
-                id_table_header(ty.names.iter().map(|name| &name.id))?,
+                id_table_header(
+                    ResourceDirectoryHeader::default(),
+                    ty.names.iter().map(|name| &name.id),
+                )?,
                 ty.names
                     .iter()
                     .map(|name| subdirectory_entry(&name.id, name.name_offset, name.dir_offset)),
@@ -244,13 +293,13 @@ impl ResourceBuilder {
 
         // Write the name strings.
         for ty in &layout.types {
-            if let ResourceId::Name(name) = &ty.id {
-                write_string_name(&mut data, ty.name_offset, name)?;
+            if let ResourceIdKey::Name(units) = &ty.id {
+                write_string_name(&mut data, ty.name_offset, units)?;
             }
         }
         for name in layout.types.iter().flat_map(|ty| &ty.names) {
-            if let ResourceId::Name(text) = &name.id {
-                write_string_name(&mut data, name.name_offset, text)?;
+            if let ResourceIdKey::Name(units) = &name.id {
+                write_string_name(&mut data, name.name_offset, units)?;
             }
         }
 
@@ -300,14 +349,14 @@ impl ResourceBuilder {
                     offset = layout_add(offset, ResourceDataEntry::SIZE)?;
                 }
                 names.push(NameLayout {
-                    id: name_key.into_resource_id(),
+                    id: name_key,
                     dir_offset: lang_dir_offset,
                     name_offset: 0,
                     languages,
                 });
             }
             types.push(TypeLayout {
-                id: type_key.into_resource_id(),
+                id: type_key,
                 dir_offset: type_dir_offset,
                 name_offset: 0,
                 names,
@@ -316,15 +365,15 @@ impl ResourceBuilder {
 
         // The name strings come next: first the type names, then the entry names.
         for ty in &mut types {
-            if let ResourceId::Name(name) = &ty.id {
+            if let ResourceIdKey::Name(units) = &ty.id {
                 ty.name_offset = layout_offset(offset)?;
-                offset = layout_add(offset, name_string_size(name)?)?;
+                offset = layout_add(offset, name_string_size(units)?)?;
             }
         }
         for name in types.iter_mut().flat_map(|ty| &mut ty.names) {
-            if let ResourceId::Name(text) = &name.id {
+            if let ResourceIdKey::Name(units) = &name.id {
                 name.name_offset = layout_offset(offset)?;
-                offset = layout_add(offset, name_string_size(text)?)?;
+                offset = layout_add(offset, name_string_size(units)?)?;
             }
         }
 
@@ -515,25 +564,30 @@ fn align_8(value: usize) -> Result<usize> {
 
 /// Return the size in bytes of a name string: a `u16` length, then the
 /// UTF-16 units.
-fn name_string_size(name: &str) -> Result<usize> {
-    usize::try_from(resource_name_size(name)?)
+fn name_string_size(units: &[u16]) -> Result<usize> {
+    usize::try_from(resource_name_size(units)?)
         .map_err(|_| Error::invalid_data_directory("resource-name size overflow"))
 }
 
 /// Build the header of a directory table whose entries have the identifiers `ids`.
-fn id_table_header<'a, I>(ids: I) -> Result<ResourceDirectoryHeader>
+///
+/// The header gets the other fields from `template`.
+fn id_table_header<'a, I>(
+    template: ResourceDirectoryHeader,
+    ids: I,
+) -> Result<ResourceDirectoryHeader>
 where
-    I: Iterator<Item = &'a ResourceId> + Clone,
+    I: Iterator<Item = &'a ResourceIdKey> + Clone,
 {
     let named = ids
         .clone()
-        .filter(|id| matches!(id, ResourceId::Name(_)))
+        .filter(|id| matches!(id, ResourceIdKey::Name(_)))
         .count();
-    let numeric = ids.filter(|id| matches!(id, ResourceId::Id(_))).count();
+    let numeric = ids.filter(|id| matches!(id, ResourceIdKey::Id(_))).count();
     Ok(ResourceDirectoryHeader {
         number_of_named_entries: checked_u16_count(named, "resource named-entry")?,
         number_of_id_entries: checked_u16_count(numeric, "resource ID-entry")?,
-        ..ResourceDirectoryHeader::default()
+        ..template
     })
 }
 
@@ -541,13 +595,13 @@ where
 ///
 /// A named entry points to its name string at `name_offset`.
 fn subdirectory_entry(
-    id: &ResourceId,
+    id: &ResourceIdKey,
     name_offset: u32,
     dir_offset: u32,
 ) -> ResourceDirectoryEntry {
     let name_or_id = match id {
-        ResourceId::Id(id) => u32::from(*id),
-        ResourceId::Name(_) => 0x8000_0000 | name_offset,
+        ResourceIdKey::Id(id) => u32::from(*id),
+        ResourceIdKey::Name(_) => 0x8000_0000 | name_offset,
     };
     ResourceDirectoryEntry {
         name_or_id,
@@ -607,18 +661,18 @@ fn write_language_data(data: &mut [u8], base_rva: u32, lang: &LanguageLayout<'_>
 }
 
 /// Write a name string at `offset`: a `u16` length, then the UTF-16LE units.
-fn write_string_name(data: &mut [u8], offset: u32, name: &str) -> Result<()> {
-    let units = checked_u16_count(name.encode_utf16().count(), "resource-name UTF-16 unit")?;
-    let mut bytes = Vec::with_capacity(name_string_size(name)?);
-    bytes.extend_from_slice(&units.to_le_bytes());
-    for unit in name.encode_utf16() {
+fn write_string_name(data: &mut [u8], offset: u32, units: &[u16]) -> Result<()> {
+    let count = checked_u16_count(units.len(), "resource-name UTF-16 unit")?;
+    let mut bytes = Vec::with_capacity(name_string_size(units)?);
+    bytes.extend_from_slice(&count.to_le_bytes());
+    for unit in units {
         bytes.extend_from_slice(&unit.to_le_bytes());
     }
     write_bytes(data, offset as usize, &bytes)
 }
 
-fn resource_name_size(name: &str) -> Result<u64> {
-    let units = name.encode_utf16().count();
+fn resource_name_size(units: &[u16]) -> Result<u64> {
+    let units = units.len();
     checked_u16_count(units, "resource-name UTF-16 unit")?;
     (units as u64)
         .checked_mul(2)
@@ -637,10 +691,14 @@ fn checked_u64_add(left: u64, right: u64, context: &str) -> Result<u64> {
         .ok_or_else(|| Error::invalid_data_directory(format!("{context} size overflow")))
 }
 
+/// The sort key of a type or name entry.
+///
+/// In each resource directory, the named entries must come before the numeric IDs. The
+/// loader compares the UTF-16 code units of names, and a shorter name comes before a longer
+/// name with the same start. The order of `Vec<u16>` is the same.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum ResourceIdKey {
-    // In each resource directory, the named entries must come before the numeric IDs.
-    Name(String),
+    Name(Vec<u16>),
     Id(u16),
 }
 
@@ -648,15 +706,34 @@ impl ResourceIdKey {
     fn from(id: &ResourceId) -> Self {
         match id {
             ResourceId::Id(n) => Self::Id(*n),
-            ResourceId::Name(s) => Self::Name(s.clone()),
+            ResourceId::Name(s) => Self::Name(s.encode_utf16().collect()),
         }
     }
+}
 
-    fn into_resource_id(self) -> ResourceId {
-        match self {
-            Self::Id(n) => ResourceId::Id(n),
-            Self::Name(s) => ResourceId::Name(s),
-        }
+/// Convert a name to uppercase, as `FindResourceW` converts the name that it looks for.
+///
+/// Windows converts each UTF-16 unit with a table of simple uppercase mappings. Thus a
+/// character outside the Basic Multilingual Plane stays the same. A character whose uppercase
+/// form has more than one character (for example `ß`) also stays the same.
+fn uppercase_name(id: &mut ResourceId) {
+    if let ResourceId::Name(name) = id
+        && name.chars().any(|c| uppercase_unit(c) != c)
+    {
+        *name = name.chars().map(uppercase_unit).collect();
+    }
+}
+
+/// Return the simple uppercase form of `c`, if `c` and the result are each one UTF-16 unit.
+/// Otherwise return `c`.
+fn uppercase_unit(c: char) -> char {
+    if c.len_utf16() != 1 {
+        return c;
+    }
+    let mut upper = c.to_uppercase();
+    match (upper.next(), upper.next()) {
+        (Some(single), None) if single.len_utf16() == 1 => single,
+        _ => c,
     }
 }
 
@@ -677,7 +754,7 @@ struct LanguageLayout<'a> {
 /// Layout of one name entry and its language directory.
 #[derive(Debug)]
 struct NameLayout<'a> {
-    id: ResourceId,
+    id: ResourceIdKey,
     /// Offset of the language directory, relative to the start of the
     /// resource directory.
     dir_offset: u32,
@@ -690,7 +767,7 @@ struct NameLayout<'a> {
 /// Layout of one type entry and its name directory.
 #[derive(Debug)]
 struct TypeLayout<'a> {
-    id: ResourceId,
+    id: ResourceIdKey,
     /// Offset of the name directory, relative to the start of the resource
     /// directory.
     dir_offset: u32,

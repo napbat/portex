@@ -54,8 +54,11 @@ use crate::prelude::*;
 use crate::{Error, Result};
 
 /// Standard resource types (`RT_*` values used as level-1 IDs of the resource tree).
+///
+/// A later version of the crate can add more types. Thus a `match` must have a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
+#[non_exhaustive]
 pub enum ResourceType {
     /// `RT_CURSOR` (1): hardware-dependent cursor image.
     Cursor = 1,
@@ -83,6 +86,8 @@ pub enum ResourceType {
     GroupCursor = 12,
     /// `RT_GROUP_ICON` (14): hardware-independent icon group.
     GroupIcon = 14,
+    /// `RT_NAMETABLE` (15): name table of 16-bit Windows. This type is obsolete.
+    NameTable = 15,
     /// `RT_VERSION` (16): version information (`VS_VERSIONINFO`).
     Version = 16,
     /// `RT_DLGINCLUDE` (17): name of a header file for a dialog template.
@@ -99,6 +104,10 @@ pub enum ResourceType {
     Html = 23,
     /// `RT_MANIFEST` (24): side-by-side assembly manifest.
     Manifest = 24,
+    /// `RT_DLGINIT` (240): MFC initialization data for the controls of a dialog box.
+    DlgInit = 240,
+    /// `RT_TOOLBAR` (241): MFC toolbar template.
+    Toolbar = 241,
 }
 
 impl ResourceType {
@@ -121,6 +130,7 @@ impl ResourceType {
             11 => Some(Self::MessageTable),
             12 => Some(Self::GroupCursor),
             14 => Some(Self::GroupIcon),
+            15 => Some(Self::NameTable),
             16 => Some(Self::Version),
             17 => Some(Self::DlgInclude),
             19 => Some(Self::PlugPlay),
@@ -129,8 +139,16 @@ impl ResourceType {
             22 => Some(Self::AniIcon),
             23 => Some(Self::Html),
             24 => Some(Self::Manifest),
+            240 => Some(Self::DlgInit),
+            241 => Some(Self::Toolbar),
             _ => None,
         }
+    }
+
+    /// Return the numeric `RT_*` value of the type.
+    #[must_use]
+    pub const fn as_u16(self) -> u16 {
+        self as u16
     }
 
     /// Upper-case type name without the `RT_` prefix (e.g. `"MANIFEST"`).
@@ -150,6 +168,7 @@ impl ResourceType {
             Self::MessageTable => "MESSAGETABLE",
             Self::GroupCursor => "GROUP_CURSOR",
             Self::GroupIcon => "GROUP_ICON",
+            Self::NameTable => "NAMETABLE",
             Self::Version => "VERSION",
             Self::DlgInclude => "DLGINCLUDE",
             Self::PlugPlay => "PLUGPLAY",
@@ -158,6 +177,8 @@ impl ResourceType {
             Self::AniIcon => "ANIICON",
             Self::Html => "HTML",
             Self::Manifest => "MANIFEST",
+            Self::DlgInit => "DLGINIT",
+            Self::Toolbar => "TOOLBAR",
         }
     }
 }
@@ -168,6 +189,10 @@ pub enum ResourceId {
     /// Numeric ID.
     Id(u16),
     /// String name.
+    ///
+    /// The parser keeps a name as the file stores it. `FindResourceW` converts the name that it
+    /// looks for to uppercase, and compares the UTF-16 code units with the stored name. Thus
+    /// [`ResourceBuilder`] stores each name in uppercase.
     Name(String),
 }
 
@@ -390,7 +415,11 @@ pub struct Resource {
     pub size: u32,
     /// Code page.
     pub code_page: u32,
-    /// The resource data. Only `parse_with_data` sets this field.
+    /// The resource data.
+    ///
+    /// [`ResourceDirectory::parse`] leaves this field as `None`.
+    /// [`ResourceDirectory::parse_with_data`], [`ResourceDirectory::load_data`] and
+    /// [`ResourceDirectory::try_load_data`] set it. A zero-size resource gets an empty vector.
     pub data: Option<Vec<u8>>,
 }
 
@@ -398,7 +427,7 @@ impl Resource {
     /// Check if this is a specific resource type.
     #[must_use]
     pub fn is_type(&self, rt: ResourceType) -> bool {
-        matches!(&self.type_id, ResourceId::Id(id) if *id == rt as u16)
+        matches!(&self.type_id, ResourceId::Id(id) if *id == rt.as_u16())
     }
 
     /// Get the standard resource type of this resource, if it has one.
@@ -417,6 +446,11 @@ impl Resource {
 /// Parsed resource directory.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResourceDirectory {
+    /// The header of the root `IMAGE_RESOURCE_DIRECTORY`, as the parser read it.
+    ///
+    /// [`ResourceBuilder::from_directory`] keeps the `Characteristics`, `TimeDateStamp`,
+    /// `MajorVersion` and `MinorVersion` fields. The builder calculates the entry counts.
+    pub root_header: ResourceDirectoryHeader,
     /// All resources in the directory.
     pub resources: Vec<Resource>,
 }

@@ -151,7 +151,8 @@ fn test_resource_builder_named_round_trip() {
     };
     let directory = ResourceDirectory::parse_with_data(base_rva, size, read_at_rva).unwrap();
 
-    // Named entries come first in each directory. Languages are sorted.
+    // Named entries come first in each directory. Languages are sorted. The builder stores
+    // names in uppercase.
     let summary: Vec<_> = directory
         .resources
         .iter()
@@ -170,7 +171,7 @@ fn test_resource_builder_named_round_trip() {
         vec![
             (named("MYTYPE"), named("FIRST"), 0x0409, 1252, vec![1, 2, 3]),
             (named("MYTYPE"), ResourceId::Id(7), 0x0407, 0, vec![4; 9]),
-            (ResourceId::Id(10), named("Ünïcode"), 0x0409, 0, vec![5; 16]),
+            (ResourceId::Id(10), named("ÜNÏCODE"), 0x0409, 0, vec![5; 16]),
             (ResourceId::Id(10), ResourceId::Id(1), 0x0407, 0, vec![7, 8]),
             (ResourceId::Id(10), ResourceId::Id(1), 0x0409, 0, vec![6]),
         ]
