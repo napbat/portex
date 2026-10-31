@@ -23,10 +23,17 @@ pub fn checked_align_up(value: u32, alignment: u32) -> Option<u32> {
 }
 
 /// Align a value up to the given alignment.
+///
+/// An `alignment` of 0 leaves the value unchanged.
+///
+/// # Panics
+///
+/// Panics if the result overflows `u32`. Use [`checked_align_up`] for a fallible calculation.
 #[inline]
 #[must_use]
 pub fn align_up(value: u32, alignment: u32) -> u32 {
-    checked_align_up(value, alignment).unwrap_or(u32::MAX - (u32::MAX % alignment.max(1)))
+    checked_align_up(value, alignment)
+        .expect("aligned value exceeds u32: use checked_align_up() for a fallible calculation")
 }
 
 /// Align a value down to the given alignment.
@@ -39,8 +46,9 @@ pub fn align_down(value: u32, alignment: u32) -> u32 {
     value - value % alignment
 }
 
-/// Layout configuration for the PE builder.
+/// The alignment values of an image layout.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct LayoutConfig {
     /// File alignment (typically 0x200).
     pub file_alignment: u32,
@@ -50,30 +58,43 @@ pub struct LayoutConfig {
 
 impl Default for LayoutConfig {
     fn default() -> Self {
-        Self {
-            file_alignment: 0x200,
-            section_alignment: 0x1000,
-        }
+        Self::new(0x200, 0x1000)
     }
 }
 
 impl LayoutConfig {
-    /// Create a configuration from the alignment values of an optional header.
+    /// Create a configuration from a `FileAlignment` and a `SectionAlignment` value.
     #[must_use]
-    pub fn from_optional_header(opt: &OptionalHeader) -> Self {
+    pub const fn new(file_alignment: u32, section_alignment: u32) -> Self {
         Self {
-            file_alignment: opt.file_alignment(),
-            section_alignment: opt.section_alignment(),
+            file_alignment,
+            section_alignment,
         }
     }
 
+    /// Create a configuration from the alignment values of an optional header.
+    #[must_use]
+    pub fn from_optional_header(opt: &OptionalHeader) -> Self {
+        Self::new(opt.file_alignment(), opt.section_alignment())
+    }
+
     /// Align a value up to the file alignment.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the result overflows `u32`. Use [`checked_align_up`] for a fallible
+    /// calculation.
     #[must_use]
     pub fn align_file(&self, value: u32) -> u32 {
         align_up(value, self.file_alignment)
     }
 
     /// Align a value up to the section alignment.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the result overflows `u32`. Use [`checked_align_up`] for a fallible
+    /// calculation.
     #[must_use]
     pub fn align_section(&self, value: u32) -> u32 {
         align_up(value, self.section_alignment)
@@ -95,8 +116,7 @@ pub fn headers_size(num_sections: usize, optional_header_size: usize) -> Option<
 ///
 /// Unlike [`headers_size`], this function includes the DOS stub and any padding before the
 /// PE signature. The `e_lfanew` value of the DOS header gives this offset.
-#[must_use]
-pub fn headers_size_at(
+pub(crate) fn headers_size_at(
     pe_offset: usize,
     num_sections: usize,
     optional_header_size: usize,
@@ -342,6 +362,13 @@ mod tests {
         assert_eq!(align_up(0x201, 0x200), 0x400);
         assert_eq!(align_up(0x1000, 0x1000), 0x1000);
         assert_eq!(align_up(0x1001, 0x1000), 0x2000);
+    }
+
+    #[test]
+    #[should_panic(expected = "aligned value exceeds u32")]
+    fn align_up_panics_on_overflow() {
+        assert_eq!(checked_align_up(u32::MAX, 0x1000), None);
+        let _ = align_up(u32::MAX, 0x1000);
     }
 
     #[test]

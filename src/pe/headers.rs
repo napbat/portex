@@ -206,6 +206,20 @@ impl PeHeaders {
         self.section_headers.iter().find(|s| s.name_str() == name)
     }
 
+    /// Return the data directory entry (`IMAGE_DATA_DIRECTORY`) of the given type.
+    ///
+    /// Returns `None` if the optional header has fewer entries. `NumberOfRvaAndSizes` can be 0
+    /// in a valid file, so do not index [`OptionalHeader::data_directories`] directly.
+    #[must_use]
+    pub fn data_directory(
+        &self,
+        dir_type: crate::data_dir::DataDirectoryType,
+    ) -> Option<&crate::data_dir::DataDirectory> {
+        self.optional_header
+            .data_directories()
+            .get(dir_type.as_index())
+    }
+
     /// Convert an RVA to a source offset for the given layout.
     ///
     /// The offset is relative to the start of the image. If you called [`Self::read_from`]

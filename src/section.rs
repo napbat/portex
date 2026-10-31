@@ -126,12 +126,37 @@ impl SectionHeader {
 
     /// Set the section name from a string.
     ///
-    /// The method keeps only the first 8 bytes of `name`.
+    /// The method keeps at most the first 8 bytes of `name`. It does not cut a UTF-8
+    /// character: if the 8-byte limit is inside a character, the name ends before that
+    /// character. Use [`Self::try_set_name`] to reject a name that is too long.
     pub fn set_name(&mut self, name: &str) {
-        self.name = [0u8; 8];
-        for (dest, &src) in self.name.iter_mut().zip(name.as_bytes()) {
-            *dest = src;
+        let mut end = name.len().min(self.name.len());
+        while !name.is_char_boundary(end) {
+            end -= 1;
         }
+        self.store_name(&name.as_bytes()[..end]);
+    }
+
+    /// Set the section name from a string, if it fits in the 8-byte name field.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `name` is longer than 8 bytes. In that case, the name does not
+    /// change.
+    pub fn try_set_name(&mut self, name: &str) -> Result<()> {
+        if name.len() > self.name.len() {
+            return Err(Error::invalid_section(format!(
+                "section name '{name}' is longer than 8 bytes"
+            )));
+        }
+        self.store_name(name.as_bytes());
+        Ok(())
+    }
+
+    /// Store `name` (at most 8 bytes) in the name field, padded with null bytes.
+    fn store_name(&mut self, name: &[u8]) {
+        self.name = [0u8; 8];
+        self.name[..name.len()].copy_from_slice(name);
     }
 
     /// Return `true` if the section is executable.
@@ -291,14 +316,17 @@ impl SectionHeader {
 
     /// Read `count` consecutive section headers from a [`ReadAt`] reader.
     ///
-    /// The first header starts at the file offset `offset`.
+    /// The first header starts at the file offset `offset`. The method reserves memory only for
+    /// the headers that the reader can hold, so a large `count` from a file does not allocate
+    /// more memory than the source justifies.
     ///
     /// # Errors
     ///
     /// Returns an error if the offset of a header overflows `u64`. Returns an error if the
     /// reader cannot supply `count` consecutive headers that start at `offset`.
     pub fn read_sections<R: ReadAt>(reader: &R, offset: u64, count: usize) -> Result<Vec<Self>> {
-        let mut sections = Vec::with_capacity(count);
+        let mut sections =
+            Vec::with_capacity(entries_to_reserve(reader, offset, count, Self::SIZE));
         for i in 0..count {
             let relative_offset = i
                 .checked_mul(Self::SIZE)
@@ -317,6 +345,27 @@ impl SectionHeader {
     pub fn to_bytes(&self) -> Vec<u8> {
         self.encode().to_vec()
     }
+}
+
+/// The number of table entries to reserve when the reader does not report its size.
+const UNSIZED_RESERVE: usize = 16;
+
+/// Return the number of `entry_size`-byte table entries to reserve for a read of `count`
+/// entries at `offset`.
+///
+/// The result is at most the number of entries that `reader` holds after `offset`. Thus a
+/// count from untrusted data cannot reserve more memory than the source holds.
+pub(crate) fn entries_to_reserve<R: ReadAt>(
+    reader: &R,
+    offset: u64,
+    count: usize,
+    entry_size: usize,
+) -> usize {
+    let held = reader.size().map_or(UNSIZED_RESERVE, |size| {
+        let entries = size.saturating_sub(offset) / entry_size as u64;
+        usize::try_from(entries).unwrap_or(usize::MAX)
+    });
+    count.min(held)
 }
 
 /// A section with its header and its owned data.
