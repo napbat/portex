@@ -25,7 +25,12 @@ use crate::prelude::*;
 use crate::{Error, Result};
 
 /// `WIN_CERTIFICATE` revision values (`wRevision`).
+///
+/// A later release can add a named variant for a value that is [`Self::Unknown`] now.
+/// [`Self::from_u16`] never returns `Unknown` for a value that has a named variant. Do not
+/// make `Unknown` with such a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CertificateRevision {
     /// `WIN_CERT_REVISION_1_0`
     Revision1,
@@ -58,7 +63,12 @@ impl CertificateRevision {
 }
 
 /// `WIN_CERTIFICATE` type values (`wCertificateType`).
+///
+/// A later release can add a named variant for a value that is [`Self::Unknown`] now.
+/// [`Self::from_u16`] never returns `Unknown` for a value that has a named variant. Do not
+/// make `Unknown` with such a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CertificateType {
     /// `WIN_CERT_TYPE_X509`: an X.509 certificate.
     X509,
@@ -68,6 +78,10 @@ pub enum CertificateType {
     Reserved1,
     /// `WIN_CERT_TYPE_TS_STACK_SIGNED`: Terminal Server Protocol Stack.
     TsStackSigned,
+    /// `WIN_CERT_TYPE_EFI_PKCS115` (0x0EF0): a UEFI PKCS#1 v1.5 signature.
+    EfiPkcs115,
+    /// `WIN_CERT_TYPE_EFI_GUID` (0x0EF1): a UEFI signature that a GUID identifies.
+    EfiGuid,
     /// A certificate type that this version of the crate does not know.
     Unknown(u16),
 }
@@ -81,6 +95,8 @@ impl CertificateType {
             0x0002 => Self::PkcsSignedData,
             0x0003 => Self::Reserved1,
             0x0004 => Self::TsStackSigned,
+            0x0EF0 => Self::EfiPkcs115,
+            0x0EF1 => Self::EfiGuid,
             other => Self::Unknown(other),
         }
     }
@@ -93,6 +109,8 @@ impl CertificateType {
             Self::PkcsSignedData => 0x0002,
             Self::Reserved1 => 0x0003,
             Self::TsStackSigned => 0x0004,
+            Self::EfiPkcs115 => 0x0EF0,
+            Self::EfiGuid => 0x0EF1,
             Self::Unknown(value) => value,
         }
     }
@@ -123,6 +141,9 @@ impl Certificate {
     /// Parse one certificate from a byte slice.
     ///
     /// Returns the certificate and the number of bytes that it uses, including the padding.
+    /// Each certificate starts at an 8-byte boundary. The padding of the last certificate can
+    /// be missing, as in the table walk of the PE specification. Then the number of bytes is
+    /// the length of `data`.
     ///
     /// # Errors
     ///
@@ -130,8 +151,7 @@ impl Certificate {
     /// if `data` is shorter than the 8-byte header.
     ///
     /// Returns [`ErrorKind::InvalidDataDirectory`](crate::error::ErrorKind::InvalidDataDirectory)
-    /// if `dwLength` is smaller than the header, or if the length (aligned to 8 bytes) is
-    /// larger than `data`.
+    /// if `dwLength` is smaller than the header, or if it is larger than `data`.
     pub fn parse(data: &[u8]) -> Result<(Self, usize)> {
         let Some((header, _)) = data.split_first_chunk::<{ Self::HEADER_SIZE }>() else {
             return Err(Error::buffer_too_small(Self::HEADER_SIZE, data.len()));
@@ -151,18 +171,13 @@ impl Certificate {
             )));
         };
 
-        // Each certificate is aligned to 8 bytes.
+        // Each certificate is aligned to 8 bytes. The table can end before the padding of
+        // its last certificate.
         let padded_length = length
             .checked_add(7)
             .map(|value| value & !7)
-            .ok_or_else(|| Error::invalid_data_directory("certificate alignment overflow"))?;
-        if padded_length > data.len() {
-            return Err(Error::invalid_data_directory(format!(
-                "aligned certificate length {} exceeds the remaining directory size {}",
-                padded_length,
-                data.len()
-            )));
-        }
+            .ok_or_else(|| Error::invalid_data_directory("certificate alignment overflow"))?
+            .min(data.len());
 
         Ok((
             Self {
@@ -470,5 +485,40 @@ mod tests {
         data[0..4].copy_from_slice(&17u32.to_le_bytes());
         assert!(Certificate::parse(&data).is_err());
         assert!(SecurityDirectory::parse(&data[..12]).is_err());
+    }
+
+    #[test]
+    fn a_last_certificate_without_padding_parses() {
+        // Two certificates of 11 and 13 bytes. Only the first one has its padding.
+        let mut data = vec![0u8; 16 + 13];
+        data[0..4].copy_from_slice(&11u32.to_le_bytes());
+        data[4..6].copy_from_slice(&0x0200u16.to_le_bytes());
+        data[6..8].copy_from_slice(&0x0002u16.to_le_bytes());
+        data[16..20].copy_from_slice(&13u32.to_le_bytes());
+        data[20..22].copy_from_slice(&0x0200u16.to_le_bytes());
+        data[22..24].copy_from_slice(&0x0EF1u16.to_le_bytes());
+        data[24..29].copy_from_slice(&[1, 2, 3, 4, 5]);
+
+        let (_, consumed) = Certificate::parse(&data[16..]).unwrap();
+        assert_eq!(consumed, 13);
+        let parsed = SecurityDirectory::parse(&data).unwrap();
+        assert_eq!(parsed.certificates.len(), 2);
+        assert_eq!(parsed.certificates[1].length, 13);
+        assert_eq!(
+            parsed.certificates[1].certificate_type,
+            CertificateType::EfiGuid
+        );
+        assert_eq!(parsed.certificates[1].data, [1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn efi_certificate_types_have_names() {
+        for (value, name) in [
+            (0x0EF0, CertificateType::EfiPkcs115),
+            (0x0EF1, CertificateType::EfiGuid),
+        ] {
+            assert_eq!(CertificateType::from_u16(value), name);
+            assert_eq!(name.as_u16(), value);
+        }
     }
 }
