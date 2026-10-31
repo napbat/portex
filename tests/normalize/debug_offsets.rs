@@ -294,13 +294,35 @@ fn a_debug_field_in_an_import_name_table_keeps_the_layout() {
     assert_the_layout_stays(&raw);
 }
 
-#[test]
-fn a_stale_debug_offset_is_reported() {
+/// Return `test_image` with one debug entry at the start of section `index`. The
+/// `PointerToRawData` field is 0x1234, but the file offset of `AddressOfRawData` is the raw
+/// offset of the section plus `DEBUG_DATA_OFFSET`. Also return that raw offset.
+fn stale_debug_entry_in_section(index: usize) -> (Vec<u8>, u32) {
     let mut raw = test_image().try_build().unwrap();
     let headers = PeHeaders::from_slice(&raw).unwrap();
-    let pointer = headers.section_headers[0].pointer_to_raw_data;
-    let rva = headers.section_headers[0].virtual_address;
+    let pointer = headers.section_headers[index].pointer_to_raw_data;
+    let rva = headers.section_headers[index].virtual_address;
     put_debug_entry(&mut raw, pointer, rva, 0x1234);
+    (raw, pointer)
+}
+
+#[test]
+fn an_unedited_round_trip_keeps_a_stale_debug_offset() {
+    // Before the fix, the build set the field to the file offset of AddressOfRawData, also
+    // when the layout did not change.
+    for index in [0, 1] {
+        let (raw, _) = stale_debug_entry_in_section(index);
+        let file = PeFile::parse(&raw).unwrap();
+        assert!(file.preserves_source_gaps());
+        assert_eq!(file.try_build().unwrap(), raw);
+        let image = PeImage::parse(&raw).unwrap();
+        assert_eq!(image.try_build().unwrap(), raw);
+    }
+}
+
+#[test]
+fn normalize_corrects_a_stale_debug_offset() {
+    let (raw, pointer) = stale_debug_entry_in_section(1);
 
     let mut file = PeFile::parse(&raw).unwrap();
     let result = file.normalize().unwrap();
@@ -317,6 +339,17 @@ fn a_stale_debug_offset_is_reported() {
         debug_pointer(&output[start - DEBUG_POINTER_FIELD..]),
         pointer + DEBUG_DATA_OFFSET
     );
+}
+
+#[test]
+fn a_stale_debug_offset_in_code_stays() {
+    // The correction would change bytes of an executable section.
+    let (raw, _) = stale_debug_entry_in_section(0);
+    let mut file = PeFile::parse(&raw).unwrap();
+    let result = file.normalize().unwrap();
+    assert_eq!(result.changes, []);
+    assert_eq!(result.kept, [NormalizeKept::SectionData]);
+    assert_eq!(file.try_build().unwrap(), raw);
 }
 
 /// Keep the layout when `.rdata` maps bytes of `.text` after its raw size.

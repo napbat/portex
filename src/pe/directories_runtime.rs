@@ -204,6 +204,8 @@ impl PeImage {
                 Ok((data, dir_size))
             })?;
         self.set_data_directory(DataDirectoryType::Debug, append_rva, dir_size);
+        // The builder writes no file offset. Set it for the current layout.
+        self.synchronize_debug_file_offsets();
 
         Ok(append_rva)
     }
@@ -258,6 +260,8 @@ impl PeImage {
                 Ok((data, dir_size))
             })?;
         self.set_data_directory(DataDirectoryType::Debug, append_rva, dir_size);
+        // The builder writes no file offset. Set it for the current layout.
+        self.synchronize_debug_file_offsets();
 
         Ok(append_rva)
     }

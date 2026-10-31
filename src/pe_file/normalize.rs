@@ -52,11 +52,13 @@ impl PeFile {
     /// space are protected. The same occurs if the import and delay-import tables together
     /// have more than 131,072 thunks in name tables at different RVAs.
     ///
-    /// The only accepted change to section bytes is the rebase of the `PointerToRawData` file
-    /// offsets of the `IMAGE_DEBUG_DIRECTORY` entries. The entries must be in a section without
-    /// `IMAGE_SCN_CNT_CODE` or `IMAGE_SCN_MEM_EXECUTE`, outside other data directories, and
-    /// outside the followed structures.
-    /// [`Normalization::changes`] reports it as [`NormalizeChange::DebugPointers`].
+    /// The only accepted change to section bytes is the change of the `PointerToRawData` file
+    /// offsets of the `IMAGE_DEBUG_DIRECTORY` entries. In each candidate, the method sets each
+    /// such field to the file offset of its `AddressOfRawData`. This also corrects a stale
+    /// field, which an unedited [`Self::try_build`] keeps. The entries must be in a section
+    /// without `IMAGE_SCN_CNT_CODE` or `IMAGE_SCN_MEM_EXECUTE`, outside other data directories,
+    /// and outside the followed structures.
+    /// [`Normalization::changes`] reports the change as [`NormalizeChange::DebugPointers`].
     ///
     /// The method corrects a wrong nonzero checksum only if the fix keeps the loader view and
     /// builds. It does not use a candidate that would make a valid checksum wrong.

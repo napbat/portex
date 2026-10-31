@@ -242,3 +242,56 @@ fn a_last_certificate_without_padding_is_a_certificate_table() {
     );
     assert_eq!(file.try_build().unwrap(), raw);
 }
+
+/// Return the `PointerToRawData` field of each entry of a debug directory of `count` entries
+/// at `rva`.
+fn debug_pointers(image: &PeImage, rva: u32, count: usize) -> Vec<u32> {
+    let table = image.read_rva(rva, count * DebugDirectory::SIZE).unwrap();
+    table
+        .as_chunks::<{ DebugDirectory::SIZE }>()
+        .0
+        .iter()
+        .map(|bytes| DebugDirectory::parse(bytes).unwrap().pointer_to_raw_data)
+        .collect()
+}
+
+#[test]
+fn a_layout_change_rebases_each_debug_file_offset_by_its_distance() {
+    let mut image = PeBuilder::new()
+        .machine(MachineType::Amd64)
+        .add_section(
+            ".text",
+            vec![0xcc; 0x200],
+            characteristics::CODE | characteristics::EXECUTE | characteristics::READ,
+        )
+        .add_section(
+            ".rdata",
+            vec![0; 0x200],
+            characteristics::INITIALIZED_DATA | characteristics::READ,
+        )
+        .add_section(
+            ".data",
+            vec![0; 0x200],
+            characteristics::INITIALIZED_DATA | characteristics::READ | characteristics::WRITE,
+        )
+        .try_build()
+        .unwrap();
+    let data = image.sections[2].header.virtual_address;
+    let payload = data + 0x80;
+    let offset = image.rva_to_offset(payload).unwrap();
+    // The first entry is correct. The second entry is stale: 0x10 bytes after the payload.
+    let mut table = entry(DebugType::CodeView, 0x10, payload, offset).to_vec();
+    table.extend_from_slice(&entry(DebugType::CodeView, 0x10, payload, offset + 0x10));
+    image.write_at_rva(data, &table).unwrap();
+    image.set_data_directory(DataDirectoryType::Debug, data, 56);
+
+    // The raw data of `.rdata` grows, so the raw data of `.data` moves 0x400 bytes.
+    image.sections[1].data.resize(0x600, 0x11);
+    image.try_update_layout().unwrap();
+    let moved = image.rva_to_offset(payload).unwrap();
+    assert_eq!(moved, offset + 0x400);
+
+    // Before the fix, the build set the stale field to the new offset of the payload.
+    let rebuilt = rebuilt(&image);
+    assert_eq!(debug_pointers(&rebuilt, data, 2), [moved, moved + 0x10]);
+}

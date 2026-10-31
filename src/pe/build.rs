@@ -46,9 +46,9 @@ impl PeImage {
     ///   consistent, or they overflow.
     /// - The allocation of the output buffer fails.
     ///
-    /// The build rebases the `PointerToRawData` field of each debug directory entry that it can
-    /// read. The loader does not use the debug directory, so a malformed one does not stop the
-    /// build.
+    /// The layout update rebases the `PointerToRawData` field of each debug directory entry
+    /// (see [`Self::try_update_layout`]). If the layout does not change, the build keeps each
+    /// field, also a stale one.
     pub fn try_build(&self) -> Result<Vec<u8>> {
         let mut pe = self.clone();
         match pe.try_update_layout() {
@@ -59,10 +59,7 @@ impl PeImage {
     }
 
     /// Serialize the image after a call to [`Self::try_update_layout`].
-    ///
-    /// The method rebases the debug file offsets in `self`, and returns each error.
-    pub(crate) fn try_build_updated_layout(&mut self) -> Result<Vec<u8>> {
-        self.synchronize_file_offsets();
+    pub(crate) fn try_build_updated_layout(&self) -> Result<Vec<u8>> {
         let headers = self.build_headers()?;
         self.try_write_bytes(&headers, None)
     }
@@ -85,13 +82,11 @@ impl PeImage {
         if !self.current_layout_can_hold() {
             return Ok(None);
         }
-        let mut pe = self.clone();
-        pe.synchronize_file_offsets();
-        let Ok(headers) = pe.build_headers() else {
+        let Ok(headers) = self.build_headers() else {
             return Ok(None);
         };
-        let output = pe.try_write_bytes(&headers, source_end)?;
-        Ok(pe.output_holds_data(&output, &headers).then_some(output))
+        let output = self.try_write_bytes(&headers, source_end)?;
+        Ok(self.output_holds_data(&output, &headers).then_some(output))
     }
 
     /// Check the sizes of the current raw layout against the section data.
@@ -267,13 +262,12 @@ impl PeImage {
                 && !self.sections.is_empty())
     }
 
-    /// Update the `PointerToRawData` field of each debug directory entry after a change to the
-    /// section layout.
+    /// Return the complete `IMAGE_DEBUG_DIRECTORY` entries that the image holds, each with the
+    /// RVA of its `PointerToRawData` field.
     ///
-    /// The loader does not use the debug directory, so a malformed directory does not stop the
-    /// build. The method rebases each complete entry that it can read and write, and keeps the
-    /// other bytes.
-    fn synchronize_file_offsets(&mut self) {
+    /// The loader does not use the debug directory, so a malformed directory gives no entries
+    /// or fewer entries, not an error.
+    fn debug_entries(&self) -> Vec<(u32, crate::debug::DebugDirectory)> {
         use crate::data_dir::DataDirectoryType;
         use crate::debug::DebugDirectory;
 
@@ -282,35 +276,93 @@ impl PeImage {
             .copied()
             .filter(|dir| dir.is_present())
         else {
-            return;
+            return Vec::new();
         };
         // Read all complete entries at once. The zero budget of `read_rva` limits the size.
         let count = directory.size as usize / DebugDirectory::SIZE;
         let Some(table) = self.read_rva(directory.virtual_address, count * DebugDirectory::SIZE)
         else {
-            return;
+            return Vec::new();
         };
         let (entries, _) = table.as_chunks::<{ DebugDirectory::SIZE }>();
-        for (index, bytes) in entries.iter().enumerate() {
-            let Ok(entry) = DebugDirectory::parse(bytes) else {
+        entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, bytes)| {
+                let entry = DebugDirectory::parse(bytes).ok()?;
+                let field_rva = u32::try_from(index * DebugDirectory::SIZE + DEBUG_POINTER_FIELD)
+                    .ok()
+                    .and_then(|relative| directory.virtual_address.checked_add(relative))?;
+                Some((field_rva, entry))
+            })
+            .collect()
+    }
+
+    /// Return the debug file offsets that a layout update must rebase.
+    ///
+    /// The result holds each entry with a nonzero `AddressOfRawData` and a nonzero
+    /// `PointerToRawData`, if the current layout gives a file offset for `AddressOfRawData`.
+    pub(super) fn debug_pointers(&self) -> Vec<DebugPointer> {
+        self.debug_entries()
+            .into_iter()
+            .filter(|(_, entry)| entry.address_of_raw_data != 0 && entry.pointer_to_raw_data != 0)
+            .filter_map(|(field_rva, entry)| {
+                Some(DebugPointer {
+                    field_rva,
+                    address: entry.address_of_raw_data,
+                    pointer: entry.pointer_to_raw_data,
+                    offset: self.rva_to_offset(entry.address_of_raw_data)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Rebase the debug file offsets `pointers` after a layout update.
+    ///
+    /// The method adds to each `PointerToRawData` field the distance that the file offset of
+    /// its `AddressOfRawData` moved. A field whose data does not move keeps its value, also a
+    /// stale value. Thus a build that keeps the layout keeps the bytes. The field can be
+    /// outside the section data, for example in the zero tail. Then the write fails, and the
+    /// field keeps its value.
+    pub(super) fn rebase_debug_pointers(&mut self, pointers: &[DebugPointer]) {
+        for pointer in pointers {
+            let Some(offset) = self.rva_to_offset(pointer.address) else {
                 continue;
             };
-            let Some(file_offset) = (entry.address_of_raw_data != 0)
+            if offset == pointer.offset {
+                continue;
+            }
+            let rebased =
+                i64::from(pointer.pointer) + i64::from(offset) - i64::from(pointer.offset);
+            if let Ok(rebased) = u32::try_from(rebased) {
+                let _ = self.write_at_rva(pointer.field_rva, &rebased.to_le_bytes());
+            }
+        }
+    }
+
+    /// Set the `PointerToRawData` field of each debug directory entry to the file offset of its
+    /// `AddressOfRawData` in the current layout. Return `true` if a field changed.
+    ///
+    /// This also corrects a stale field. The method keeps an entry without `AddressOfRawData`,
+    /// an entry whose `AddressOfRawData` has no file offset, and a field that it cannot write.
+    pub(crate) fn synchronize_debug_file_offsets(&mut self) -> bool {
+        let mut changed = false;
+        for (field_rva, entry) in self.debug_entries() {
+            let Some(offset) = (entry.address_of_raw_data != 0)
                 .then(|| self.rva_to_offset(entry.address_of_raw_data))
                 .flatten()
             else {
                 continue;
             };
-            let Some(field_rva) = u32::try_from(index * DebugDirectory::SIZE + 24)
-                .ok()
-                .and_then(|relative| directory.virtual_address.checked_add(relative))
-            else {
-                continue;
-            };
-            // The field can be outside the section data, for example in the zero tail. Then the
-            // write fails, and the entry keeps its value.
-            let _ = self.write_at_rva(field_rva, &file_offset.to_le_bytes());
+            if offset != entry.pointer_to_raw_data
+                && self
+                    .write_at_rva(field_rva, &offset.to_le_bytes())
+                    .is_some()
+            {
+                changed = true;
+            }
         }
+        changed
     }
 
     /// Serialize the DOS header, the DOS stub, the NT headers and the raw header bytes.
@@ -602,6 +654,21 @@ impl PeImage {
         stream.write_all(&self.try_build()?)?;
         Ok(())
     }
+}
+
+/// The offset of `PointerToRawData` in `IMAGE_DEBUG_DIRECTORY`.
+const DEBUG_POINTER_FIELD: usize = 24;
+
+/// A `PointerToRawData` field of an `IMAGE_DEBUG_DIRECTORY` entry, before a layout update.
+pub(super) struct DebugPointer {
+    /// The RVA of the field.
+    field_rva: u32,
+    /// `AddressOfRawData`: the RVA of the debug data.
+    address: u32,
+    /// The value of the field: a file offset.
+    pointer: u32,
+    /// The file offset of `address` before the layout update.
+    offset: u32,
 }
 
 fn try_zeroed_buffer(size: usize, context: &str) -> Result<Vec<u8>> {
