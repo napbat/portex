@@ -118,8 +118,8 @@ impl PeBuilder {
 
     /// Set the preferred image base (`ImageBase`, a VA).
     ///
-    /// If you do not call this method, the build uses 0x1_4000_0000 for a PE32+ image and
-    /// 0x40_0000 for a PE32 image.
+    /// If you do not call this method, the build uses `0x1_4000_0000` for a PE32+ image and
+    /// `0x40_0000` for a PE32 image.
     #[must_use]
     pub fn image_base(mut self, base: u64) -> Self {
         self.image_base = Some(base);
