@@ -244,7 +244,7 @@ impl PeImage {
     }
 
     /// Return `true` if this image has the section RVAs of `other`.
-    fn has_section_rvas_of(&self, other: &PeImage) -> bool {
+    pub(super) fn has_section_rvas_of(&self, other: &PeImage) -> bool {
         self.sections.len() == other.sections.len()
             && self
                 .sections

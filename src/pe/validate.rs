@@ -495,25 +495,71 @@ impl PeImage {
         }
     }
 
-    /// Check that the virtual ranges of the sections do not overlap.
+    /// Check that the virtual ranges of the sections do not overlap and leave no gap.
     ///
     /// Each range has the size that the loader maps (see [`SectionHeader::mapped_size`]).
     ///
     /// [`SectionHeader::mapped_size`]: crate::SectionHeader::mapped_size
     fn validate_section_virtual_overlaps(&self, result: &mut ValidationResult) {
         let alignment = self.optional_header.section_alignment();
-        let ranges = self
+        let ranges: Vec<SectionRange> = self
             .sections
             .iter()
             .enumerate()
-            .filter(|(_, section)| section.header.mapped_size(alignment) != 0)
             .map(|(index, section)| {
                 let start = u64::from(section.header.virtual_address);
                 (start, start + section.header.mapped_size(alignment), index)
             })
             .collect();
+        self.validate_section_gaps(result, &ranges);
+        let ranges = ranges
+            .into_iter()
+            .filter(|(start, end, _)| end > start)
+            .collect();
         for (earlier, later) in overlapping_ranges(ranges) {
             self.push_overlap(result, "virtual memory", earlier, later);
+        }
+    }
+
+    /// Check that each section starts where the previous one ends, and has a size.
+    ///
+    /// The loader expects the first section at `SizeOfHeaders` aligned to `SectionAlignment`,
+    /// and each next section at the end of the mapped size of the previous one. It rejects an
+    /// image with a gap or with a section that has no size.
+    fn validate_section_gaps(&self, result: &mut ValidationResult, ranges: &[SectionRange]) {
+        let alignment = self.optional_header.section_alignment();
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return;
+        }
+        let mut sorted = ranges.to_vec();
+        sorted.sort_unstable();
+        let mut expected = u64::from(self.optional_header.size_of_headers())
+            .div_ceil(u64::from(alignment))
+            * u64::from(alignment);
+        for (start, end, index) in sorted {
+            let name = self.sections[index].header.name_str();
+            if start > expected {
+                result.push(
+                    ValidationIssue::error(
+                        ValidationCode::InvalidSectionLayout,
+                        format!(
+                            "section '{name}' starts at {start:#x}, after a gap from {expected:#x}; \
+                             the loader rejects a gap"
+                        ),
+                    )
+                    .with_context(name.to_string()),
+                );
+            }
+            if end == start {
+                result.push(
+                    ValidationIssue::error(
+                        ValidationCode::InvalidSectionLayout,
+                        format!("section '{name}' has no size; the loader rejects it"),
+                    )
+                    .with_context(name.to_string()),
+                );
+            }
+            expected = expected.max(end);
         }
     }
 

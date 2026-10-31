@@ -7,6 +7,11 @@ use crate::section::{Section, SectionHeader};
 use crate::{Error, Result};
 
 impl PeImage {
+    /// Update the layout, and return the RVA where an append to a section puts its data.
+    ///
+    /// The RVA is after the section data and after `VirtualSize`, so that the data does not
+    /// overwrite the uninitialized data (BSS) of the section. It is aligned to
+    /// [`APPEND_ALIGNMENT`], so that each structure in the data is aligned.
     pub(super) fn prepare_section_append(&mut self, section_index: usize) -> Result<u32> {
         self.try_update_layout()?;
         let section = self
@@ -14,32 +19,66 @@ impl PeImage {
             .get(section_index)
             .ok_or_else(|| Error::invalid_section("section index is out of range"))?;
         let offset = u32::try_from(section.data.len())
-            .map_err(|_| Error::invalid_section("section data exceeds u32"))?;
-        section
-            .header
-            .virtual_address
-            .checked_add(offset)
+            .map_err(|_| Error::invalid_section("section data exceeds u32"))?
+            .max(section.header.virtual_size);
+        layout::checked_align_up(offset, APPEND_ALIGNMENT)
+            .and_then(|offset| section.header.virtual_address.checked_add(offset))
             .ok_or_else(|| Error::invalid_section("appended section-data RVA overflow"))
     }
 
+    /// Append `data` at the RVA that [`Self::prepare_section_append`] returned.
+    ///
+    /// The method fills the space before `expected_rva` with zeros.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the append moves a section, for example if the data does not fit
+    /// before the next section. Then the image does not change.
     pub(super) fn commit_section_append(
         &mut self,
         section_index: usize,
         expected_rva: u32,
         data: &[u8],
     ) -> Result<()> {
+        if self.try_commit_section_append(section_index, expected_rva, data)? {
+            Ok(())
+        } else {
+            Err(self.moved_section_error(section_index))
+        }
+    }
+
+    /// Append `data` at `expected_rva`, as [`Self::commit_section_append`] does.
+    ///
+    /// Return `Ok(false)` and do not change the image if the append moves a section.
+    fn try_commit_section_append(
+        &mut self,
+        section_index: usize,
+        expected_rva: u32,
+        data: &[u8],
+    ) -> Result<bool> {
         let mut candidate = self.clone();
         let section = candidate
             .sections
             .get_mut(section_index)
             .ok_or_else(|| Error::invalid_section("section index is out of range"))?;
+        let start = expected_rva
+            .checked_sub(section.header.virtual_address)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .filter(|offset| *offset >= section.data.len())
+            .ok_or_else(|| {
+                Error::invalid_section("the append RVA is not after the section data")
+            })?;
+        section
+            .data
+            .try_reserve(start - section.data.len())
+            .map_err(|_| Error::invalid_section("section data is too large to allocate"))?;
+        section.data.resize(start, 0);
         let offset = section.try_append_data(data)?;
         candidate.try_update_layout()?;
-        let section = candidate
-            .sections
-            .get(section_index)
-            .ok_or_else(|| Error::invalid_section("section index is out of range"))?;
-        let actual_rva = section
+        if !candidate.has_section_rvas_of(self) {
+            return Ok(false);
+        }
+        let actual_rva = candidate.sections[section_index]
             .header
             .virtual_address
             .checked_add(offset)
@@ -50,7 +89,80 @@ impl PeImage {
             ));
         }
         *self = candidate;
-        Ok(())
+        Ok(true)
+    }
+
+    /// Return the error for an append to a section that moves another section.
+    fn moved_section_error(&self, section_index: usize) -> Error {
+        let name = self
+            .sections
+            .get(section_index)
+            .map(Section::name)
+            .unwrap_or_default();
+        Error::invalid_section(format!(
+            "the data does not fit in section '{name}' before the next section; \
+             an append must not move a section"
+        ))
+    }
+
+    /// Build data for an RVA in a section, and append it there.
+    ///
+    /// `build` gets the RVA of the data and returns the bytes and a value for the caller. If the
+    /// data does not fit before the next section, the result depends on `explicit_target`:
+    ///
+    /// - If the caller named the section (`true`), the method returns an error.
+    /// - Otherwise, the method appends the data to the last section. If the last section is not
+    ///   readable or has uninitialized data, the method adds a new section for the data. Then
+    ///   it calls `build` again with the new RVA.
+    ///
+    /// The method never moves a section. Returns the RVA of the data and the value of `build`.
+    pub(super) fn append_section_data<T>(
+        &mut self,
+        section_index: usize,
+        explicit_target: bool,
+        mut build: impl FnMut(u32) -> Result<(Vec<u8>, T)>,
+    ) -> Result<(u32, T)> {
+        let rva = self.prepare_section_append(section_index)?;
+        let (data, value) = build(rva)?;
+        if self.try_commit_section_append(section_index, rva, &data)? {
+            return Ok((rva, value));
+        }
+        if explicit_target {
+            return Err(self.moved_section_error(section_index));
+        }
+
+        let fallback = self.append_fallback_section()?;
+        let rva = self.prepare_section_append(fallback)?;
+        let (data, value) = build(rva)?;
+        self.commit_section_append(fallback, rva, &data)?;
+        Ok((rva, value))
+    }
+
+    /// Return the index of the section that gets appended data that does not fit in its target
+    /// section.
+    ///
+    /// This is the last section in RVA order, if it is readable and has no uninitialized data
+    /// after its data. Otherwise the method adds a new section after it.
+    fn append_fallback_section(&mut self) -> Result<usize> {
+        use crate::section::characteristics;
+
+        let last = self
+            .sections
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, section)| section.header.virtual_address);
+        if let Some((index, section)) = last
+            && section.header.is_readable()
+            && section.header.virtual_size as usize <= section.data.len()
+        {
+            return Ok(index);
+        }
+        self.try_add_section_with_data(
+            APPEND_SECTION_NAME,
+            Vec::new(),
+            characteristics::INITIALIZED_DATA | characteristics::READ,
+        )?;
+        Ok(self.sections.len() - 1)
     }
 
     /// Update the imports.
@@ -252,15 +364,11 @@ impl PeImage {
             return Err(crate::Error::invalid_section(section_name));
         };
 
-        // Calculate the RVA at which to put the data.
-        let append_rva = self.prepare_section_append(section_idx)?;
-
-        // Build the export data at the append RVA.
-        let builder = ExportTableBuilder::new(append_rva);
-        let (data, export_size) = builder.try_build(exports)?;
-
-        // Append the data to the section.
-        self.commit_section_append(section_idx, append_rva, &data)?;
+        // Build the export data at the RVA of the append, and append it.
+        let (append_rva, export_size) =
+            self.append_section_data(section_idx, target_section.is_some(), |rva| {
+                ExportTableBuilder::new(rva).try_build(exports)
+            })?;
 
         // Update the data directory.
         self.set_data_directory(DataDirectoryType::Export, append_rva, export_size);
@@ -387,6 +495,22 @@ impl PeImage {
         Ok(())
     }
 
+    /// Return the RVA where the layout places the first section, for a section table of
+    /// `section_count` entries.
+    ///
+    /// The result is `None` if the header size overflows. The calculation follows
+    /// [`Self::update_layout_fields`].
+    pub(super) fn first_section_rva(&self, section_count: usize) -> Option<u32> {
+        let pe_offset = usize::try_from(self.dos_header.e_lfanew).ok()?;
+        let optional_size = self
+            .optional_header
+            .size()
+            .max(usize::from(self.coff_header.size_of_optional_header));
+        let table_end = layout::headers_size_at(pe_offset, section_count, optional_size)?;
+        let headers_size = u32::try_from(self.header_data_end(table_end)?).ok()?;
+        layout::checked_align_up(headers_size, self.optional_header.section_alignment())
+    }
+
     /// Remove the header tail after the section table grows into it.
     ///
     /// The section table replaces the start of the tail. If the `BoundImport` directory points
@@ -440,62 +564,149 @@ impl PeImage {
 
     // ========== Section Management ==========
 
-    /// Remove the section at `index`.
+    /// Remove the section with the given name, and return it.
     ///
-    /// Returns the removed section, or `None` if `index` is out of bounds.
+    /// The method removes only a section that leaves no gap in the RVA range: the last section
+    /// in RVA order, a section with no size, or a section that has no RVA yet. The loader
+    /// rejects an image with a gap between two sections.
     ///
     /// **Warning**: Removing a section can break the PE image if data directories or code refer
     /// to data in that section. Use this function with caution.
-    pub fn remove_section_at(&mut self, index: usize) -> Option<Section> {
-        if index >= self.sections.len() {
-            return None;
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no section has the name `name`, or if the removal leaves a gap in the
+    /// RVA range. Then the image does not change.
+    pub fn remove_section(&mut self, name: &str) -> Result<Section> {
+        let index = self
+            .section_index(name)
+            .ok_or_else(|| Error::invalid_section(format!("no section is named '{name}'")))?;
+        self.remove_section_at(index)
+    }
+
+    /// Remove the section at `index` in the section table, and return it.
+    ///
+    /// See [`Self::remove_section`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `index` is out of bounds, or if the removal leaves a gap in the RVA
+    /// range. Then the image does not change.
+    pub fn remove_section_at(&mut self, index: usize) -> Result<Section> {
+        let section = self.sections.get(index).ok_or_else(|| {
+            Error::invalid_section(format!("section index {index} is out of range"))
+        })?;
+        let start = section.header.virtual_address;
+        let alignment = self.optional_header.section_alignment();
+        if start != 0
+            && section.header.mapped_size(alignment) != 0
+            && self
+                .sections
+                .iter()
+                .any(|other| other.header.virtual_address > start)
+        {
+            return Err(Error::invalid_section(format!(
+                "removing section '{}' leaves a gap in the RVA range; the loader rejects a gap",
+                section.name()
+            )));
         }
         let section = self.sections.remove(index);
         self.coff_header.number_of_sections =
             u16::try_from(self.sections.len()).unwrap_or(u16::MAX);
-        Some(section)
+        Ok(section)
     }
 
-    /// Find a section by name.
-    #[must_use]
-    pub fn find_section(&self, name: &str) -> Option<&Section> {
-        self.sections.iter().find(|s| s.name() == name)
-    }
-
-    /// Find a section by name and returns a mutable reference.
-    pub fn find_section_mut(&mut self, name: &str) -> Option<&mut Section> {
-        self.sections.iter_mut().find(|s| s.name() == name)
+    /// Return the index of the first section with the given name.
+    fn section_index(&self, name: &str) -> Option<usize> {
+        self.sections
+            .iter()
+            .position(|section| section.name() == name)
     }
 
     /// Resize the data of a section.
     ///
-    /// If the new size is larger, the function pads the data with zeros. If the new size is
-    /// smaller, the function truncates the data.
+    /// See [`Self::try_resize_section`].
     ///
-    /// Returns `true` if the function found and resized the section, `false` otherwise.
-    pub fn resize_section(&mut self, name: &str, new_size: usize) -> bool {
-        self.try_resize_section(name, new_size).unwrap_or(false)
+    /// # Panics
+    ///
+    /// Panics if [`Self::try_resize_section`] returns an error.
+    pub fn resize_section(&mut self, name: &str, new_size: usize) {
+        self.try_resize_section(name, new_size)
+            .expect("invalid section resize: use try_resize_section() for fallible updates");
     }
 
-    /// Resize a section after a check that its virtual size fits in a PE section header.
+    /// Resize the data of a section.
     ///
-    /// Returns `Ok(false)` if no section has that name.
+    /// If the new size is larger, the method pads the data with zeros. If the new size is
+    /// smaller, the method truncates the data. The method never moves a section, and never
+    /// leaves a gap in the RVA range:
+    ///
+    /// - The last section in RVA order, and a section that has no RVA yet, get `new_size` as
+    ///   `VirtualSize` (at least 1).
+    /// - Each other section keeps the RVA range that the loader maps. Its `VirtualSize` becomes
+    ///   `new_size` only if that is larger, and the bytes after the data read as zeros.
     ///
     /// # Errors
     ///
-    /// Returns an error if `new_size` exceeds `u32`.
-    pub fn try_resize_section(&mut self, name: &str, new_size: usize) -> Result<bool> {
+    /// Returns an error in these conditions. Then the image does not change.
+    ///
+    /// - No section has the name `name`.
+    /// - `new_size` exceeds `u32`, or the memory for the data cannot be allocated.
+    /// - The new size does not fit before the next section.
+    pub fn try_resize_section(&mut self, name: &str, new_size: usize) -> Result<()> {
         let new_size_u32 = u32::try_from(new_size)
             .map_err(|_| Error::invalid_section("section size exceeds u32"))?;
-        if let Some(section) = self.find_section_mut(name) {
-            section.data.resize(new_size, 0);
-            section.mapped_raw_size = None;
-            section.mapped_data_len = 0;
-            section.header.virtual_size = new_size_u32;
-            Ok(true)
-        } else {
-            Ok(false)
+        let index = self
+            .section_index(name)
+            .ok_or_else(|| Error::invalid_section(format!("no section is named '{name}'")))?;
+        let alignment = self.optional_header.section_alignment();
+        let section = &self.sections[index];
+        let start = section.header.virtual_address;
+        let next = (start != 0)
+            .then(|| {
+                self.sections
+                    .iter()
+                    .map(|other| other.header.virtual_address)
+                    .filter(|address| *address > start)
+                    .min()
+            })
+            .flatten();
+        let virtual_size = match next {
+            None => new_size_u32.max(1),
+            Some(next) => {
+                let header = &section.header;
+                let current = if header.virtual_size == 0 {
+                    header.size_of_raw_data
+                } else {
+                    header.virtual_size
+                };
+                let virtual_size = current.max(new_size_u32);
+                let resized = SectionHeader {
+                    virtual_size,
+                    ..header.clone()
+                };
+                if u64::from(start) + resized.mapped_size(alignment) > u64::from(next) {
+                    return Err(Error::invalid_section(format!(
+                        "section '{name}' with {new_size:#x} bytes does not fit before the next \
+                         section at {next:#x}; a resize must not move a section"
+                    )));
+                }
+                virtual_size
+            }
+        };
+
+        let section = &mut self.sections[index];
+        if let Some(additional) = new_size.checked_sub(section.data.len()) {
+            section
+                .data
+                .try_reserve(additional)
+                .map_err(|_| Error::invalid_section("section data is too large to allocate"))?;
         }
+        section.data.resize(new_size, 0);
+        section.mapped_raw_size = None;
+        section.mapped_data_len = 0;
+        section.header.virtual_size = virtual_size;
+        Ok(())
     }
 
     /// Add a new section with the given name, data and characteristics.
@@ -638,3 +849,12 @@ fn minimum_nonzero(current: u32, candidate: u32) -> u32 {
 
 /// The value of `e_lfanew` for NT headers directly after the DOS header.
 const DOS_HEADER_END: i32 = 0x40;
+
+/// The alignment of the data that an edit appends to a section, in bytes.
+///
+/// The structures of the data directories need at most 8-byte alignment (for example the
+/// PE32+ `IMAGE_TLS_DIRECTORY64` and `IMAGE_LOAD_CONFIG_DIRECTORY64`).
+const APPEND_ALIGNMENT: u32 = 8;
+
+/// The name of the section that an edit adds for data that fits in no existing section.
+const APPEND_SECTION_NAME: &str = ".portex";

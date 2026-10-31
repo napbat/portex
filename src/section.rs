@@ -421,36 +421,47 @@ impl Section {
         Ok(())
     }
 
-    /// Append data to the section and updates `virtual_size`.
+    /// Append data to the section and update `virtual_size`.
+    ///
+    /// See [`Self::try_append_data`].
     ///
     /// # Panics
     ///
-    /// Panics if the combined data length is more than `u32::MAX`. Use
-    /// [`Self::try_append_data`] for a fallible update.
+    /// Panics if [`Self::try_append_data`] returns an error.
     pub fn append_data(&mut self, data: &[u8]) {
         self.try_append_data(data)
             .expect("section data exceeds u32: use try_append_data() for fallible updates");
     }
 
-    /// Append bytes to the section and returns their offset from the section start.
+    /// Append bytes to the section and return their offset from the section start.
+    ///
+    /// The bytes go after the data and after `VirtualSize`, whichever is later. The method fills
+    /// the space between them with zeros. Thus the appended bytes do not overwrite the
+    /// uninitialized data (BSS) of a section. `VirtualSize` grows to the new end of the data. It
+    /// does not become smaller.
     ///
     /// # Errors
     ///
-    /// Returns an error if the combined data length is more than `u32::MAX`. In that case, the
-    /// section does not change.
+    /// Returns an error if the combined data length is more than `u32::MAX`, or if the memory
+    /// for the data cannot be allocated. In that case, the section does not change.
     pub fn try_append_data(&mut self, data: &[u8]) -> Result<u32> {
+        let too_large = || Error::invalid_section("section data exceeds u32");
         let offset = u32::try_from(self.data.len())
-            .map_err(|_| Error::invalid_section("section data exceeds u32"))?;
-        let new_len = self
-            .data
-            .len()
-            .checked_add(data.len())
-            .and_then(|length| u32::try_from(length).ok())
-            .ok_or_else(|| Error::invalid_section("section data exceeds u32"))?;
+            .map_err(|_| too_large())?
+            .max(self.header.virtual_size);
+        let new_len = usize::try_from(offset)
+            .ok()
+            .and_then(|offset| offset.checked_add(data.len()))
+            .ok_or_else(too_large)?;
+        let new_virtual_size = u32::try_from(new_len).map_err(|_| too_large())?;
+        self.data
+            .try_reserve(new_len - self.data.len())
+            .map_err(|_| Error::invalid_section("section data is too large to allocate"))?;
+        self.data.resize(offset as usize, 0);
         self.data.extend_from_slice(data);
         self.mapped_raw_size = None;
         self.mapped_data_len = 0;
-        self.header.virtual_size = new_len;
+        self.header.virtual_size = self.header.virtual_size.max(new_virtual_size);
         Ok(offset)
     }
 

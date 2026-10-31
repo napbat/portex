@@ -92,15 +92,12 @@ impl PeImage {
             return Err(crate::Error::invalid_section(&section_name));
         };
 
-        // Get the RVA for the appended data.
-        let append_rva = self.prepare_section_append(section_idx)?;
-
-        // Build the TLS data for that RVA.
-        let builder = TlsBuilder::new(append_rva, self.image_base(), self.is_64bit());
-        let (data, dir_size) = builder.try_build_from_info(tls_info)?;
-
-        // Append the data to the section.
-        self.commit_section_append(section_idx, append_rva, &data)?;
+        // Build the TLS data at the RVA of the append, and append it.
+        let (image_base, is_64bit) = (self.image_base(), self.is_64bit());
+        let (append_rva, dir_size) =
+            self.append_section_data(section_idx, target_section.is_some(), |rva| {
+                TlsBuilder::new(rva, image_base, is_64bit).try_build_from_info(tls_info)
+            })?;
         self.set_data_directory(DataDirectoryType::Tls, append_rva, dir_size);
 
         Ok(append_rva)
@@ -185,15 +182,12 @@ impl PeImage {
             return Err(crate::Error::invalid_section(&section_name));
         };
 
-        // Get the RVA for the appended data.
-        let append_rva = self.prepare_section_append(section_idx)?;
-
-        // Build the debug data for that RVA.
-        let builder = DebugBuilder::new(append_rva);
-        let (data, dir_size, _) = builder.try_build_codeview(codeview)?;
-
-        // Append the data to the section.
-        self.commit_section_append(section_idx, append_rva, &data)?;
+        // Build the debug data at the RVA of the append, and append it.
+        let (append_rva, dir_size) =
+            self.append_section_data(section_idx, target_section.is_some(), |rva| {
+                let (data, dir_size, _) = DebugBuilder::new(rva).try_build_codeview(codeview)?;
+                Ok((data, dir_size))
+            })?;
         self.set_data_directory(DataDirectoryType::Debug, append_rva, dir_size);
 
         Ok(append_rva)
@@ -242,15 +236,12 @@ impl PeImage {
             return Err(crate::Error::invalid_section(&section_name));
         };
 
-        // Get the RVA for the appended data.
-        let append_rva = self.prepare_section_append(section_idx)?;
-
-        // Rebuild each entry together with its kept raw payload.
-        let builder = DebugBuilder::new(append_rva);
-        let (data, dir_size, _) = builder.try_build(debug_info)?;
-
-        // Append the data to the section.
-        self.commit_section_append(section_idx, append_rva, &data)?;
+        // Rebuild each entry together with its kept raw payload, at the RVA of the append.
+        let (append_rva, dir_size) =
+            self.append_section_data(section_idx, target_section.is_some(), |rva| {
+                let (data, dir_size, _) = DebugBuilder::new(rva).try_build(debug_info)?;
+                Ok((data, dir_size))
+            })?;
         self.set_data_directory(DataDirectoryType::Debug, append_rva, dir_size);
 
         Ok(append_rva)
@@ -465,8 +456,10 @@ impl PeImage {
             .iter()
             .position(|section| section.name() == section_name)
             .ok_or_else(|| Error::invalid_section(&section_name))?;
-        let rva = self.prepare_section_append(section_index)?;
-        self.commit_section_append(section_index, rva, &data)?;
+        let (rva, ()) =
+            self.append_section_data(section_index, target_section.is_some(), |_| {
+                Ok((data.clone(), ()))
+            })?;
         self.set_data_directory(DataDirectoryType::Exception, rva, size);
         Ok(rva)
     }
@@ -520,11 +513,11 @@ impl PeImage {
         // Build the exception data.
         let (data, dir_size) = ExceptionBuilder::try_build_from(directory)?;
 
-        // Get the RVA for the appended data.
-        let append_rva = self.prepare_section_append(section_idx)?;
-
         // Append the data to the section.
-        self.commit_section_append(section_idx, append_rva, &data)?;
+        let (append_rva, ()) =
+            self.append_section_data(section_idx, target_section.is_some(), |_| {
+                Ok((data.clone(), ()))
+            })?;
         self.set_data_directory(DataDirectoryType::Exception, append_rva, dir_size);
 
         Ok(append_rva)
@@ -621,11 +614,11 @@ impl PeImage {
         let builder = LoadConfigBuilder::new(self.is_64bit());
         let (data, dir_size) = builder.try_build(config)?;
 
-        // Get the RVA for the appended data.
-        let append_rva = self.prepare_section_append(section_idx)?;
-
         // Append the data to the section.
-        self.commit_section_append(section_idx, append_rva, &data)?;
+        let (append_rva, ()) =
+            self.append_section_data(section_idx, target_section.is_some(), |_| {
+                Ok((data.clone(), ()))
+            })?;
         self.set_data_directory(DataDirectoryType::LoadConfig, append_rva, dir_size);
 
         Ok(append_rva)

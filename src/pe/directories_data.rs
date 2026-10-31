@@ -105,9 +105,10 @@ impl PeImage {
             return Err(crate::Error::invalid_section(section_name));
         };
 
-        let append_rva = self.prepare_section_append(section_idx)?;
-
-        self.commit_section_append(section_idx, append_rva, &data)?;
+        let (append_rva, ()) =
+            self.append_section_data(section_idx, target_section.is_some(), |_| {
+                Ok((data.clone(), ()))
+            })?;
         // The old table can be in the header bytes after the section table. Remove it there.
         if let Some(dir) = existing_dir {
             self.header_tail
@@ -397,9 +398,10 @@ impl PeImage {
             return Err(crate::Error::invalid_section(section_name));
         };
 
-        let append_rva = self.prepare_section_append(section_idx)?;
-
-        self.commit_section_append(section_idx, append_rva, &data)?;
+        let (append_rva, ()) =
+            self.append_section_data(section_idx, target_section.is_some(), |_| {
+                Ok((data.clone(), ()))
+            })?;
         self.set_data_directory(DataDirectoryType::BaseReloc, append_rva, encoded_size);
 
         Ok(append_rva)
@@ -483,10 +485,10 @@ impl PeImage {
             return Err(crate::Error::invalid_section(section_name));
         };
 
-        let append_rva = self.prepare_section_append(section_idx)?;
-
-        let (data, size) = builder.try_build(append_rva)?;
-        self.commit_section_append(section_idx, append_rva, &data)?;
+        let (append_rva, size) =
+            self.append_section_data(section_idx, target_section.is_some(), |rva| {
+                builder.try_build(rva)
+            })?;
         self.set_data_directory(DataDirectoryType::Resource, append_rva, size);
 
         Ok(append_rva)
@@ -563,10 +565,10 @@ impl PeImage {
             return Err(crate::Error::invalid_section(section_name));
         };
 
-        let append_rva = self.prepare_section_append(section_idx)?;
-
-        let (data, size) = builder.try_build(append_rva)?;
-        self.commit_section_append(section_idx, append_rva, &data)?;
+        let (append_rva, size) =
+            self.append_section_data(section_idx, target_section.is_some(), |rva| {
+                builder.try_build(rva)
+            })?;
         self.set_data_directory(DataDirectoryType::Resource, append_rva, size);
 
         Ok(append_rva)

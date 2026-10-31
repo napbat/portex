@@ -310,20 +310,26 @@ impl PeImage {
     ///
     /// # Panics
     ///
-    /// Panics if [`Self::try_add_section`] fails. This occurs if the image already has
-    /// [`MAX_NUMBER_OF_SECTIONS`] sections, or if the section data is larger than `u32::MAX`
-    /// bytes.
+    /// Panics if [`Self::try_add_section`] returns an error.
     pub fn add_section(&mut self, section: Section) {
         self.try_add_section(section)
-            .expect("too many PE sections: use try_add_section() for fallible updates");
+            .expect("invalid PE section: use try_add_section() for fallible updates");
     }
 
     /// Add a section, and apply the section limit for executable images.
     ///
+    /// The next layout update places the section after the last section. The section table
+    /// grows by one entry. If the larger table needs the RVA of an existing section, the method
+    /// returns an error, because an edit must not move a section. This can occur in an image
+    /// with a low `SectionAlignment`.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the image already has [`MAX_NUMBER_OF_SECTIONS`] sections, or if
-    /// the section data is larger than `u32::MAX` bytes.
+    /// Returns an error in these conditions. Then the image does not change.
+    ///
+    /// - The image already has [`MAX_NUMBER_OF_SECTIONS`] sections.
+    /// - The section data is larger than `u32::MAX` bytes.
+    /// - The larger section table needs the RVA of an existing section.
     pub fn try_add_section(&mut self, section: Section) -> Result<()> {
         if self.sections.len() >= MAX_NUMBER_OF_SECTIONS {
             return Err(Error::invalid_section(format!(
@@ -332,19 +338,24 @@ impl PeImage {
         }
         u32::try_from(section.data.len())
             .map_err(|_| Error::invalid_section("section data exceeds u32"))?;
-        self.sections.push(section);
-        self.coff_header.number_of_sections = u16::try_from(self.sections.len())
+        let count = u16::try_from(self.sections.len() + 1)
             .map_err(|_| Error::invalid_section("section count exceeds u16"))?;
+        if let (Some(old_start), Some(new_start)) = (
+            self.first_section_rva(self.sections.len()),
+            self.first_section_rva(self.sections.len() + 1),
+        ) && self
+            .sections
+            .iter()
+            .any(|existing| (old_start..new_start).contains(&existing.header.virtual_address))
+        {
+            return Err(Error::invalid_section(format!(
+                "the section table grows to {new_start:#x} and moves the first section; \
+                 an edit must not move a section"
+            )));
+        }
+        self.sections.push(section);
+        self.coff_header.number_of_sections = count;
         Ok(())
-    }
-
-    /// Remove the section with the given name.
-    pub fn remove_section(&mut self, name: &str) -> Option<Section> {
-        let idx = self.sections.iter().position(|s| s.name() == name)?;
-        let removed = self.sections.remove(idx);
-        self.coff_header.number_of_sections =
-            u16::try_from(self.sections.len()).unwrap_or(u16::MAX);
-        Some(removed)
     }
 
     /// Return the RVA of the entry point.
@@ -648,34 +659,35 @@ impl PeImage {
 
     /// Append data to a section, and return the RVA of the data.
     ///
-    /// Returns `None` if the section does not exist.
+    /// Returns `None` if [`Self::try_append_to_section`] returns an error.
     pub fn append_to_section(&mut self, section_name: &str, data: &[u8]) -> Option<u32> {
         self.try_append_to_section(section_name, data).ok()
     }
 
     /// Append data to a section, with checked layout and address calculation.
     ///
+    /// The data goes after the section data and after `VirtualSize`, at the next multiple of
+    /// 8 bytes. The method fills the space before it with zeros, so that the data does not
+    /// overwrite the uninitialized data (BSS) of the section. The append never moves a section.
+    ///
     /// # Errors
     ///
-    /// Returns an error in these conditions:
+    /// Returns an error in these conditions. Then the image does not change.
     ///
     /// - No section has the name `section_name`.
     /// - The layout calculation fails.
     /// - The appended data overflows the size or the RVA range of the section.
+    /// - The data does not fit before the next section.
     pub fn try_append_to_section(&mut self, section_name: &str, data: &[u8]) -> Result<u32> {
-        self.try_update_layout()?;
-        let section = self
+        let index = self
             .sections
-            .iter_mut()
-            .find(|section| section.name() == section_name)
+            .iter()
+            .position(|section| section.name() == section_name)
             .ok_or_else(|| Error::invalid_section(section_name))?;
-        let offset = section.try_append_data(data)?;
-        let rva = section
-            .header
-            .virtual_address
-            .checked_add(offset)
-            .ok_or_else(|| Error::invalid_section("appended section-data RVA overflow"))?;
-        self.try_update_layout()?;
+        let mut updated = self.clone();
+        let rva = updated.prepare_section_append(index)?;
+        updated.commit_section_append(index, rva, data)?;
+        *self = updated;
         Ok(rva)
     }
 }
