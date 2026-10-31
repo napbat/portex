@@ -8,8 +8,12 @@ use crate::import::ImportDescriptor;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum ImportTableEnd {
-    /// End at a descriptor with all fields zero, as the loader does.
+    /// End at the first descriptor with a zero `Name` or a zero `FirstThunk`, as the Windows
+    /// loader and [`crate::ImportTable::parse`] do.
     #[default]
+    ZeroNameOrFirstThunk,
+    /// End at a descriptor with all fields zero. A linker writes such a descriptor at the end
+    /// of the table.
     NullDescriptor,
     /// End at the first descriptor with a zero `OriginalFirstThunk`, as `msdelta.dll` does.
     ZeroOriginalFirstThunk,
@@ -105,6 +109,7 @@ impl RawCursor for RawImportDescriptors {
         }
         let descriptor = RawImportDescriptor::parse(data, self.offset)?;
         let last = match self.end {
+            ImportTableEnd::ZeroNameOrFirstThunk => descriptor.descriptor().is_terminator(),
             ImportTableEnd::NullDescriptor => descriptor.is_null(),
             ImportTableEnd::ZeroOriginalFirstThunk => descriptor.original_first_thunk.value == 0,
         };
@@ -123,6 +128,11 @@ impl RawCursor for RawImportDescriptors {
 /// Use it for an import lookup table, an import address table, an export address table, an
 /// export name pointer table or the lock prefix table of the load configuration. Each entry is
 /// a [`RawField<u64>`]. A 32-bit entry has zero in its high bits.
+///
+/// # Caution
+///
+/// The entries of the export address table and the export name pointer table are 32-bit RVAs,
+/// also in a PE32+ image. For these tables, set `is_64bit` to `false`.
 #[derive(Debug, Clone)]
 pub struct RawAddressTable {
     offset: usize,
@@ -150,7 +160,8 @@ impl RawAddressTable {
 
     /// Make a cursor that reads `count` entries, also the zero entries.
     ///
-    /// Use this for an export address table or an export name pointer table.
+    /// Use this for an export address table or an export name pointer table. For these tables,
+    /// set `is_64bit` to `false`, also in a PE32+ image: their entries are 32-bit RVAs.
     #[must_use]
     pub const fn counted(offset: usize, count: usize, is_64bit: bool) -> Self {
         Self {
@@ -249,5 +260,32 @@ impl RawImportByName {
     #[must_use]
     pub fn name<'a>(&self, data: &'a [u8]) -> Option<&'a [u8]> {
         data.get(self.name_offset..self.name_offset.checked_add(self.name_len)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::prelude::*;
+
+    #[test]
+    fn the_default_end_rule_is_the_loader_rule() {
+        // The second descriptor has a `Name` and no `FirstThunk`. The loader ends the table
+        // there. Before the fix, the docs said that the null-descriptor rule is the loader rule.
+        let words = [
+            0x2000u32, 0, 0, 0x3000, 0x4000, 0x2100, 0, 0, 0x3100, 0, 0, 0, 0, 0, 0,
+        ];
+        let data: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let count = |end| {
+            let mut cursor = RawImportDescriptors::new(0, data.len(), end);
+            let mut count = 0;
+            while cursor.read_next(&data).unwrap().is_some() {
+                count += 1;
+            }
+            count
+        };
+        assert_eq!(count(ImportTableEnd::default()), 1);
+        assert_eq!(count(ImportTableEnd::ZeroNameOrFirstThunk), 1);
+        assert_eq!(count(ImportTableEnd::NullDescriptor), 2);
     }
 }

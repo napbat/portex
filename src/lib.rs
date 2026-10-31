@@ -139,7 +139,7 @@ pub use coff::{CoffHeader, MachineType};
 pub use data_dir::{DataDirectory, DataDirectoryType};
 pub use debug::{CodeViewRsds, DebugBuilder, DebugDirectory, DebugInfo, DebugType};
 pub use delay_import::{
-    DelayImportBuilder, DelayImportDirectory, DelayImportThunk, DelayLoadDescriptor, DelayLoadedDll,
+    DelayImportBuilder, DelayImportDirectory, DelayLoadDescriptor, DelayLoadedDll,
 };
 pub use dos::DosHeader;
 pub use error::{Error, ErrorContext, ErrorKind, Result};

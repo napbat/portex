@@ -7,7 +7,7 @@
 use super::{NormalizeKept, PAGE_SIZE, loader_virtual_size};
 use crate::data_dir::{DataDirectory, DataDirectoryType};
 use crate::debug::DebugDirectory;
-use crate::delay_import::{DelayImportDirectory, DelayImportThunk, DelayLoadDescriptor};
+use crate::delay_import::{DelayImportDirectory, DelayLoadDescriptor};
 use crate::import::{ImportDescriptor, ImportTable, ImportThunk};
 use crate::layout::{checked_align_up, loader_raw_offset};
 use crate::optional::OptionalHeader;
@@ -654,8 +654,8 @@ fn push_delay_import_ranges(
             dll.name.len().checked_add(1)?,
         ));
         let names = dll.imports.iter().map(|thunk| match thunk {
-            DelayImportThunk::Name { name, .. } => Some(name.len()),
-            DelayImportThunk::Ordinal(_) => None,
+            ImportThunk::Name { name, .. } => Some(name.len()),
+            ImportThunk::Ordinal(_) => None,
         });
         push_thunk_ranges(
             ranges,

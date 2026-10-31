@@ -114,6 +114,11 @@ impl PeImage {
     /// - CLR metadata
     /// - Directories with an encoding that Portex does not own
     ///
+    /// The rebuilt import and delay-import tables keep each existing import address table
+    /// (IAT) at its RVA, because their function lists do not change. Code that calls through
+    /// the IATs thus continues to work. See [`Self::update_imports`] and
+    /// [`Self::update_delay_imports`].
+    ///
     /// # Errors
     ///
     /// Returns an error if any data directory fails to parse or rebuild.

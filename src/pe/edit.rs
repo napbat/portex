@@ -174,6 +174,20 @@ impl PeImage {
     /// 2. `.rdata`.
     /// 3. The last section.
     ///
+    /// The function keeps the import address table (IAT) of each DLL whose function list is
+    /// unchanged: the descriptor keeps its `FirstThunk`. Only the import lookup table, the
+    /// names and the descriptors move. Code that calls through the existing IAT slots thus
+    /// continues to work. A DLL is unchanged if [`Self::imports`] has a DLL with the same
+    /// `descriptor.first_thunk` and the same `imports`. Start from [`Self::imports`] to keep
+    /// the IATs. See [`crate::ImportTableBuilder`].
+    ///
+    /// A new DLL, or a DLL whose function list changed, gets a new IAT in the written data.
+    /// Code that uses the old IAT of a changed DLL must be patched by the caller.
+    ///
+    /// The IAT data directory gets the range from the first IAT to the end of the last IAT. If
+    /// this range is not in one section, the function clears the IAT data directory. A range
+    /// over more than one section can include pages with other protections.
+    ///
     /// Returns the RVA of the import directory. Returns 0 if `imports` is empty; then the
     /// function clears the import and IAT data directories.
     ///
@@ -199,30 +213,29 @@ impl PeImage {
         }
         self.ensure_data_directory_slot(DataDirectoryType::Iat)?;
 
-        // Calculate the required size.
-        let builder_temp = ImportTableBuilder::new(self.is_64bit(), 0);
-        let required_size = builder_temp.try_calculate_size(imports)?;
+        // Keep the IATs of the unchanged DLLs. If the current table is malformed, no DLL is
+        // unchanged, and each DLL gets a new IAT.
+        let current = self.imports().unwrap_or_default();
+        let is_64bit = self.is_64bit();
+        let builder_at =
+            |base_rva| ImportTableBuilder::new(is_64bit, base_rva).keep_unchanged_iats(&current);
 
-        // Try to replace the data in place.
+        // Calculate the required size.
+        let required_size = builder_at(0).try_calculate_size(imports)?;
+
+        // Try to replace the data in place. Do not write in place if a kept IAT is in the way.
         let existing_dir = self.data_directory(DataDirectoryType::Import).copied();
-        if let Some(ref dir) = existing_dir
+        if let Some(dir) = &existing_dir
             && dir.is_present()
             && dir.size as usize >= required_size
+            && let Ok((data, iat_rva, iat_size)) =
+                builder_at(dir.virtual_address).try_build(imports)
+            && self.write_at_rva(dir.virtual_address, &data).is_some()
         {
-            // The data fits in place.
-            let builder = ImportTableBuilder::new(self.is_64bit(), dir.virtual_address);
-            let (data, iat_rva, iat_size) = builder.try_build(imports)?;
-
-            if self.write_at_rva(dir.virtual_address, &data).is_some() {
-                let import_size = import_descriptor_table_size(imports.dlls.len())?;
-                self.set_data_directory(
-                    DataDirectoryType::Import,
-                    dir.virtual_address,
-                    import_size,
-                );
-                self.set_data_directory(DataDirectoryType::Iat, iat_rva, iat_size);
-                return Ok(dir.virtual_address);
-            }
+            let import_size = import_descriptor_table_size(imports.dlls.len())?;
+            self.set_data_directory(DataDirectoryType::Import, dir.virtual_address, import_size);
+            set_iat_directory(self, iat_rva, iat_size);
+            return Ok(dir.virtual_address);
         }
 
         // Find the target section for the append, in this order:
@@ -261,8 +274,7 @@ impl PeImage {
         let append_rva = self.prepare_section_append(section_idx)?;
 
         // Build the import data at the append RVA.
-        let builder = ImportTableBuilder::new(self.is_64bit(), append_rva);
-        let (data, iat_rva, iat_size) = builder.try_build(imports)?;
+        let (data, iat_rva, iat_size) = builder_at(append_rva).try_build(imports)?;
 
         // Append the data to the section.
         self.commit_section_append(section_idx, append_rva, &data)?;
@@ -270,7 +282,7 @@ impl PeImage {
         // Update the data directories.
         let import_size = import_descriptor_table_size(imports.dlls.len())?;
         self.set_data_directory(DataDirectoryType::Import, append_rva, import_size);
-        self.set_data_directory(DataDirectoryType::Iat, iat_rva, iat_size);
+        set_iat_directory(self, iat_rva, iat_size);
 
         Ok(append_rva)
     }
@@ -764,6 +776,31 @@ fn import_descriptor_table_size(dll_count: usize) -> Result<u32> {
         .and_then(|count| count.checked_mul(crate::import::ImportDescriptor::SIZE))
         .and_then(|size| u32::try_from(size).ok())
         .ok_or_else(|| Error::invalid_data_directory("import descriptor table exceeds u32"))
+}
+
+/// Set the IAT data directory to `iat_rva..iat_rva + iat_size` if one section holds this
+/// range. Else clear the IAT data directory.
+///
+/// The loader makes the IAT range writable while it binds the imports. A range over more than
+/// one section can include pages with other protections. Without an IAT data directory, the
+/// loader uses the section of each IAT.
+fn set_iat_directory(image: &mut PeImage, iat_rva: u32, iat_size: u32) {
+    use crate::data_dir::DataDirectoryType;
+
+    let one_section = iat_size
+        .checked_sub(1)
+        .and_then(|last| iat_rva.checked_add(last))
+        .and_then(|last| {
+            image
+                .section_by_rva(iat_rva)
+                .zip(image.section_by_rva(last))
+        })
+        .is_some_and(|(first, last)| core::ptr::eq(first, last));
+    if one_section {
+        image.set_data_directory(DataDirectoryType::Iat, iat_rva, iat_size);
+    } else {
+        image.clear_data_directory(DataDirectoryType::Iat);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
