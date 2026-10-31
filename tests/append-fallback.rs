@@ -288,3 +288,37 @@ fn rebuild_does_not_put_tables_in_a_discardable_last_section() {
     assert_eq!(image.exports().unwrap().exports.len(), 1);
     assert_eq!(image.tls().unwrap().unwrap().callback_rvas, [0x1000]);
 }
+
+/// Build `.text` and a last `.data` section with 16 bytes of data and a 32 MiB `VirtualSize`.
+fn image_with_large_bss() -> PeImage {
+    PeBuilder::new()
+        .machine(MachineType::Amd64)
+        .add_section(".text", vec![0xc3; 16], characteristics::CODE)
+        .add_section_with_virtual_size(
+            ".data",
+            vec![2; 16],
+            0x0200_0000,
+            READ_DATA | characteristics::WRITE,
+        )
+        .try_build()
+        .unwrap()
+}
+
+#[test]
+fn an_append_to_a_named_section_does_not_write_a_large_zero_fill() {
+    let mut image = image_with_large_bss();
+    // Before the fix, the append wrote 32 MiB of zeros before the data.
+    assert!(image.try_append_to_section(".data", &[1; 16]).is_err());
+    assert_eq!(image.sections[1].data.len(), 16);
+}
+
+#[test]
+fn an_append_without_a_named_section_skips_a_large_zero_fill() {
+    let mut image = image_with_large_bss();
+    // Before the fix, the table went after the 32 MiB `VirtualSize` of `.data`.
+    let rva = image.update_exports(&large_exports(), None).unwrap();
+    assert_eq!(image.sections[1].data.len(), 16);
+    assert_eq!(image.section_by_rva(rva).unwrap().name(), ".portex");
+    let rebuilt = PeImage::parse(&image.try_build().unwrap()).unwrap();
+    assert_eq!(rebuilt.exports().unwrap().exports.len(), 400);
+}

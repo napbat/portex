@@ -175,18 +175,20 @@ pub const MAX_NUMBER_OF_SECTIONS: usize = 65535;
 ///
 /// - The data starts at an 8-byte aligned RVA after the `VirtualSize` of the section and
 ///   after the last nonzero byte of the section data. Thus zero raw padding after
-///   `VirtualSize` can hold the data. The method fills the space before the data with zeros.
+///   `VirtualSize` can hold the data. The method fills the space before the data with zeros,
+///   up to 16 MiB. A section that needs more zero fill does not get the data.
 /// - The method never moves a section. If you named the target section, the method returns
-///   an error if the data does not fit before the next section. It also returns an error if
-///   the data needs a writable section and the section is not writable (see
-///   [`Self::update_imports`] and [`Self::update_delay_imports`]).
+///   an error if the data does not fit before the next section or needs more than 16 MiB of
+///   zero fill. It also returns an error if the data needs a writable section and the section
+///   is not writable (see [`Self::update_imports`] and [`Self::update_delay_imports`]).
 /// - If you did not name a section, the method uses a fallback when the data does not fit,
-///   when the table cannot be built at the RVA in that section (for example because a kept
-///   import address table is in the way), or when the section is not writable and the data
-///   needs a writable section. The fallback is the last section. The method does not use the
-///   last section if it is not readable, has uninitialized data, is discardable (a driver can
-///   free it after the load) or is `.rsrc` (resource editors write it again). Then the method
-///   adds a new `.portex` section. This section is writable only if the data needs it.
+///   when it needs more than 16 MiB of zero fill, when the table cannot be built at the RVA
+///   in that section (for example because a kept import address table is in the way), or
+///   when the section is not writable and the data needs a writable section. The fallback is
+///   the last section. The method does not use the last section if it is not readable, has
+///   uninitialized data, is discardable (a driver can free it after the load) or is `.rsrc`
+///   (resource editors write it again). Then the method adds a new `.portex` section. This
+///   section is writable only if the data needs it.
 /// - If an `update_*` method returns an error, the image does not change. The exception is
 ///   a data directory table that the method extended to hold the new directory.
 #[derive(Debug, Clone, PartialEq, Eq)]

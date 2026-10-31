@@ -16,6 +16,14 @@ const APPEND_ALIGNMENT: u32 = 8;
 /// The name of the section that an edit adds for data that fits in no existing section.
 const APPEND_SECTION_NAME: &str = ".portex";
 
+/// The largest zero fill that an append writes before its data, in bytes.
+///
+/// An append after a large `VirtualSize` writes the uninitialized data of the section to the
+/// file as zeros. `VirtualSize` comes from the file, so this limit stops a header value from
+/// selecting the size of an allocation. Above the limit, an append uses another section or
+/// returns an error.
+const MAX_APPEND_ZERO_FILL: usize = 16 * 1024 * 1024;
+
 /// The result of one append attempt in one section.
 enum Attempt<T> {
     /// The data fits. The fields are the changed copy of the image, the RVA of the data and
@@ -23,6 +31,8 @@ enum Attempt<T> {
     Done(Box<PeImage>, u32, T),
     /// The data does not fit before the next section.
     NoFit,
+    /// The data starts after more than [`MAX_APPEND_ZERO_FILL`] bytes of zero fill.
+    LargeZeroFill,
     /// The data needs a writable section, and the section is not writable.
     NotWritable,
     /// The build function failed for the RVA of the attempt.
@@ -119,8 +129,9 @@ impl PeImage {
     /// `needs_write` gets the image, the index of the section and the value of `build`. It
     /// returns `true` if the data needs a writable section there.
     ///
-    /// If the data does not fit before the next section, if `build` fails, or if the section
-    /// is not writable and the data needs a writable section, the result depends on
+    /// If the data does not fit before the next section, if it starts after more than
+    /// [`MAX_APPEND_ZERO_FILL`] bytes of zero fill, if `build` fails, or if the section is not
+    /// writable and the data needs a writable section, the result depends on
     /// `explicit_target`:
     ///
     /// - If the caller named the section (`true`), the method returns an error.
@@ -152,11 +163,14 @@ impl PeImage {
             Attempt::NoFit if explicit_target => {
                 return Err(self.moved_section_error(section_index));
             }
+            Attempt::LargeZeroFill if explicit_target => {
+                return Err(self.zero_fill_error(section_index));
+            }
             Attempt::NotWritable if explicit_target => {
                 return Err(self.not_writable_error(section_index));
             }
             Attempt::NotWritable => needs_writable_section = true,
-            Attempt::BuildFailed(_) | Attempt::NoFit => {}
+            Attempt::BuildFailed(_) | Attempt::NoFit | Attempt::LargeZeroFill => {}
         }
 
         if let Some(last) = self.fallback_section_index()
@@ -169,7 +183,7 @@ impl PeImage {
                 }
                 Attempt::BuildFailed(error) => return Err(error),
                 Attempt::NotWritable => needs_writable_section = true,
-                Attempt::NoFit => {}
+                Attempt::NoFit | Attempt::LargeZeroFill => {}
             }
         }
 
@@ -188,6 +202,7 @@ impl PeImage {
                 }
                 Attempt::BuildFailed(error) => return Err(error),
                 Attempt::NoFit => return Err(candidate.moved_section_error(index)),
+                Attempt::LargeZeroFill => return Err(candidate.zero_fill_error(index)),
                 Attempt::NotWritable if !needs_writable_section => needs_writable_section = true,
                 Attempt::NotWritable => return Err(candidate.not_writable_error(index)),
             }
@@ -223,11 +238,14 @@ impl PeImage {
             .iter()
             .map(|section| section.header.virtual_address)
             .collect();
-        let section = &mut candidate.sections[section_index];
         let offset = rva
-            .checked_sub(section.header.virtual_address)
+            .checked_sub(candidate.sections[section_index].header.virtual_address)
             .and_then(|offset| usize::try_from(offset).ok())
             .ok_or_else(|| Error::invalid_section("the append RVA is not in the section"))?;
+        let section = &mut candidate.sections[section_index];
+        if offset.saturating_sub(section.data.len()) > MAX_APPEND_ZERO_FILL {
+            return Ok(Attempt::LargeZeroFill);
+        }
         section.try_write_appended(offset, &data)?;
         candidate.try_update_layout()?;
         let moved = candidate
@@ -288,6 +306,16 @@ impl PeImage {
         Error::invalid_section(format!(
             "the data does not fit in section '{}' before the next section; \
              an append must not move a section",
+            self.section_name_at(section_index)
+        ))
+    }
+
+    /// Return the error for an append that needs more than [`MAX_APPEND_ZERO_FILL`] bytes of
+    /// zero fill.
+    fn zero_fill_error(&self, section_index: usize) -> Error {
+        Error::invalid_section(format!(
+            "the data starts after more than {MAX_APPEND_ZERO_FILL} bytes of uninitialized \
+             data in section '{}'",
             self.section_name_at(section_index)
         ))
     }
