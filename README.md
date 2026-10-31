@@ -207,12 +207,17 @@ field is at an odd file offset. For each rejected fix, the method names the reas
 - `Checksum`: the checksum fix changes the loader view or does not build. A wrong checksum
   stays, or the method does not use the candidate that needs the fix.
 
-After a new layout, the build rebases the `PointerToRawData` file offsets of the
-`IMAGE_DEBUG_DIRECTORY` entries. `changes` reports this as `NormalizeChange::DebugPointers`.
-The method uses a new layout only if each such field is in a section without
-`IMAGE_SCN_CNT_CODE` or `IMAGE_SCN_MEM_EXECUTE`. Each field must also be outside the other data
-directories and outside the followed structures. Otherwise, the layout stays, and `kept` names
-`SectionData`.
+In each candidate, the method sets the `PointerToRawData` file offset of each
+`IMAGE_DEBUG_DIRECTORY` entry to the file offset of its `AddressOfRawData`. This also corrects
+a stale field. `changes` reports this as `NormalizeChange::DebugPointers`. The method uses such
+a candidate only if each changed field is in a section without `IMAGE_SCN_CNT_CODE` or
+`IMAGE_SCN_MEM_EXECUTE`. Each field must also be outside the other data directories and
+outside the followed structures. Otherwise, the debug fields and the layout stay, and `kept`
+names `SectionData`.
+
+An unedited build does not correct a stale debug field. A layout update moves each nonzero
+`PointerToRawData` field by the distance that the file offset of its `AddressOfRawData` moves.
+Thus a build that keeps the layout keeps the bytes of each field.
 
 `NormalizeChange::HeaderTail` means that the section table grows into the header bytes after
 it, and the build drops these bytes. The method allows this only for a bound import table. The
@@ -362,13 +367,30 @@ The only unsafe code is `BaseAddressReader`. Direct Cargo commands thus apply th
 The Rust examples in this README compile as doctests.
 
 The fuzz targets are in `fuzz/`. Run them with `cargo-fuzz` and a nightly toolchain. This works
-on Linux, macOS and Windows (MSVC):
+on Linux, macOS and Windows (MSVC). There are four targets:
+
+- `fuzz-pe-headers` parses the input with `PeHeaders::from_slice`.
+- `fuzz-pe-parse` parses the input as a raw `PeImage`, a mapped `PeImage` and a `PeFile`.
+- `fuzz-pe-image` runs the directory accessors, the validation, the builds, the mapping at
+  the image base and at a new base, `rebuild_supported_directories` and `normalize`. It also
+  checks that an unedited `PeFile` round trip returns the input byte for byte when
+  `preserves_source_gaps` is `true`.
+- `fuzz-raw-views` drives each view and cursor of `portex::raw`. The last 64 bytes of the
+  input select the offsets, sizes, end rules and entry widths. The target also compares
+  `PeHeaders::from_slice_strict` with `PeHeaders::from_slice`, and reads each field at the
+  offsets of `PeHeaders::header_offsets`.
 
 ```bash
 cargo +nightly fuzz run fuzz-pe-headers
 cargo +nightly fuzz run fuzz-pe-image
 cargo +nightly fuzz run fuzz-pe-parse
+cargo +nightly fuzz run fuzz-raw-views
 ```
+
+On Windows, put the directory of `clang_rt.asan_dynamic-x86_64.dll` from the Visual Studio
+installation on `PATH` before you run a target. A Rust panic on Windows stops the process with
+`__fastfail`, so libFuzzer does not write a crash file for it. The timeout and out-of-memory
+files are not affected.
 
 ## License
 

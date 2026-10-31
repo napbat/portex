@@ -63,3 +63,10 @@ path = "fuzz_targets/fuzz-pe-parse.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz-raw-views"
+path = "fuzz_targets/fuzz-raw-views.rs"
+test = false
+doc = false
+bench = false

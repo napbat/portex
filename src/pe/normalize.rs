@@ -120,8 +120,8 @@ pub enum NormalizeChange {
     /// The section table grows into the header bytes after it, so the build drops them. This is
     /// allowed only for a bound import table, which the loader can do without.
     HeaderTail,
-    /// The build rebased the `PointerToRawData` file offsets of the `IMAGE_DEBUG_DIRECTORY`
-    /// entries.
+    /// The `PointerToRawData` file offsets of the `IMAGE_DEBUG_DIRECTORY` entries changed: they
+    /// follow a new layout, or a stale field now gives the file offset of `AddressOfRawData`.
     DebugPointers,
 }
 
@@ -161,15 +161,29 @@ impl PeImage {
     /// why a fix is not in them.
     ///
     /// The first copy has normal header fields and a new file layout, if a new layout keeps the
-    /// RVA, the virtual size, the characteristics and the data of each section. The last copy
-    /// has only the normal header fields. The caller must check the loader view of each copy.
+    /// RVA, the virtual size, the characteristics and the data of each section. The next copy
+    /// has only the normal header fields. In these copies, each `PointerToRawData` field of the
+    /// debug directory is the file offset of its `AddressOfRawData`, also if the source field
+    /// is stale. If this correction changes a field, a last copy has only the normal header
+    /// fields and keeps the debug fields. The caller must check the loader view of each copy.
     pub(crate) fn normalize_candidates(&self) -> (Vec<Self>, Vec<NormalizeKept>) {
         let mut fields = self.clone();
         fields.normalize_fields();
+        let mut candidates = Vec::with_capacity(3);
+        let mut kept = Vec::new();
         match fields.normalized_layout(self) {
-            Ok(layout) => (vec![layout, fields], Vec::new()),
-            Err(reason) => (vec![fields], vec![reason]),
+            Ok(mut layout) => {
+                layout.synchronize_debug_file_offsets();
+                candidates.push(layout);
+            }
+            Err(reason) => kept.push(reason),
         }
+        let mut synchronized = fields.clone();
+        if synchronized.synchronize_debug_file_offsets() {
+            candidates.push(synchronized);
+        }
+        candidates.push(fields);
+        (candidates, kept)
     }
 
     /// Set the fields that the loader does not read to their normal values.
@@ -227,7 +241,8 @@ impl PeImage {
         {
             candidate.dos_header.e_lfanew = 0x40;
         }
-        if let Err(error) = candidate.try_update_layout() {
+        // The caller sets the debug file offsets for the new layout.
+        if let Err(error) = candidate.try_update_layout_keeping_section_data() {
             return Err(NormalizeKept::Layout(error.to_string()));
         }
         // The loader reserves and maps the pages up to `SizeOfImage`. Code can use them, so do

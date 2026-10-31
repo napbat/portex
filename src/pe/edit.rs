@@ -136,6 +136,11 @@ impl PeImage {
     /// - If the NT headers overlap the DOS header, and a new layout field changes the bytes of
     ///   `e_lfanew`, the NT headers move to offset 64 (`e_lfanew` = 0x40).
     ///
+    /// The update also rebases the `PointerToRawData` field of each debug directory entry
+    /// (`IMAGE_DEBUG_DIRECTORY`). It adds the distance that the file offset of the
+    /// `AddressOfRawData` of the entry moves. A field whose data does not move keeps its value,
+    /// also a stale value. A zero field also stays.
+    ///
     /// # Errors
     ///
     /// Returns an error in these conditions:
@@ -145,6 +150,15 @@ impl PeImage {
     /// - A header size, a section address, a section size or an aggregate size overflows its
     ///   field.
     pub fn try_update_layout(&mut self) -> Result<()> {
+        let debug_pointers = self.debug_pointers();
+        self.try_update_layout_keeping_section_data()?;
+        self.rebase_debug_pointers(&debug_pointers);
+        Ok(())
+    }
+
+    /// Recalculate the layout as [`Self::try_update_layout`] does, but do not rebase the debug
+    /// file offsets. The section data does not change.
+    pub(super) fn try_update_layout_keeping_section_data(&mut self) -> Result<()> {
         if usize::try_from(self.dos_header.e_lfanew)
             .is_ok_and(|pe_offset| pe_offset < DosHeader::SIZE)
         {
