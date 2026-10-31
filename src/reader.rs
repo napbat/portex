@@ -3,6 +3,7 @@
 use crate::prelude::*;
 use crate::{Error, Result};
 use core::cell::RefCell;
+use core::marker::PhantomData;
 use nostdio::SeekFrom;
 
 #[cfg(feature = "std")]
@@ -37,17 +38,20 @@ pub trait ReadAt {
     /// - Returns [`ErrorKind::BufferTooSmall`](crate::error::ErrorKind::BufferTooSmall) if the
     ///   source ends before `buf` is full.
     /// - Returns [`ErrorKind::OffsetOutOfBounds`](crate::error::ErrorKind::OffsetOutOfBounds) if
-    ///   the offset arithmetic overflows.
+    ///   the offset arithmetic overflows. The error holds `offset` and the length of `buf`.
     /// - Returns a generic error if [`Self::read_at`] reports more bytes than `buf` can hold.
     /// - Propagates any error from [`Self::read_at`].
     fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         let expected = buf.len();
+        let out_of_bounds =
+            || Error::offset_out_of_bounds_u64(offset, u64::try_from(expected).unwrap_or(u64::MAX));
         let mut total = 0usize;
 
         while total < expected {
-            let read_offset = offset
-                .checked_add(total as u64)
-                .ok_or_else(|| Error::offset_out_of_bounds(usize::MAX, expected))?;
+            let read_offset = u64::try_from(total)
+                .ok()
+                .and_then(|total| offset.checked_add(total))
+                .ok_or_else(out_of_bounds)?;
             let count = self.read_at(read_offset, &mut buf[total..])?;
             if count == 0 {
                 return Err(Error::buffer_too_small(expected, total));
@@ -57,9 +61,7 @@ pub trait ReadAt {
                     "ReadAt::read_at reported more bytes than the supplied buffer",
                 ));
             }
-            total = total
-                .checked_add(count)
-                .ok_or_else(|| Error::offset_out_of_bounds(usize::MAX, expected))?;
+            total = total.checked_add(count).ok_or_else(out_of_bounds)?;
         }
 
         Ok(())
@@ -313,10 +315,12 @@ impl ReadAt for VecReader {
 }
 
 #[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 /// Positional reader for a file on disk.
 pub type FileReader = SeekReader<File>;
 
 #[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 impl SeekReader<File> {
     /// Open a file for reading.
     ///
@@ -338,57 +342,78 @@ impl SeekReader<File> {
 
 /// Positional reader for memory at a base address in the current process.
 ///
-/// Use this reader to parse a module that is already loaded.
+/// Use this reader to parse a module that is already loaded. For memory that you have as a
+/// byte slice, use [`SliceReader`]. It needs no `unsafe` code.
+///
+/// The lifetime `'a` is the lifetime of the memory. The reader cannot outlive it. Select a
+/// lifetime that ends before the memory becomes invalid, for example before `FreeLibrary`
+/// unloads the module.
+///
+/// # Caution
+///
+/// A loaded module is frequently not readable for all of its `SizeOfImage` bytes:
+///
+/// - The loader maps a section without `IMAGE_SCN_MEM_READ` as no-access memory. A read of
+///   such a page stops the process with an access violation.
+/// - The loader or the module can decommit pages, for example the pages of a discardable
+///   section.
+/// - Other threads can write to the writable sections of the module. A read during such a
+///   write is a data race, which is undefined behavior.
+///
+/// The parser selects its read ranges from the header values in the memory. Thus you cannot
+/// know these ranges before the parse. Before you make the reader, use `VirtualQuery` to find
+/// the committed and readable range from `base`. Give the size of that range as `size`. Then
+/// parse with [`ParseOptions::allow_missing_section_data`](crate::ParseOptions::allow_missing_section_data)
+/// ([`MissingSectionData::Empty`](crate::MissingSectionData::Empty)). Section data after the
+/// end of the range is then empty, and the parse does not fail. Do not parse memory that other
+/// threads can change. For a module with pages that are not readable before the end of
+/// the image, implement [`ReadAt`] with a check of each page.
 #[derive(Debug, Clone, Copy)]
-pub struct BaseAddressReader {
+pub struct BaseAddressReader<'a> {
     base: *const u8,
     size: Option<usize>,
+    memory: PhantomData<&'a [u8]>,
 }
 
-impl BaseAddressReader {
+impl BaseAddressReader<'_> {
     /// Create a reader for memory that starts at `base`. `size` is an optional limit in bytes.
+    ///
+    /// Always give a `size` if you can. Without a size, the reader reads each range that the
+    /// parser requests, and the parser selects these ranges from values in the memory.
     ///
     /// # Safety
     ///
-    /// For the lifetime of the reader, the caller must make sure that:
+    /// For the lifetime `'a` of the reader, the caller must make sure that:
     ///
-    /// - The memory at `base` is readable for `size` bytes. If `size` is `None`, each range that
-    ///   a later [`ReadAt::read_at`] call requests must be readable.
-    /// - No other code changes this memory concurrently.
+    /// - The memory at `base` is readable for `size` bytes. If `size` is `None`, each range
+    ///   that a later [`ReadAt::read_at`] call requests must be readable. The only exception
+    ///   is a range that ends past the address space, or that ends more than `isize::MAX`
+    ///   bytes from `base`. [`ReadAt::read_at`] rejects such a range and does not read memory.
+    /// - Each page of this memory is committed, and its protection lets the process read it.
+    ///   A page that has no access, a guard page or a decommitted page in this memory is
+    ///   undefined behavior. See the caution on [`BaseAddressReader`].
+    /// - No other code, also not a different thread, changes this memory.
     #[must_use]
     #[expect(
         unsafe_code,
         reason = "constructor encodes the caller's memory-validity invariant"
     )]
     pub unsafe fn new(base: *const u8, size: Option<usize>) -> Self {
-        Self { base, size }
-    }
-
-    /// Create a reader for memory that starts at `base`, with no size limit.
-    ///
-    /// # Safety
-    ///
-    /// For the lifetime of the reader, the caller must make sure that each range that a later
-    /// [`ReadAt::read_at`] call requests (as an offset from `base`):
-    ///
-    /// - Is readable.
-    /// - Is not changed concurrently by other code.
-    ///
-    /// The only exception is a range that ends past the address space, or that ends more than
-    /// `isize::MAX` bytes from `base`. [`ReadAt::read_at`] rejects such a range and does not read
-    /// memory.
-    #[must_use]
-    #[expect(
-        unsafe_code,
-        reason = "constructor encodes the caller's memory-validity invariant"
-    )]
-    pub unsafe fn from_base(base: *const u8) -> Self {
-        Self { base, size: None }
+        Self {
+            base,
+            size,
+            memory: PhantomData,
+        }
     }
 }
 
-impl ReadAt for BaseAddressReader {
+impl ReadAt for BaseAddressReader<'_> {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        // An empty read copies nothing. Do not compute a pointer for it, because the offset
+        // can be past the end of the memory.
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let Ok(offset) = usize::try_from(offset) else {
             return Ok(0); // Offset too large for this platform
         };
@@ -421,8 +446,9 @@ impl ReadAt for BaseAddressReader {
         }
         // SAFETY: for an unbounded reader, the caller of the constructor guarantees that each
         // requested range from `base` is readable. The only exception is a range that the check
-        // above rejects. `offset + buf.len()` is at most `isize::MAX` and does not wrap the
-        // address space. `buf` is a distinct exclusive borrow of exactly `buf.len()` bytes.
+        // above rejects. `buf` is not empty, so the range is not empty. `offset + buf.len()` is
+        // at most `isize::MAX` and does not wrap the address space. `buf` is a distinct
+        // exclusive borrow of exactly `buf.len()` bytes.
         #[expect(unsafe_code, reason = "reads caller-guaranteed in-process memory")]
         unsafe {
             core::ptr::copy_nonoverlapping(self.base.add(offset), buf.as_mut_ptr(), buf.len());
@@ -441,15 +467,16 @@ impl ReadAt for BaseAddressReader {
 )]
 // SAFETY: the reader only reads through the raw pointer. It never writes through the pointer
 // or frees it. The caller of the constructor guarantees that the memory stays valid and does
-// not change. Thus it is sound to move the reader to another thread.
-unsafe impl Send for BaseAddressReader {}
+// not change for the lifetime `'a`, and the reader cannot outlive `'a`. Thus it is sound to
+// move the reader to another thread.
+unsafe impl Send for BaseAddressReader<'_> {}
 #[expect(
     unsafe_code,
     reason = "raw pointer field opts out of Sync automatically"
 )]
 // SAFETY: `read_at` takes `&self` and only reads through the raw pointer. Thus concurrent
 // shared access does only concurrent reads of valid memory.
-unsafe impl Sync for BaseAddressReader {}
+unsafe impl Sync for BaseAddressReader<'_> {}
 
 #[cfg(test)]
 mod tests {
@@ -488,7 +515,7 @@ mod tests {
         #[expect(unsafe_code, reason = "constructs a reader over a local buffer")]
         // SAFETY: the test reads in-range offsets of `data`, and offsets that
         // `read_at` rejects before it reads memory.
-        let reader = unsafe { BaseAddressReader::from_base(data.as_ptr()) };
+        let reader = unsafe { BaseAddressReader::new(data.as_ptr(), None) };
         assert_eq!(reader.read_u16_at(0).unwrap(), 0x5A4D);
 
         let end = u64::try_from(usize::MAX).unwrap();
@@ -500,6 +527,65 @@ mod tests {
         assert!(reader.read_exact_at(end - 1, &mut buf).is_err());
         let past_isize = u64::try_from(isize::MAX.unsigned_abs()).unwrap();
         assert!(reader.read_at(past_isize, &mut buf).is_err());
+    }
+
+    #[test]
+    fn base_address_reader_reads_an_empty_range_at_any_offset_as_empty() {
+        let data = [0x4D, 0x5A, 0x90, 0x00];
+        #[expect(unsafe_code, reason = "constructs a reader over a local buffer")]
+        // SAFETY: the test reads only empty ranges, which `read_at` does not read from memory.
+        let reader = unsafe { BaseAddressReader::new(data.as_ptr(), None) };
+        for offset in [0, 4, 1 << 40, u64::try_from(usize::MAX).unwrap(), u64::MAX] {
+            assert_eq!(
+                reader.read_at(offset, &mut []).unwrap(),
+                0,
+                "offset {offset:#x}"
+            );
+            reader.read_exact_at(offset, &mut []).unwrap();
+        }
+
+        #[expect(unsafe_code, reason = "constructs a reader over a local buffer")]
+        // SAFETY: `data` is readable for its length and does not change.
+        let bounded = unsafe { BaseAddressReader::new(data.as_ptr(), Some(data.len())) };
+        assert_eq!(bounded.read_at(2, &mut []).unwrap(), 0);
+        assert_eq!(bounded.read_at(u64::MAX, &mut []).unwrap(), 0);
+    }
+
+    /// Source that has a byte at each offset and reads one byte for each call.
+    struct OneByteReader;
+
+    impl ReadAt for OneByteReader {
+        fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize> {
+            match buf.first_mut() {
+                Some(byte) => {
+                    *byte = 0xAA;
+                    Ok(1)
+                }
+                None => Ok(0),
+            }
+        }
+
+        fn size(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    #[test]
+    fn read_exact_at_reports_the_u64_offset_of_an_overflowing_request() {
+        let mut buf = [0u8; 4];
+        let error = OneByteReader
+            .read_exact_at(u64::MAX - 1, &mut buf)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error.kind(),
+                ErrorKind::OffsetOutOfBounds {
+                    offset: 0xFFFF_FFFF_FFFF_FFFE,
+                    size: 4
+                }
+            ),
+            "{error}"
+        );
     }
 
     /// Stream that fails its first read with an interrupted error, as a signal can.
