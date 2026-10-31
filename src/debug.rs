@@ -238,7 +238,9 @@ impl DebugInfo {
     /// The maximum number of payload bytes that one parse keeps, for all entries together.
     ///
     /// Many entries can point to the same bytes. This limit stops a small file from using a
-    /// large quantity of memory.
+    /// large quantity of memory. The parse does not read a payload that is larger than the
+    /// rest of this budget. The entry of that payload stays in [`Self::directories`], and its
+    /// payload is `None` in [`Self::data`].
     pub const MAX_PAYLOAD_BYTES: usize = 64 << 20;
 
     /// Parse the debug directory at RVA `debug_rva`.
@@ -254,13 +256,12 @@ impl DebugInfo {
     ///
     /// The function does not decode the payloads. A malformed payload, for example a bad
     /// CodeView record, does not cause an error here. An unreadable payload is `None` in
-    /// [`Self::data`].
+    /// [`Self::data`]. A payload that goes past [`Self::MAX_PAYLOAD_BYTES`] is also `None`.
     ///
     /// # Errors
     /// Returns an error if one of these conditions occurs:
     /// - The table cannot be read.
     /// - A payload length does not match.
-    /// - The payloads together are larger than [`Self::MAX_PAYLOAD_BYTES`].
     pub fn parse<F>(debug_rva: u32, debug_size: u32, read_at_rva: F) -> Result<Self>
     where
         F: Fn(u32, usize) -> Option<Vec<u8>>,
@@ -348,21 +349,22 @@ impl DebugInfo {
         let mut budget = Self::MAX_PAYLOAD_BYTES;
         for data in entries {
             let dir = DebugDirectory::parse(data)?;
-            let payload = read_payload(&dir);
+            // Do not read a payload that goes past the budget. Keep its entry.
+            let declared = dir.size_of_data as usize;
+            let payload = if declared > budget {
+                None
+            } else {
+                read_payload(&dir)
+            };
             if let Some(payload) = &payload {
-                if payload.len() != dir.size_of_data as usize {
+                if payload.len() != declared {
                     return Err(Error::invalid_data_directory(format!(
                         "debug payload has {} bytes but declares {}",
                         payload.len(),
                         dir.size_of_data
                     )));
                 }
-                budget = budget.checked_sub(payload.len()).ok_or_else(|| {
-                    Error::invalid_data_directory(format!(
-                        "debug payloads are larger than the limit of {} bytes",
-                        Self::MAX_PAYLOAD_BYTES
-                    ))
-                })?;
+                budget -= declared;
             }
             directories.push(dir);
             raw_data.push(payload);
@@ -594,17 +596,28 @@ mod tests {
         let file = vec![0x11; 0x1000 + size];
         let table_size = u32::try_from(table.len()).unwrap();
 
-        let error =
-            DebugInfo::parse_with_file(0, table_size, reader(&table), reader(&file)).unwrap_err();
-        assert!(matches!(
-            error.kind,
-            crate::ErrorKind::InvalidDataDirectory(_)
-        ));
-
-        // The same entries without the last one fit in the budget.
-        let table_size = table_size - DebugDirectory::SIZE_U32;
+        // The last payload goes past the budget. Its entry stays, without a payload.
         let info =
             DebugInfo::parse_with_file(0, table_size, reader(&table), reader(&file)).unwrap();
-        assert_eq!(info.data.len(), count - 1);
+        assert_eq!(info.directories.len(), count);
+        assert!(info.data[..count - 1].iter().all(Option::is_some));
+        assert_eq!(info.data[count - 1], None);
+    }
+
+    #[test]
+    fn a_payload_larger_than_the_budget_is_not_read() {
+        let size = DebugInfo::MAX_PAYLOAD_BYTES + 1;
+        let bytes = entry(DebugType::Coff, size, 0x40).to_vec();
+        let read_count = core::cell::Cell::new(0);
+        let read = |rva: u32, len: usize| {
+            read_count.set(read_count.get() + 1);
+            reader(&bytes)(rva, len)
+        };
+
+        let info = DebugInfo::parse(0, 28, read).unwrap();
+        assert_eq!(info.directories.len(), 1);
+        assert_eq!(info.data, [None]);
+        // Only the table is read.
+        assert_eq!(read_count.get(), 1);
     }
 }

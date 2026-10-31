@@ -89,6 +89,7 @@ extern crate std;
 /// type, and this causes no problem.
 pub(crate) mod prelude {
     pub use alloc::borrow::Cow;
+    pub use alloc::boxed::Box;
     pub use alloc::collections::{BTreeMap, BTreeSet};
     pub use alloc::format;
     pub use alloc::string::{String, ToString};

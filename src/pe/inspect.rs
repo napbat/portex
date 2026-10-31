@@ -666,9 +666,10 @@ impl PeImage {
 
     /// Append data to a section, with checked layout and address calculation.
     ///
-    /// The data goes after the section data and after `VirtualSize`, at the next multiple of
-    /// 8 bytes. The method fills the space before it with zeros, so that the data does not
-    /// overwrite the uninitialized data (BSS) of the section. The append never moves a section.
+    /// The data goes after `VirtualSize` and after the last nonzero byte of the section data,
+    /// at the next multiple of 8 bytes. Thus it does not overwrite the uninitialized data (BSS)
+    /// of the section, and it can reuse zero raw padding. The method fills the space before
+    /// the data with zeros. The append never moves a section.
     ///
     /// # Errors
     ///
@@ -684,11 +685,7 @@ impl PeImage {
             .iter()
             .position(|section| section.name() == section_name)
             .ok_or_else(|| Error::invalid_section(section_name))?;
-        let mut updated = self.clone();
-        let rva = updated.prepare_section_append(index)?;
-        updated.commit_section_append(index, rva, data)?;
-        *self = updated;
-        Ok(rva)
+        self.append_to_section_at(index, data)
     }
 }
 

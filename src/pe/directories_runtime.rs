@@ -53,7 +53,8 @@ impl PeImage {
     ///
     /// This function creates the TLS directory, or replaces the current one. If
     /// `target_section` is `None`, the function uses ".rdata". If ".rdata" does not exist, it
-    /// uses the last section.
+    /// uses the last section. See [Directory updates](crate::PeImage#directory-updates) for
+    /// the fallback if the data does not fit.
     ///
     /// The function keeps the original TLS index (`AddressOfIndex`); see
     /// [`TlsBuilder::try_build_from_info`](crate::tls::TlsBuilder::try_build_from_info).
@@ -74,8 +75,19 @@ impl PeImage {
     /// be extended, if the target section does not exist, if the TLS data
     /// cannot be serialized, or if the append fails (see
     /// [Directory updates](crate::PeImage#directory-updates)). Also returns an
-    /// error if the base relocations cannot be parsed or written.
+    /// error if the base relocations cannot be parsed or written. If an error occurs, the
+    /// image does not change.
     pub fn update_tls(
+        &mut self,
+        tls_info: &crate::tls::TlsInfo,
+        target_section: Option<&str>,
+    ) -> Result<u32> {
+        self.transact(|image| image.update_tls_in(tls_info, target_section))
+    }
+
+    /// Do the work of [`Self::update_tls`] on the image. An error can leave the image half
+    /// updated.
+    fn update_tls_in(
         &mut self,
         tls_info: &crate::tls::TlsInfo,
         target_section: Option<&str>,
@@ -557,7 +569,8 @@ impl PeImage {
     ///
     /// This function creates the `LoadConfig` directory, or replaces the current one. If
     /// `target_section` is `None`, the function uses ".rdata". If ".rdata" does not exist, it
-    /// uses the last section.
+    /// uses the last section. See [Directory updates](crate::PeImage#directory-updates) for
+    /// the fallback if the data does not fit.
     ///
     /// The structure holds VAs, for example `SecurityCookie` and the CFG pointers. If the image
     /// has a base relocation directory, the function adds a `HIGHLOW` (PE32) or `DIR64`
@@ -576,8 +589,19 @@ impl PeImage {
     /// and cannot be extended, if the target section does not exist, if the
     /// structure cannot be serialized, or if the append fails (see
     /// [Directory updates](crate::PeImage#directory-updates)). Also returns an error if the
-    /// base relocations cannot be parsed or written.
+    /// base relocations cannot be parsed or written. If an error occurs, the image does not
+    /// change.
     pub fn update_load_config(
+        &mut self,
+        config: &crate::loadconfig::LoadConfigDirectory,
+        target_section: Option<&str>,
+    ) -> Result<u32> {
+        self.transact(|image| image.update_load_config_in(config, target_section))
+    }
+
+    /// Do the work of [`Self::update_load_config`] on the image. An error can leave the image
+    /// half updated.
+    fn update_load_config_in(
         &mut self,
         config: &crate::loadconfig::LoadConfigDirectory,
         target_section: Option<&str>,

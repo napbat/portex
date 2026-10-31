@@ -4,6 +4,7 @@
 //! Code calls an imported function through its IAT slot. A rebuilt import table must keep the
 //! IAT of each DLL whose function list is unchanged.
 
+use portex::section::{Section, characteristics};
 use portex::{
     DelayImportDirectory, DelayLoadDescriptor, DelayLoadedDll, ImportTable, ImportThunk,
     MachineType, PeBuilder, PeImage, Subsystem, data_dir::DataDirectoryType,
@@ -137,6 +138,9 @@ fn zero_descriptor() -> DelayLoadDescriptor {
 
 /// Build an image with two delay-loaded DLLs. Give each descriptor a bound IAT, an unload IAT
 /// and a time stamp.
+///
+/// As in an MSVC image, the IATs and the module handles are in the writable `.data`, and the
+/// descriptors and the names are in `.rdata`.
 fn image_with_delay_imports(machine: MachineType) -> PeImage {
     let mut image = base_image(machine);
     let dll = |name: &str, imports| DelayLoadedDll {
@@ -150,6 +154,11 @@ fn image_with_delay_imports(machine: MachineType) -> PeImage {
             dll("b.dll", vec![named("B1")]),
         ],
     };
+    image
+        .update_delay_imports(&directory, Some(".data"))
+        .unwrap();
+    let mut image = reparse(&image);
+    let directory = image.delay_imports().unwrap();
     let rva = image
         .update_delay_imports(&directory, Some(".rdata"))
         .unwrap();
@@ -161,6 +170,9 @@ fn image_with_delay_imports(machine: MachineType) -> PeImage {
             .collect();
         image.write_at_rva(descriptor + 20, &fields).unwrap();
     }
+    // The data directory holds only the descriptors, as in an MSVC image.
+    let descriptors = u32::try_from(3 * DelayLoadDescriptor::SIZE).unwrap();
+    image.set_data_directory(DataDirectoryType::DelayImport, rva, descriptors);
     reparse(&image)
 }
 
@@ -206,5 +218,222 @@ fn update_delay_imports_with_the_parsed_directory_keeps_the_tables() {
         let mut image = image_with_delay_imports(machine);
         image.rebuild_supported_directories(None).unwrap();
         assert_eq!(kept_fields(&reparse(&image)), before);
+    }
+}
+
+/// Build an image whose `.rdata` holds the imports of two DLLs and has no free space after
+/// them. `.data` is writable, and the last section `.rsrc` is read-only.
+fn image_with_full_rdata(machine: MachineType) -> PeImage {
+    let read_data = characteristics::INITIALIZED_DATA | characteristics::READ;
+    let mut image = PeBuilder::new()
+        .machine(machine)
+        .subsystem(Subsystem::WindowsCui)
+        .entry_point(0x1000)
+        .add_section(".text", vec![0xCC; 0x200], 0x6000_0020)
+        .add_section_with_virtual_size(".rdata", vec![0; 0x100], 0x1000, read_data)
+        .add_section(".data", vec![0; 0x200], read_data | characteristics::WRITE)
+        .add_section(".rsrc", vec![0; 0x200], read_data)
+        .build();
+    // Write the first table in place at the start of `.rdata`.
+    image.set_data_directory(DataDirectoryType::Import, 0x2000, 0x100);
+    let mut imports = ImportTable::default();
+    imports.add_dll("KERNEL32.dll", vec![named("ExitProcess"), named("Sleep")]);
+    imports.add_dll("USER32.dll", vec![named("MessageBoxA")]);
+    assert_eq!(image.update_imports(&imports, None).unwrap(), 0x2000);
+    reparse(&image)
+}
+
+/// Return the section that holds `rva`.
+fn section_of(image: &PeImage, rva: u32) -> &Section {
+    image.section_by_rva(rva).unwrap()
+}
+
+#[test]
+fn new_iats_outside_the_section_of_the_kept_iats_are_writable() {
+    for machine in MACHINES {
+        let mut image = image_with_full_rdata(machine);
+        let kept_iats = *image.data_directory(DataDirectoryType::Iat).unwrap();
+        assert_eq!(
+            section_of(&image, kept_iats.virtual_address).name(),
+            ".rdata"
+        );
+        let mut imports = image.imports().unwrap();
+        imports.add_dll("ADVAPI32.dll", vec![named("RegCloseKey")]);
+
+        // A named target that is not writable cannot hold the new IAT.
+        let before = image.clone();
+        assert!(image.update_imports(&imports, Some(".rsrc")).is_err());
+        assert_eq!(image, before);
+
+        // Before the fix, the new IAT went to the read-only last section, and the IAT data
+        // directory was cleared. The loader then failed to write the kept IATs and the new IAT.
+        image.update_imports(&imports, None).unwrap();
+        let image = reparse(&image);
+        let parsed = image.imports().unwrap();
+        assert_eq!(
+            parsed.dlls[0].descriptor.first_thunk,
+            kept_iats.virtual_address
+        );
+        let new_iat = parsed.dlls[2].descriptor.first_thunk;
+        let section = section_of(&image, new_iat);
+        assert_eq!(section.name(), ".portex");
+        assert!(section.header.is_writable());
+        // The IAT data directory holds the kept IATs, in `.rdata`.
+        assert_eq!(
+            image.data_directory(DataDirectoryType::Iat).copied(),
+            Some(kept_iats)
+        );
+    }
+}
+
+#[test]
+fn a_named_writable_target_gets_the_new_iats() {
+    for machine in MACHINES {
+        let mut image = image_with_full_rdata(machine);
+        let kept_iats = *image.data_directory(DataDirectoryType::Iat).unwrap();
+        let mut imports = image.imports().unwrap();
+        imports.add_dll("ADVAPI32.dll", vec![named("RegCloseKey")]);
+
+        image.update_imports(&imports, Some(".data")).unwrap();
+        let image = reparse(&image);
+        let new_iat = image.imports().unwrap().dlls[2].descriptor.first_thunk;
+        assert_eq!(section_of(&image, new_iat).name(), ".data");
+        assert_eq!(
+            image.data_directory(DataDirectoryType::Iat).copied(),
+            Some(kept_iats)
+        );
+    }
+}
+
+/// Return an import list with `count` DLLs, each with long function names.
+fn many_dlls(count: usize) -> Vec<(String, Vec<ImportThunk>)> {
+    (0..count)
+        .map(|index| {
+            let functions = (0..4)
+                .map(|function| named(&format!("LongFunctionName{index:03}With{function}")))
+                .collect();
+            (format!("library{index:03}.dll"), functions)
+        })
+        .collect()
+}
+
+/// Build an image with two delay-loaded DLLs. Their IATs and module handles are at the start
+/// of `.data`. Their descriptors are at the end of a nearly full `.rdata`. The delay import
+/// data directory holds only the descriptors, as in an MSVC image.
+fn image_with_delay_tables_after_rdata(machine: MachineType) -> PeImage {
+    let read_data = characteristics::INITIALIZED_DATA | characteristics::READ;
+    let mut image = PeBuilder::new()
+        .machine(machine)
+        .add_section(".text", vec![0xCC; 0x200], 0x6000_0020)
+        .add_section(".rdata", vec![1; 0x10], read_data)
+        .add_section(".data", vec![1; 0x10], read_data | characteristics::WRITE)
+        .build();
+    let functions = |dll: &str| {
+        (0..8)
+            .map(|index| named(&format!("{dll}LongDelayLoadedFunctionName{index}")))
+            .collect()
+    };
+    let directory = DelayImportDirectory {
+        dlls: ["a", "b"]
+            .into_iter()
+            .map(|name| DelayLoadedDll {
+                descriptor: zero_descriptor(),
+                name: format!("{name}.dll"),
+                imports: functions(name),
+            })
+            .collect(),
+    };
+    image
+        .update_delay_imports(&directory, Some(".data"))
+        .unwrap();
+    let mut image = reparse(&image);
+    let directory = image.delay_imports().unwrap();
+    let rva = image
+        .update_delay_imports(&directory, Some(".rdata"))
+        .unwrap();
+    let rdata = image.section_by_name(".rdata").unwrap();
+    let used = rdata.header.virtual_size.next_multiple_of(8);
+    let filler = vec![0xAA; usize::try_from(0x1000 - used - 0x20).unwrap()];
+    image.try_append_to_section(".rdata", &filler).unwrap();
+    let descriptors = u32::try_from(3 * DelayLoadDescriptor::SIZE).unwrap();
+    image.set_data_directory(DataDirectoryType::DelayImport, rva, descriptors);
+    reparse(&image)
+}
+
+#[test]
+fn a_kept_delay_table_after_the_target_section_uses_the_fallback() {
+    for machine in MACHINES {
+        let mut image = image_with_delay_tables_after_rdata(machine);
+        let before = kept_fields(&image);
+        assert_eq!(section_of(&image, before[0][1]).name(), ".data");
+        let directory = image.delay_imports().unwrap();
+
+        // Each DLL keeps its tables, so the data needs no writable section. Before the fix,
+        // the build at the end of `.rdata` covered the kept IATs in `.data`. The error
+        // stopped the update before the fallback.
+        let rva = image.update_delay_imports(&directory, None).unwrap();
+        let image = reparse(&image);
+        assert_eq!(section_of(&image, rva).name(), ".data");
+        assert_eq!(kept_fields(&image), before);
+    }
+}
+
+#[test]
+fn new_delay_tables_need_a_writable_section() {
+    for machine in MACHINES {
+        let mut image = image_with_delay_imports(machine);
+        let before = kept_fields(&image);
+        let mut directory = image.delay_imports().unwrap();
+        directory.dlls.push(DelayLoadedDll {
+            descriptor: zero_descriptor(),
+            name: "c.dll".to_string(),
+            imports: vec![named("C1")],
+        });
+
+        // A named target that is not writable cannot hold the new IAT and module handle.
+        let unchanged = image.clone();
+        assert!(
+            image
+                .update_delay_imports(&directory, Some(".rdata"))
+                .is_err()
+        );
+        assert_eq!(image, unchanged);
+
+        // Before the fix, the new tables went to the read-only `.rdata`. The delay-load helper
+        // then failed to write the IAT slot and the module handle.
+        image.update_delay_imports(&directory, None).unwrap();
+        let image = reparse(&image);
+        assert_eq!(kept_fields(&image)[..2], before[..]);
+        let new = image.delay_imports().unwrap().dlls[2].descriptor;
+        for rva in [new.import_address_table_rva, new.module_handle_rva] {
+            assert!(section_of(&image, rva).header.is_writable());
+        }
+    }
+}
+
+#[test]
+fn a_kept_iat_after_the_target_section_uses_the_fallback() {
+    for machine in MACHINES {
+        // Put the IATs in `.data`, then move the descriptors to `.rdata`.
+        let mut image = base_image(machine);
+        let mut imports = ImportTable::default();
+        imports.add_dll("KERNEL32.dll", vec![named("ExitProcess")]);
+        image.update_imports(&imports, Some(".data")).unwrap();
+        let mut image = reparse(&image);
+        let imports = image.imports().unwrap();
+        image.update_imports(&imports, Some(".rdata")).unwrap();
+        let mut image = reparse(&image);
+        let kept = first_thunks(&image);
+        assert_eq!(section_of(&image, kept[0].1).name(), ".data");
+
+        let mut imports = image.imports().unwrap();
+        for (name, functions) in many_dlls(40) {
+            imports.add_dll(&name, functions);
+        }
+        // Before the fix, the build at the end of `.rdata` covered the kept IAT in `.data`.
+        let rva = image.update_imports(&imports, None).unwrap();
+        let image = reparse(&image);
+        assert_eq!(section_of(&image, rva).name(), ".data");
+        assert_eq!(first_thunks(&image)[0], kept[0]);
     }
 }

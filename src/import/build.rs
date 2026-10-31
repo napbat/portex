@@ -213,8 +213,25 @@ impl ImportTableBuilder {
     /// - For PE32, an RVA reaches the ordinal flag bit.
     /// - A kept IAT overlaps the built data, or its RVA range overflows.
     pub fn try_build(&self, table: &ImportTable) -> Result<(Vec<u8>, u32, u32)> {
+        let built = self.try_build_parts(table)?;
+        let (iat_rva, iat_end) = match (built.new_iats, built.kept_iats) {
+            (Some((new_start, new_end)), Some((kept_start, kept_end))) => {
+                (new_start.min(kept_start), new_end.max(kept_end))
+            }
+            (Some(range), None) | (None, Some(range)) => range,
+            (None, None) => (0, 0),
+        };
+        Ok((built.data, iat_rva, iat_end - iat_rva))
+    }
+
+    /// Build the import table, and return the data and the IAT ranges separately.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::try_build`].
+    pub(crate) fn try_build_parts(&self, table: &ImportTable) -> Result<BuiltImportTable> {
         if table.dlls.is_empty() {
-            return Ok((Vec::new(), 0, 0));
+            return Ok(BuiltImportTable::default());
         }
         let layout = self.layout(table)?;
         let size = u32::try_from(layout.total_size)
@@ -229,13 +246,13 @@ impl ImportTableBuilder {
             ));
         }
 
-        // The IAT range: the new IATs, then each kept IAT.
-        let mut iat_range = if layout.iat_size == 0 {
+        let new_iats = if layout.iat_size == 0 {
             None
         } else {
             let start = self.rva_at(layout.iat_offset, 0)?;
             Some((start, self.rva_at(layout.hint_names_offset, 0)?))
         };
+        let mut kept_iats: Option<(u32, u32)> = None;
         for (dll, kept) in table.dlls.iter().zip(&layout.kept) {
             let Some(start) = *kept else {
                 continue;
@@ -253,15 +270,18 @@ impl ImportTableBuilder {
                     "a kept IAT overlaps the built import table",
                 ));
             }
-            iat_range = Some(match iat_range {
+            kept_iats = Some(match kept_iats {
                 Some((first, last)) => (first.min(start), last.max(iat_end)),
                 None => (start, iat_end),
             });
         }
-        let (iat_rva, iat_end) = iat_range.unwrap_or_default();
 
         let data = self.write_table(table, &layout)?;
-        Ok((data, iat_rva, iat_end - iat_rva))
+        Ok(BuiltImportTable {
+            data,
+            new_iats,
+            kept_iats,
+        })
     }
 
     /// Serialize `table` into a new buffer with the parts at the offsets in
@@ -402,6 +422,18 @@ fn hint_names_size(dlls: &[ImportedDll]) -> Result<usize> {
         }
     }
     Ok(size)
+}
+
+/// An import table that [`ImportTableBuilder::try_build_parts`] built.
+#[derive(Debug, Default)]
+pub(crate) struct BuiltImportTable {
+    /// The section data of the table.
+    pub(crate) data: Vec<u8>,
+    /// The RVA range `start..end` of the new IATs in `data`, if a DLL gets a new IAT.
+    pub(crate) new_iats: Option<(u32, u32)>,
+    /// The RVA range from the first kept IAT to the end of the last kept IAT, if a DLL keeps
+    /// its IAT.
+    pub(crate) kept_iats: Option<(u32, u32)>,
 }
 
 /// Offsets and sizes of the parts of a built import table.
