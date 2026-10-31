@@ -174,8 +174,10 @@ impl PeImage {
         let mut updated = self.clone();
         let layout_updated = updated.try_update_layout().is_ok();
         let pe: &PeImage = if layout_updated { &updated } else { self };
+        let section_alignment = pe.optional_header.section_alignment();
         if let Some(section) = pe.sections.iter().find(|section| {
-            super::inspect::section_end(section) > u64::from(pe.optional_header.size_of_image())
+            super::inspect::section_end(section, section_alignment)
+                > u64::from(pe.optional_header.size_of_image())
         }) {
             return Err(Error::invalid_section(format!(
                 "section '{}' exceeds SizeOfImage",
@@ -205,7 +207,7 @@ impl PeImage {
         } else {
             pe.sections
                 .iter()
-                .map(super::inspect::section_end)
+                .map(|section| super::inspect::section_end(section, section_alignment))
                 .max()
                 .unwrap_or(0)
         };
@@ -217,12 +219,11 @@ impl PeImage {
         mapped[..header_count].copy_from_slice(&headers[..header_count]);
 
         for section in &pe.sections {
-            // The check above makes sure that the section is inside the image.
+            // The check above makes sure that the section is inside the image. The loader maps
+            // only the raw bytes inside the mapped size of the section.
             let start = section.header.virtual_address as usize;
-            let mapped_size = section
-                .header
-                .virtual_size
-                .max(section.header.size_of_raw_data) as usize;
+            let mapped_size = usize::try_from(section.header.mapped_size(section_alignment))
+                .unwrap_or(usize::MAX);
             let count = section.data.len().min(mapped_size);
             mapped[start..start + count].copy_from_slice(&section.data[..count]);
         }

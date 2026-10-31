@@ -158,24 +158,64 @@ impl SectionHeader {
         self.characteristics & characteristics::CODE != 0
     }
 
+    /// Return the number of bytes that the loader maps for the section, from its RVA.
+    ///
+    /// The loader uses `VirtualSize`, or `SizeOfRawData` if `VirtualSize` is 0. It rounds this
+    /// size up to `section_alignment` (`SectionAlignment`). The loader expects the next section at
+    /// the end of this range. A `SizeOfRawData` that is larger than this range does not make the
+    /// section larger: the loader maps only the raw bytes that fit.
+    ///
+    /// The result is a `u64`, so that it cannot overflow.
+    #[must_use]
+    pub fn mapped_size(&self, section_alignment: u32) -> u64 {
+        let size = if self.virtual_size == 0 {
+            self.size_of_raw_data
+        } else {
+            self.virtual_size
+        };
+        let size = u64::from(size);
+        if section_alignment == 0 {
+            return size;
+        }
+        size.div_ceil(u64::from(section_alignment)) * u64::from(section_alignment)
+    }
+
+    /// Return the number of raw bytes that the loader maps for the section.
+    ///
+    /// This is `SizeOfRawData`, limited to [`Self::mapped_size`].
+    pub(crate) fn mapped_raw_len(&self, section_alignment: u32) -> u32 {
+        let mapped = self.mapped_size(section_alignment);
+        u32::try_from(mapped).map_or(self.size_of_raw_data, |mapped| {
+            self.size_of_raw_data.min(mapped)
+        })
+    }
+
     /// Return `true` if the RVA `rva` is in this section.
     ///
-    /// The section extent is the larger of `virtual_size` and `size_of_raw_data`.
+    /// The section extent is [`Self::mapped_size`] bytes from `VirtualAddress`, as the loader
+    /// maps it. `section_alignment` is the `SectionAlignment` of the image.
     #[must_use]
-    pub fn contains_rva(&self, rva: u32) -> bool {
-        let size = self.virtual_size.max(self.size_of_raw_data);
+    pub fn contains_rva(&self, rva: u32, section_alignment: u32) -> bool {
         rva.checked_sub(self.virtual_address)
-            .is_some_and(|offset| offset < size)
+            .is_some_and(|offset| u64::from(offset) < self.mapped_size(section_alignment))
     }
 
     /// Convert the RVA `rva` to a file offset in this section.
     ///
-    /// Returns `None` if `rva` is not in the raw data of the section, or if the section has no
-    /// raw data.
+    /// The result is `PointerToRawData` plus the offset of `rva` in the section. It does not
+    /// apply the loader rounding of `PointerToRawData` down to a multiple of 0x200. For the
+    /// offset where the loader reads the byte, use
+    /// [`PeHeaders::rva_to_offset`](crate::PeHeaders::rva_to_offset) or
+    /// [`PeImage::rva_to_offset`](crate::PeImage::rva_to_offset).
+    ///
+    /// Returns `None` if the section has no raw data, or if `rva` is not in the raw bytes that
+    /// the loader maps (see [`Self::mapped_size`]). `section_alignment` is the `SectionAlignment`
+    /// of the image.
     #[must_use]
-    pub fn rva_to_offset(&self, rva: u32) -> Option<u32> {
+    pub fn rva_to_offset(&self, rva: u32, section_alignment: u32) -> Option<u32> {
         let section_offset = rva.checked_sub(self.virtual_address)?;
-        if self.pointer_to_raw_data == 0 || section_offset >= self.size_of_raw_data {
+        if self.pointer_to_raw_data == 0 || section_offset >= self.mapped_raw_len(section_alignment)
+        {
             return None;
         }
         self.pointer_to_raw_data.checked_add(section_offset)
@@ -455,30 +495,31 @@ impl Section {
     }
 
     /// Return `true` if the RVA `rva` is in this section.
+    ///
+    /// See [`SectionHeader::contains_rva`]. `section_alignment` is the `SectionAlignment` of the
+    /// image.
     #[must_use]
-    pub fn contains_rva(&self, rva: u32) -> bool {
-        self.header.contains_rva(rva)
+    pub fn contains_rva(&self, rva: u32, section_alignment: u32) -> bool {
+        self.header.contains_rva(rva, section_alignment)
     }
 
     /// Return `len` bytes of section data that start at the RVA `rva`.
     ///
-    /// Returns `None` if the range is not in `data`.
+    /// Returns `None` if the range is not in `data`. The method does not limit the range to the
+    /// bytes that the loader maps. [`PeImage::read_at_rva`](crate::PeImage::read_at_rva) applies
+    /// that limit.
     #[must_use]
     pub fn data_at_rva(&self, rva: u32, len: usize) -> Option<&[u8]> {
-        if !self.contains_rva(rva) {
-            return None;
-        }
         let offset = usize::try_from(rva.checked_sub(self.header.virtual_address)?).ok()?;
         self.data.get(offset..offset.checked_add(len)?)
     }
 
     /// Return `len` bytes of mutable section data that start at the RVA `rva`.
     ///
-    /// Returns `None` if the range is not in `data`.
+    /// Returns `None` if the range is not in `data`. The method does not limit the range to the
+    /// bytes that the loader maps. [`PeImage::write_at_rva`](crate::PeImage::write_at_rva)
+    /// applies that limit.
     pub fn data_at_rva_mut(&mut self, rva: u32, len: usize) -> Option<&mut [u8]> {
-        if !self.contains_rva(rva) {
-            return None;
-        }
         let offset = usize::try_from(rva.checked_sub(self.header.virtual_address)?).ok()?;
         self.data.get_mut(offset..offset.checked_add(len)?)
     }
@@ -547,10 +588,13 @@ mod tests {
         section.header.virtual_address = 0x2000;
         section.set_data(vec![0x11, 0x22, 0x33, 0x44, 0x55]);
 
-        assert!(section.contains_rva(0x2000));
-        assert!(section.contains_rva(0x2004));
-        assert!(!section.contains_rva(0x1FFF));
-        assert!(!section.contains_rva(0x2005));
+        assert!(section.contains_rva(0x2000, 0));
+        assert!(section.contains_rva(0x2004, 0));
+        assert!(!section.contains_rva(0x1FFF, 0));
+        assert!(!section.contains_rva(0x2005, 0));
+        // The loader maps the complete page.
+        assert!(section.contains_rva(0x2FFF, 0x1000));
+        assert!(!section.contains_rva(0x3000, 0x1000));
 
         assert_eq!(section.data_at_rva(0x2001, 2), Some(&[0x22, 0x33][..]));
         assert_eq!(section.data_at_rva(0x2000, 10), None); // too long
@@ -571,9 +615,42 @@ mod tests {
             characteristics: characteristics::INITIALIZED_DATA | characteristics::READ,
         };
 
-        assert!(header.contains_rva(0x2200));
-        assert_eq!(header.rva_to_offset(0x21ff), Some(0x5ff));
-        assert_eq!(header.rva_to_offset(0x2200), None);
+        assert!(header.contains_rva(0x2200, 0x1000));
+        assert_eq!(header.rva_to_offset(0x21ff, 0x1000), Some(0x5ff));
+        assert_eq!(header.rva_to_offset(0x2200, 0x1000), None);
+    }
+
+    #[test]
+    fn raw_data_after_the_aligned_virtual_size_is_not_in_the_section() {
+        // The loader places the next section at 0x2000. `SizeOfRawData` cannot make the section
+        // larger than its aligned `VirtualSize`.
+        let header = SectionHeader {
+            virtual_size: 0x10,
+            virtual_address: 0x1000,
+            size_of_raw_data: 0x1200,
+            pointer_to_raw_data: 0x200,
+            ..SectionHeader::default()
+        };
+        assert_eq!(header.mapped_size(0x1000), 0x1000);
+        assert!(header.contains_rva(0x1fff, 0x1000));
+        assert!(!header.contains_rva(0x2000, 0x1000));
+        assert_eq!(header.rva_to_offset(0x1fff, 0x1000), Some(0x11ff));
+        assert_eq!(header.rva_to_offset(0x2000, 0x1000), None);
+
+        // A `VirtualSize` of 0 makes `SizeOfRawData` the size.
+        let raw_only = SectionHeader {
+            virtual_size: 0,
+            ..header
+        };
+        assert_eq!(raw_only.mapped_size(0x1000), 0x2000);
+        assert_eq!(raw_only.rva_to_offset(0x2000, 0x1000), Some(0x1200));
+        assert_eq!(SectionHeader::default().mapped_size(0x1000), 0);
+        // The size cannot overflow.
+        let large = SectionHeader {
+            virtual_size: u32::MAX,
+            ..SectionHeader::default()
+        };
+        assert_eq!(large.mapped_size(0x1000), 0x1_0000_0000);
     }
 
     #[test]

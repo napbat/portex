@@ -143,15 +143,18 @@ pub(crate) fn loader_raw_offset(pointer_to_raw_data: u32, file_alignment: u32) -
 
 /// Convert an RVA in a section to the file offset where the loader reads the byte.
 ///
-/// The result is `None` if the RVA is not in the raw data of the section.
+/// The result is `None` if the RVA is not in the raw data that the loader maps for the section.
 pub(crate) fn section_rva_to_file_offset(
     header: &SectionHeader,
     rva: u32,
     file_alignment: u32,
+    section_alignment: u32,
 ) -> Option<u32> {
     let rounding =
         header.pointer_to_raw_data - loader_raw_offset(header.pointer_to_raw_data, file_alignment);
-    header.rva_to_offset(rva)?.checked_sub(rounding)
+    header
+        .rva_to_offset(rva, section_alignment)?
+        .checked_sub(rounding)
 }
 
 /// Calculate the section layout again (RVAs and file offsets).
@@ -224,13 +227,19 @@ pub fn try_layout_sections(
         // no raw bytes) intact. A `VirtualSize` of 0 makes the old `SizeOfRawData` the virtual
         // extent, so keep that extent also if the data is shorter, for example after the end of
         // the file.
-        let virtual_size = if section.header.virtual_size == 0 {
+        let mut virtual_size = if section.header.virtual_size == 0 {
             data_size.max(old_raw_size)
         } else if data_size > old_raw_size {
             section.header.virtual_size.max(data_size)
         } else {
             section.header.virtual_size
         };
+        // The loader rejects a section with no size. A section that the layout places gets the
+        // size of one alignment unit. A kept section keeps its size, so that the build of a
+        // malformed source stays lossless.
+        if virtual_size == 0 && section.header.virtual_address != existing_rva {
+            virtual_size = config.section_alignment.max(1);
+        }
         section.header.virtual_size = virtual_size;
         section.header.size_of_raw_data = match preserved_raw_size {
             Some(size) => size,
@@ -242,19 +251,12 @@ pub fn try_layout_sections(
             })?,
         };
 
-        // Advance the RVA (aligned to the section alignment).
-        let mapped_size = virtual_size.max(section.header.size_of_raw_data).max(1);
-        let section_end = section
-            .header
-            .virtual_address
-            .checked_add(mapped_size)
-            .ok_or_else(|| {
-                Error::invalid_section(format!(
-                    "section '{}' virtual range overflows",
-                    section.name()
-                ))
-            })?;
-        current_rva = checked_align_up(section_end, config.section_alignment).ok_or_else(|| {
+        // Advance the RVA by the size that the loader maps: `VirtualSize`, or `SizeOfRawData` if
+        // `VirtualSize` is 0, aligned to the section alignment. The loader expects the next
+        // section at that RVA.
+        let section_end = u64::from(section.header.virtual_address)
+            + section.header.mapped_size(config.section_alignment);
+        current_rva = u32::try_from(section_end).map_err(|_| {
             Error::invalid_section(format!(
                 "section '{}' virtual end exceeds u32 after alignment",
                 section.name()
@@ -306,22 +308,9 @@ pub fn try_calculate_size_of_image(sections: &[Section], config: &LayoutConfig) 
     sections
         .iter()
         .map(|section| {
-            let mapped_size = section
-                .header
-                .virtual_size
-                .max(section.header.size_of_raw_data)
-                .max(1);
-            let end = section
-                .header
-                .virtual_address
-                .checked_add(mapped_size)
-                .ok_or_else(|| {
-                    Error::invalid_section(format!(
-                        "section '{}' virtual range overflows",
-                        section.name()
-                    ))
-                })?;
-            checked_align_up(end, config.section_alignment).ok_or_else(|| {
+            let end = u64::from(section.header.virtual_address)
+                + section.header.mapped_size(config.section_alignment);
+            u32::try_from(end).map_err(|_| {
                 Error::invalid_section(format!(
                     "section '{}' virtual end exceeds u32 after alignment",
                     section.name()

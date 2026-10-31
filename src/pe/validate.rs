@@ -355,7 +355,11 @@ impl PeImage {
         // Check that the entry point is in a section, or is 0 for a DLL.
         let entry = self.optional_header.address_of_entry_point();
         if entry != 0 {
-            let entry_in_section = self.sections.iter().any(|s| s.header.contains_rva(entry));
+            let alignment = self.optional_header.section_alignment();
+            let entry_in_section = self
+                .sections
+                .iter()
+                .any(|s| s.header.contains_rva(entry, alignment));
             if !entry_in_section {
                 result.push(ValidationIssue::warning(
                     ValidationCode::EntryPointOutOfBounds,
@@ -492,25 +496,20 @@ impl PeImage {
     }
 
     /// Check that the virtual ranges of the sections do not overlap.
+    ///
+    /// Each range has the size that the loader maps (see [`SectionHeader::mapped_size`]).
+    ///
+    /// [`SectionHeader::mapped_size`]: crate::SectionHeader::mapped_size
     fn validate_section_virtual_overlaps(&self, result: &mut ValidationResult) {
+        let alignment = self.optional_header.section_alignment();
         let ranges = self
             .sections
             .iter()
             .enumerate()
-            .filter(|(_, section)| {
-                section
-                    .header
-                    .virtual_size
-                    .max(section.header.size_of_raw_data)
-                    != 0
-            })
+            .filter(|(_, section)| section.header.mapped_size(alignment) != 0)
             .map(|(index, section)| {
                 let start = u64::from(section.header.virtual_address);
-                let size = section
-                    .header
-                    .virtual_size
-                    .max(section.header.size_of_raw_data);
-                (start, start + u64::from(size), index)
+                (start, start + section.header.mapped_size(alignment), index)
             })
             .collect();
         for (earlier, later) in overlapping_ranges(ranges) {

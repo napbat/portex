@@ -192,7 +192,7 @@ impl PeImage {
             reader,
             base_offset,
             headers.section_headers,
-            headers.optional_header.file_alignment(),
+            &headers.optional_header,
             options,
         )?;
 
@@ -216,6 +216,10 @@ impl PeImage {
     /// The loader maps zeros for those bytes. Then the section keeps the bytes up to the end of
     /// the source, and RVA reads give zeros for the rest.
     ///
+    /// In the mapped layout, the method reads the larger of `VirtualSize` and `SizeOfRawData`,
+    /// but not more than the size that the loader maps (see [`SectionHeader::mapped_size`]).
+    /// The bytes after that size belong to the next section.
+    ///
     /// Sections can share source bytes, but each section owns a copy. To keep the memory use in
     /// proportion to the source, the method reads at most [`SECTION_DATA_LIMIT`] times the size
     /// of the source.
@@ -223,9 +227,11 @@ impl PeImage {
         reader: &R,
         base_offset: u64,
         headers: Vec<SectionHeader>,
-        file_alignment: u32,
+        optional_header: &crate::optional::OptionalHeader,
         options: ParseOptions,
     ) -> Result<Vec<Section>> {
+        let file_alignment = optional_header.file_alignment();
+        let section_alignment = optional_header.section_alignment();
         let source_size = reader.size().map(|size| size.saturating_sub(base_offset));
         let mut budget = source_size.map(|size| size.saturating_mul(SECTION_DATA_LIMIT));
         let mut sections = Vec::with_capacity(headers.len());
@@ -240,7 +246,12 @@ impl PeImage {
                     options,
                 )?,
                 SourceLayout::Mapped => {
-                    let mapped_size = header.virtual_size.max(header.size_of_raw_data);
+                    let loader_size =
+                        u32::try_from(header.mapped_size(section_alignment)).unwrap_or(u32::MAX);
+                    let mapped_size = header
+                        .virtual_size
+                        .max(header.size_of_raw_data)
+                        .min(loader_size);
                     let data = if mapped_size == 0 {
                         Vec::new()
                     } else {
