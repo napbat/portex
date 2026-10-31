@@ -7,7 +7,8 @@ use crate::export::ExportDirectory;
 /// The export directory (`IMAGE_EXPORT_DIRECTORY`) and the offsets of its fields.
 ///
 /// Use [`RawAddressTable::counted`](super::RawAddressTable::counted) to read the export
-/// address table and the export name pointer table.
+/// address table and the export name pointer table. Set its `is_64bit` argument to `false`,
+/// also in a PE32+ image: the entries of these tables are always 32-bit RVAs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RawExportDirectory {
     /// The offset of the directory.

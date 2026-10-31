@@ -9,7 +9,7 @@ pub use crate::bound_import::{
 pub use crate::clr::{CliBuilder, CliHeader};
 pub use crate::debug::{CodeViewRsds, DebugBuilder, DebugDirectory, DebugInfo, DebugType};
 pub use crate::delay_import::{
-    DelayImportBuilder, DelayImportDirectory, DelayImportThunk, DelayLoadDescriptor, DelayLoadedDll,
+    DelayImportBuilder, DelayImportDirectory, DelayLoadDescriptor, DelayLoadedDll,
 };
 pub use crate::exception::{
     ExceptionBuilder, ExceptionDirectory, ExceptionTable, PackedExceptionDirectory,
