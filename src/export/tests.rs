@@ -161,7 +161,9 @@ fn try_build_writes_forwarders_and_aliases() {
     assert_eq!(parsed.find_by_name("Beta").map(|e| e.ordinal), Some(6));
 }
 
-/// Build raw export data at `base_rva` with `functions` EAT slots that all hold `0x9000`.
+/// Build raw export data at `base_rva` with `functions` EAT slots that all hold `0x00F0_0000`.
+///
+/// That RVA is outside the export data, so no slot is a forwarder.
 ///
 /// Name entry `i` has the name RVA `name_rvas[i]` and the EAT index `ordinals[i]`. `strings`
 /// follows the tables, and the function returns the RVA of `strings` and the data.
@@ -191,7 +193,7 @@ fn raw_exports(
     dir.write(&mut data).unwrap();
     for i in 0..functions {
         let at = (40 + i * 4) as usize;
-        data[at..at + 4].copy_from_slice(&0x9000u32.to_le_bytes());
+        data[at..at + 4].copy_from_slice(&0x00F0_0000u32.to_le_bytes());
     }
     for i in 0..names {
         let at = (eat + i * 4) as usize;
@@ -229,11 +231,12 @@ fn parse_binds_names_to_sparse_slots_through_the_slot_map() {
 }
 
 #[test]
-fn parse_rejects_names_that_share_one_string() {
-    // Every name entry points at one 100-byte string and at the last EAT slot. Before the fix,
-    // the parser copied the string once for each name (an amplification of the input).
-    let names = 1000;
-    let mut strings = vec![b'A'; 100];
+fn parse_limits_names_that_share_one_string() {
+    // Every name entry points at one 4095-byte string and at the last EAT slot. The aliases
+    // need more than 16 MiB, which is much more than the export data. Before the fix, the
+    // parser copied the string once for each name without a limit.
+    let names = 4200;
+    let mut strings = vec![b'A'; 4095];
     strings.push(0);
     let data = raw_exports(
         0x1000,
@@ -246,9 +249,36 @@ fn parse_rejects_names_that_share_one_string() {
     let size = u32::try_from(data.len()).unwrap();
     let err = ExportTable::parse(0x1000, size, reader(&data, 0x1000)).unwrap_err();
     assert!(
-        matches!(err.kind(), crate::ErrorKind::InvalidDataDirectory(msg) if msg.contains("more bytes")),
+        matches!(err.kind(), crate::ErrorKind::InvalidDataDirectory(msg) if msg.contains("name byte limit")),
         "{err:?}"
     );
+}
+
+#[test]
+fn parse_reads_each_name_rva_once() {
+    // 100 names point at one string. Before the fix, the parser read the string 100 times.
+    let names = 100;
+    let data = raw_exports(
+        0x1000,
+        names,
+        |_, s| s,
+        |i| u16::try_from(i).unwrap(),
+        names,
+        b"a\0",
+    );
+    let size = u32::try_from(data.len()).unwrap();
+    let string_rva = 0x1000 + size - 2;
+    let string_reads = core::cell::Cell::new(0u32);
+    let inner = reader(&data, 0x1000);
+    let table = ExportTable::parse(0x1000, size, |rva, len| {
+        if rva == string_rva {
+            string_reads.set(string_reads.get() + 1);
+        }
+        inner(rva, len)
+    })
+    .unwrap();
+    assert_eq!(table.exports.len(), 100);
+    assert_eq!(string_reads.get(), 1);
 }
 
 #[test]

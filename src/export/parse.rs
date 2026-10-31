@@ -23,9 +23,9 @@ impl ExportTable {
     /// - A table is outside the export directory range.
     /// - An RVA or an ordinal overflows.
     /// - A name refers to an empty slot in the address table.
-    /// - The names and aliases together hold more bytes than `export_size`. Valid names are
-    ///   in the export directory range and do not share bytes, so this limit stops a
-    ///   malformed table that points many names at one string.
+    /// - The names and aliases together hold more bytes than the larger of `export_size` and
+    ///   16 MiB. This limit stops a malformed table that points many names at one string.
+    ///   The parser reads each name RVA only once.
     pub fn parse<F>(export_rva: u32, export_size: u32, read_at_rva: F) -> Result<Self>
     where
         F: Fn(u32, usize) -> Option<Vec<u8>>,
@@ -110,7 +110,8 @@ impl ExportTable {
             Self::read_address_table(read_at_rva, dir, export_rva, export_size, export_end)?;
         let mut binder = NameBinder {
             slots: eat_slot_map(dir, &exports)?,
-            remaining: export_size as usize,
+            remaining: (export_size as usize).max(MAX_EXPORT_NAME_BYTES),
+            names: BTreeMap::new(),
         };
         for index in 0..dir.number_of_names {
             Self::read_name_entry(
@@ -261,13 +262,19 @@ impl ExportTable {
         let ord_index = u16::from_le_bytes(read_array_rva(read_at_rva, ord_rva, "export ordinal")?);
 
         // Read the name.
-        let name = Self::read_string(
-            read_at_rva,
-            name_rva,
-            export_rva,
-            export_size,
-            "export function name",
-        )?;
+        let name = if let Some(name) = binder.names.get(&name_rva) {
+            name.clone()
+        } else {
+            let name = Self::read_string(
+                read_at_rva,
+                name_rva,
+                export_rva,
+                export_size,
+                "export function name",
+            )?;
+            binder.names.insert(name_rva, name.clone());
+            name
+        };
         binder.take(&name)?;
 
         // Find the export that has this EAT index.
@@ -291,12 +298,20 @@ impl ExportTable {
     }
 }
 
+/// The maximum total bytes of export names and aliases, if `export_size` is smaller.
+///
+/// Valid files hold far fewer name bytes. The limit stops a malformed table that points many
+/// names at one string from using a large quantity of memory.
+const MAX_EXPORT_NAME_BYTES: usize = 16 * 1024 * 1024;
+
 /// The state that binds names to exports.
 struct NameBinder {
     /// The position in the export list of each EAT index. See [`eat_slot_map`].
     slots: Vec<Option<u32>>,
-    /// The number of name bytes that the parser can still read.
+    /// The number of name bytes that the parser can still return.
     remaining: usize,
+    /// The names that the parser read, by name RVA. Each name string is read only once.
+    names: BTreeMap<u32, String>,
 }
 
 impl NameBinder {
@@ -311,9 +326,7 @@ impl NameBinder {
             .checked_add(1)
             .and_then(|size| self.remaining.checked_sub(size))
             .ok_or_else(|| {
-                Error::invalid_data_directory(
-                    "export names hold more bytes than the export directory",
-                )
+                Error::invalid_data_directory("export names and aliases exceed the name byte limit")
             })?;
         Ok(())
     }
