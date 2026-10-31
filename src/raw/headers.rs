@@ -26,6 +26,7 @@ const TIME_DATE_STAMP: usize = 4;
 /// [`PeHeaders::header_offsets`](crate::PeHeaders::header_offsets) makes this value. Each
 /// offset has the same base as [`PeHeaders::pe_offset`](crate::PeHeaders::pe_offset).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HeaderOffsets {
     /// The offset of the NT headers (`IMAGE_NT_HEADERS`): the PE signature.
     pub nt_headers: usize,

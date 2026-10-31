@@ -6,6 +6,7 @@ use crate::import::ImportDescriptor;
 
 /// The rule that ends a list of import descriptors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ImportTableEnd {
     /// End at a descriptor with all fields zero, as the loader does.
     #[default]
@@ -236,10 +237,12 @@ impl RawImportByName {
     }
 
     /// Return the size of the entry in bytes: the hint, the name and the zero terminator.
+    ///
+    /// Return `None` on overflow. This occurs only for a `name_len` that [`Self::parse`] did
+    /// not set.
     #[must_use]
-    pub const fn size(&self) -> usize {
-        // The terminator is in the buffer, so this sum does not overflow.
-        self.name_len + 3
+    pub const fn size(&self) -> Option<usize> {
+        self.name_len.checked_add(3)
     }
 
     /// Return the name bytes in `data`, or `None` if they are not in `data`.

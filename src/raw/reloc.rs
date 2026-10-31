@@ -85,7 +85,9 @@ impl RawCursor for RawRelocationBlocks {
             self.remaining = 0;
             return Ok(None);
         }
-        self.offset = at(self.offset, size)?;
+        // The cursor returns the block also if its end overflows, because its header is in
+        // `data`. A saturated offset gives no next block, because the read fails.
+        self.offset = self.offset.saturating_add(size);
         self.remaining -= size;
         Ok(Some(block))
     }
@@ -121,14 +123,16 @@ impl RawCursor for RawRelocations {
         }
         let word = read_u16(data, self.offset)?;
         let entry = RelocationEntry::from_u16(word.value);
-        self.remaining -= 1;
-        self.offset = at(self.offset, 2)?;
+        // Read the parameter word before the cursor moves. A failed read then keeps the
+        // position of the entry, and the next call reads the entry again.
+        let mut words = 1;
         let mut parameter = None;
-        if entry.reloc_type == RelocationType::HighAdj && self.remaining != 0 {
-            parameter = Some(read_u16(data, self.offset)?);
-            self.remaining -= 1;
-            self.offset = at(self.offset, 2)?;
+        if entry.reloc_type == RelocationType::HighAdj && self.remaining > 1 {
+            parameter = Some(read_u16(data, at(self.offset, 2)?)?);
+            words = 2;
         }
+        self.offset = at(self.offset, 2 * words)?;
+        self.remaining -= words;
         Ok(Some(RawRelocation {
             offset: word.offset,
             entry,

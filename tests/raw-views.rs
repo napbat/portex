@@ -226,7 +226,7 @@ fn import_by_name_needs_a_terminator_in_the_limit() {
     let entry = RawImportByName::parse(&data, 0, 8).unwrap().unwrap();
     assert_eq!(entry.hint.value, 7);
     assert_eq!(entry.name(&data), Some(&b"Sleep"[..]));
-    assert_eq!(entry.size(), 8);
+    assert_eq!(entry.size(), Some(8));
     assert_eq!(entry.name_offset, 2);
 
     // The terminator is at index 7, so a limit of 7 bytes does not include it.
@@ -234,6 +234,17 @@ fn import_by_name_needs_a_terminator_in_the_limit() {
     assert_eq!(RawImportByName::parse(&data, 0, 2).unwrap(), None);
     // A limit after the end of the buffer reads until the first missing byte.
     assert!(RawImportByName::parse(&data[..6], 0, 100).is_err());
+}
+
+#[test]
+fn import_by_name_size_reports_an_overflow() {
+    let entry = RawImportByName {
+        offset: 0,
+        hint: RawField::default(),
+        name_offset: 2,
+        name_len: usize::MAX - 1,
+    };
+    assert_eq!(entry.size(), None);
 }
 
 #[test]
@@ -286,6 +297,19 @@ fn relocation_blocks_end_at_a_bad_block_size() {
 }
 
 #[test]
+fn relocation_blocks_return_a_block_whose_end_overflows_usize() {
+    // The block at offset 8 has `SizeOfBlock` 0xFFFF_FFFF. With 32-bit `usize`, its end
+    // overflows. The cursor must still return the block, because its header is in the buffer.
+    let data = words(&[0, 0, 0x1000, u32::MAX]);
+    let mut cursor = RawRelocationBlocks::new(8, usize::MAX);
+    let block = cursor.read_next(&data).unwrap().unwrap();
+    assert_eq!(block.offset, 8);
+    assert_eq!(block.size_of_block.value, u32::MAX);
+    // No next block is in the buffer.
+    assert!(!matches!(cursor.read_next(&data), Ok(Some(_))));
+}
+
+#[test]
 fn relocation_entries_read_padding_and_highadj_parameters() {
     let mut data = words(&[0x1000, 16]);
     for word in [0x3010u16, 0x4020, 0x1234, 0x0000, 0x4030] {
@@ -319,6 +343,29 @@ fn relocation_entries_read_padding_and_highadj_parameters() {
     let next = cursor.read_next(&data).unwrap().unwrap();
     assert_eq!(next.entry.reloc_type, RelocationType::Dir64);
     assert_eq!(next.parameter, None);
+}
+
+#[test]
+fn relocation_entries_keep_the_position_after_a_failed_parameter_read() {
+    let mut data = words(&[0x1000, 12]);
+    for word in [0x4123u16, 0x5678] {
+        data.extend_from_slice(&word.to_le_bytes());
+    }
+    let mut cursor = RawRelocationBlock::parse(&data, 0).unwrap().entries();
+    // The `HIGHADJ` parameter word is not in the short buffer.
+    assert!(cursor.read_next(&data[..10]).is_err());
+    // The next call reads the `HIGHADJ` entry again, with its parameter.
+    let entry = cursor.read_next(&data).unwrap().unwrap();
+    assert_eq!(entry.offset, 8);
+    assert_eq!(entry.entry.reloc_type, RelocationType::HighAdj);
+    assert_eq!(
+        entry.parameter,
+        Some(RawField {
+            offset: 10,
+            value: 0x5678
+        })
+    );
+    assert_eq!(cursor.read_next(&data).unwrap(), None);
 }
 
 #[test]

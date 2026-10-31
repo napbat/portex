@@ -9,6 +9,7 @@ use crate::Result;
 /// [`LoadConfigDirectory`](crate::LoadConfigDirectory) reads only the fields that `Size`
 /// covers. This view reads the fields at their fixed offsets and ignores `Size`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RawLoadConfigDirectory {
     /// The offset of the load configuration.
     pub offset: usize,
