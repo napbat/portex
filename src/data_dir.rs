@@ -188,6 +188,9 @@ impl DataDirectory {
     /// Read `count` consecutive data directories from a positional reader, starting at the
     /// reader offset `offset`.
     ///
+    /// The method reserves memory only for the entries that the reader can hold, so a large
+    /// `count` from a file does not allocate more memory than the source justifies.
+    ///
     /// # Errors
     ///
     /// Returns an invalid-data-directory error if the table size or an entry offset overflows.
@@ -196,7 +199,12 @@ impl DataDirectory {
         count
             .checked_mul(Self::SIZE)
             .ok_or_else(|| Error::invalid_data_directory("data-directory table size overflow"))?;
-        let mut dirs = Vec::with_capacity(count);
+        let mut dirs = Vec::with_capacity(crate::section::entries_to_reserve(
+            reader,
+            offset,
+            count,
+            Self::SIZE,
+        ));
         for i in 0..count {
             let relative = i
                 .checked_mul(Self::SIZE)

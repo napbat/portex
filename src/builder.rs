@@ -9,12 +9,15 @@
 //! let code = vec![0xCC; 0x100]; // INT3 instructions
 //! let data = vec![0u8; 0x50];
 //!
+//! // The layout places the first section at RVA 0x1000. The builder does not change the entry
+//! // point, so give the RVA where the code will be.
 //! let pe = PeBuilder::new()
 //!     .machine(MachineType::Amd64)
 //!     .subsystem(Subsystem::WindowsCui)
-//!     .entry_point(0x1000)  // RVA will be adjusted after layout
+//!     .entry_point(0x1000)
 //!     .add_section(".text", code, characteristics::CODE | characteristics::EXECUTE | characteristics::READ)
 //!     .add_section(".data", data, characteristics::INITIALIZED_DATA | characteristics::READ | characteristics::WRITE)
+//!     .add_section_with_virtual_size(".bss", Vec::new(), 0x2000, characteristics::UNINITIALIZED_DATA | characteristics::READ | characteristics::WRITE)
 //!     .build();
 //! ```
 
@@ -35,14 +38,31 @@ pub struct PeBuilder {
     machine: MachineType,
     subsystem: Subsystem,
     is_64bit: bool,
-    image_base: u64,
+    /// The image base that the caller set, if any.
+    image_base: Option<u64>,
     entry_point: u32,
     file_alignment: u32,
     section_alignment: u32,
     dll_characteristics: u16,
     is_dll: bool,
-    sections: Vec<(String, Vec<u8>, u32)>, // (name, data, characteristics)
+    sections: Vec<BuilderSection>,
 }
+
+/// A section that the builder adds.
+#[derive(Debug, Clone)]
+struct BuilderSection {
+    name: String,
+    data: Vec<u8>,
+    /// The `VirtualSize` that the caller set, or 0 for the size of `data`.
+    virtual_size: u32,
+    characteristics: u32,
+}
+
+/// The default image base of a PE32+ image.
+const DEFAULT_IMAGE_BASE_64: u64 = 0x0000_0001_4000_0000;
+
+/// The default image base of a PE32 image.
+const DEFAULT_IMAGE_BASE_32: u64 = 0x0040_0000;
 
 impl Default for PeBuilder {
     fn default() -> Self {
@@ -58,7 +78,7 @@ impl PeBuilder {
             machine: MachineType::Amd64,
             subsystem: Subsystem::WindowsCui,
             is_64bit: true,
-            image_base: 0x0000_0001_4000_0000, // Default for 64-bit
+            image_base: None,
             entry_point: 0,
             file_alignment: 0x200,
             section_alignment: 0x1000,
@@ -69,15 +89,14 @@ impl PeBuilder {
     }
 
     /// Set the target machine type.
+    ///
+    /// The machine type also selects PE32 or PE32+. If you do not set an image base with
+    /// [`Self::image_base`], the build uses the default image base for that width.
     #[must_use]
     pub fn machine(mut self, machine: MachineType) -> Self {
         self.machine = machine;
         // Get the PE32 or PE32+ width from the machine type.
         self.is_64bit = machine.is_64_bit();
-        // Use the default image base for a 32-bit image.
-        if !self.is_64bit {
-            self.image_base = 0x0040_0000; // Default for 32-bit
-        }
         self
     }
 
@@ -98,13 +117,20 @@ impl PeBuilder {
     }
 
     /// Set the preferred image base (`ImageBase`, a VA).
+    ///
+    /// If you do not call this method, the build uses `0x1_4000_0000` for a PE32+ image and
+    /// `0x40_0000` for a PE32 image.
     #[must_use]
     pub fn image_base(mut self, base: u64) -> Self {
-        self.image_base = base;
+        self.image_base = Some(base);
         self
     }
 
     /// Set the entry point (`AddressOfEntryPoint`, an RVA).
+    ///
+    /// The build does not change this value. The layout places the first section at the section
+    /// alignment after the headers (RVA 0x1000 with the default alignment), and each next
+    /// section after the previous one.
     #[must_use]
     pub fn entry_point(mut self, rva: u32) -> Self {
         self.entry_point = rva;
@@ -140,10 +166,34 @@ impl PeBuilder {
     }
 
     /// Add a section with the given name, data, and characteristics.
+    ///
+    /// The `VirtualSize` of the section is the size of `data`. A section with no data gets one
+    /// section alignment unit as its `VirtualSize`, because the loader rejects a section with no
+    /// size.
     #[must_use]
-    pub fn add_section(mut self, name: &str, data: Vec<u8>, characteristics: u32) -> Self {
-        self.sections
-            .push((name.to_string(), data, characteristics));
+    pub fn add_section(self, name: &str, data: Vec<u8>, characteristics: u32) -> Self {
+        self.add_section_with_virtual_size(name, data, 0, characteristics)
+    }
+
+    /// Add a section with an explicit `VirtualSize`.
+    ///
+    /// Use this method for a section with uninitialized data (BSS). The loader fills the bytes
+    /// after `data` and before `virtual_size` with zeros. The `VirtualSize` of the section is
+    /// the larger of `virtual_size` and the size of `data`.
+    #[must_use]
+    pub fn add_section_with_virtual_size(
+        mut self,
+        name: &str,
+        data: Vec<u8>,
+        virtual_size: u32,
+        characteristics: u32,
+    ) -> Self {
+        self.sections.push(BuilderSection {
+            name: name.to_string(),
+            data,
+            virtual_size,
+            characteristics,
+        });
         self
     }
 
@@ -174,17 +224,16 @@ impl PeBuilder {
     /// - The data of a section does not fit in a `u32`.
     ///
     /// Also propagates any error from [`PeImage::try_update_layout`].
-    pub fn try_build(self) -> Result<PeImage> {
-        if !self.is_64bit && self.image_base > u64::from(u32::MAX) {
+    pub fn try_build(mut self) -> Result<PeImage> {
+        let image_base = self.resolved_image_base();
+        if !self.is_64bit && image_base > u64::from(u32::MAX) {
             return Err(Error::invalid_section(format!(
-                "PE32 image base {:#x} exceeds u32",
-                self.image_base
+                "PE32 image base {image_base:#x} exceeds u32"
             )));
         }
-        if self.image_base & 0xffff != 0 {
+        if image_base & 0xffff != 0 {
             return Err(Error::invalid_section(format!(
-                "image base {:#x} is not 64-KiB aligned",
-                self.image_base
+                "image base {image_base:#x} is not 64-KiB aligned"
             )));
         }
         if self.machine != MachineType::Unknown && self.machine.is_64_bit() != self.is_64bit {
@@ -201,9 +250,9 @@ impl PeBuilder {
                 crate::pe::MAX_NUMBER_OF_SECTIONS
             )));
         }
-        for (name, data, _) in &self.sections {
-            u32::try_from(data.len()).map_err(|_| {
-                Error::invalid_section(format!("section '{name}' data exceeds u32"))
+        for section in &self.sections {
+            u32::try_from(section.data.len()).map_err(|_| {
+                Error::invalid_section(format!("section '{}' data exceeds u32", section.name))
             })?;
         }
 
@@ -217,7 +266,7 @@ impl PeBuilder {
         let optional_header = self.create_optional_header()?;
 
         // Create sections
-        let sections = self.create_sections();
+        let sections = Self::create_sections(core::mem::take(&mut self.sections));
 
         // Create the PE image and update the layout.
         let mut pe = PeImage {
@@ -234,6 +283,15 @@ impl PeBuilder {
 
         pe.try_update_layout()?;
         Ok(pe)
+    }
+
+    /// Return the image base that the caller set, or the default for the image width.
+    fn resolved_image_base(&self) -> u64 {
+        self.image_base.unwrap_or(if self.is_64bit {
+            DEFAULT_IMAGE_BASE_64
+        } else {
+            DEFAULT_IMAGE_BASE_32
+        })
     }
 
     fn create_dos_header() -> DosHeader {
@@ -305,7 +363,7 @@ impl PeBuilder {
                 size_of_uninitialized_data: 0,
                 address_of_entry_point: self.entry_point,
                 base_of_code: 0,
-                image_base: self.image_base,
+                image_base: self.resolved_image_base(),
                 section_alignment: self.section_alignment,
                 file_alignment: self.file_alignment,
                 major_operating_system_version: 6,
@@ -339,7 +397,7 @@ impl PeBuilder {
                 address_of_entry_point: self.entry_point,
                 base_of_code: 0,
                 base_of_data: 0,
-                image_base: u32::try_from(self.image_base)
+                image_base: u32::try_from(self.resolved_image_base())
                     .map_err(|_| Error::invalid_section("PE32 image base exceeds u32"))?,
                 section_alignment: self.section_alignment,
                 file_alignment: self.file_alignment,
@@ -366,14 +424,19 @@ impl PeBuilder {
         })
     }
 
-    fn create_sections(&self) -> Vec<Section> {
-        self.sections
-            .iter()
-            .map(|(name, data, characteristics)| {
+    fn create_sections(sections: Vec<BuilderSection>) -> Vec<Section> {
+        sections
+            .into_iter()
+            .map(|section| {
                 let mut header = SectionHeader::default();
-                header.set_name(name);
-                header.characteristics = *characteristics;
-                Section::from_header_and_data(header, data.clone())
+                header.set_name(&section.name);
+                header.characteristics = section.characteristics;
+                if section.virtual_size != 0 {
+                    // `try_build` checked that the data fits in `u32`.
+                    let data_size = u32::try_from(section.data.len()).unwrap_or(u32::MAX);
+                    header.virtual_size = section.virtual_size.max(data_size);
+                }
+                Section::from_header_and_data(header, section.data)
             })
             .collect()
     }

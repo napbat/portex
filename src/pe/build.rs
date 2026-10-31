@@ -32,13 +32,16 @@ impl PeImage {
     ///
     /// The build calculates the layout again. A malformed image can have values that no new
     /// layout can use, for example a `SectionAlignment` of 0. Then the build keeps the current
-    /// layout, if it holds the headers and the section data.
+    /// layout, if it holds the headers and the section data. For an image from a loader-mapped
+    /// source, the build always makes a new layout: the raw file offsets in the headers of such a
+    /// source do not describe the source.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     ///
-    /// - The layout update fails, and the current layout cannot hold the data.
+    /// - The layout update fails, and the current layout cannot hold the data, or the image is
+    ///   from a loader-mapped source.
     /// - `e_lfanew`, the DOS stub, the optional header or the raw ranges of the sections are not
     ///   consistent, or they overflow.
     /// - The allocation of the output buffer fails.
@@ -50,6 +53,7 @@ impl PeImage {
         let mut pe = self.clone();
         match pe.try_update_layout() {
             Ok(()) => pe.try_build_updated_layout(),
+            Err(error) if self.source_layout == super::SourceLayout::Mapped => Err(error),
             Err(error) => self.try_build_current_layout(Some(0))?.ok_or(error),
         }
     }
@@ -174,8 +178,10 @@ impl PeImage {
         let mut updated = self.clone();
         let layout_updated = updated.try_update_layout().is_ok();
         let pe: &PeImage = if layout_updated { &updated } else { self };
+        let section_alignment = pe.optional_header.section_alignment();
         if let Some(section) = pe.sections.iter().find(|section| {
-            super::inspect::section_end(section) > u64::from(pe.optional_header.size_of_image())
+            super::inspect::section_end(section, section_alignment)
+                > u64::from(pe.optional_header.size_of_image())
         }) {
             return Err(Error::invalid_section(format!(
                 "section '{}' exceeds SizeOfImage",
@@ -205,7 +211,7 @@ impl PeImage {
         } else {
             pe.sections
                 .iter()
-                .map(super::inspect::section_end)
+                .map(|section| super::inspect::section_end(section, section_alignment))
                 .max()
                 .unwrap_or(0)
         };
@@ -217,12 +223,11 @@ impl PeImage {
         mapped[..header_count].copy_from_slice(&headers[..header_count]);
 
         for section in &pe.sections {
-            // The check above makes sure that the section is inside the image.
+            // The check above makes sure that the section is inside the image. The loader maps
+            // only the raw bytes inside the mapped size of the section.
             let start = section.header.virtual_address as usize;
-            let mapped_size = section
-                .header
-                .virtual_size
-                .max(section.header.size_of_raw_data) as usize;
+            let mapped_size = usize::try_from(section.header.mapped_size(section_alignment))
+                .unwrap_or(usize::MAX);
             let count = section.data.len().min(mapped_size);
             mapped[start..start + count].copy_from_slice(&section.data[..count]);
         }
@@ -243,7 +248,7 @@ impl PeImage {
     }
 
     /// Return `true` if this image has the section RVAs of `other`.
-    fn has_section_rvas_of(&self, other: &PeImage) -> bool {
+    pub(super) fn has_section_rvas_of(&self, other: &PeImage) -> bool {
         self.sections.len() == other.sections.len()
             && self
                 .sections

@@ -270,12 +270,16 @@ structure at a buffer offset and keeps the offset of each field. A cursor reads 
 each call, so you can change the buffer between two calls:
 
 ```rust,no_run
-use portex::PeHeaders;
 use portex::raw::{ImportTableEnd, RawCursor, RawImportDescriptors};
+use portex::{DataDirectoryType, PeHeaders};
 
 # let mut file: Vec<u8> = Vec::new();
 let headers = PeHeaders::from_slice_strict(&file)?;
-let import = headers.optional_header.data_directories()[1];
+// `NumberOfRvaAndSizes` can be too small to hold the entry. Then use an empty table.
+let import = headers
+    .data_directory(DataDirectoryType::Import)
+    .copied()
+    .unwrap_or_default();
 let offset = headers
     .rva_to_offset(import.virtual_address)
     .and_then(|offset| usize::try_from(offset).ok())

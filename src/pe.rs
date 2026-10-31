@@ -85,7 +85,10 @@ pub enum SourceLayout {
 /// In the file layout, the end of a source that reports its size is not a read failure: raw
 /// data after it reads as zeros, as the loader maps it. The policy applies to the other read
 /// failures, and to the mapped layout.
+///
+/// Later versions can add policies, so a `match` needs a wildcard arm.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MissingSectionData {
     /// Reject section ranges that the parser cannot read.
     #[default]
@@ -98,7 +101,11 @@ pub enum MissingSectionData {
 }
 
 /// Options to parse a PE image from any byte source.
+///
+/// Later versions can add options. Start from [`Self::file`], [`Self::mapped`] or
+/// [`Self::default`], and change the options with the methods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ParseOptions {
     /// How each RVA maps to an offset in the source.
     pub layout: SourceLayout,
@@ -242,8 +249,10 @@ impl HeaderBytes {
 
 /// The PE headers without the section data.
 ///
-/// Use this type for a remote process, or when you need only the header data.
+/// Use this type for a remote process, or when you need only the header data. Later versions
+/// can add fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PeHeaders {
     /// The DOS header (`IMAGE_DOS_HEADER`).
     pub dos_header: DosHeader,

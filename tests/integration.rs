@@ -328,7 +328,7 @@ fn test_section_management() {
     pe.add_section_with_data(".data", vec![0x00; 0x100], 0xC000_0040);
 
     assert_eq!(pe.sections.len(), 2);
-    assert!(pe.find_section(".data").is_some());
+    assert!(pe.section_by_name(".data").is_some());
 
     // Rebuild the PE and parse it again.
     let bytes = pe.build();

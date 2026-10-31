@@ -206,13 +206,28 @@ impl PeHeaders {
         self.section_headers.iter().find(|s| s.name_str() == name)
     }
 
+    /// Return the data directory entry (`IMAGE_DATA_DIRECTORY`) of the given type.
+    ///
+    /// Returns `None` if the optional header has fewer entries. `NumberOfRvaAndSizes` can be 0
+    /// in a valid file, so do not index [`OptionalHeader::data_directories`] directly.
+    #[must_use]
+    pub fn data_directory(
+        &self,
+        dir_type: crate::data_dir::DataDirectoryType,
+    ) -> Option<&crate::data_dir::DataDirectory> {
+        self.optional_header
+            .data_directories()
+            .get(dir_type.as_index())
+    }
+
     /// Convert an RVA to a source offset for the given layout.
     ///
     /// The offset is relative to the start of the image. If you called [`Self::read_from`]
     /// with a nonzero `base_offset`, add that base to the offset before you read from the
     /// original source. In the file layout, the offset is where the loader reads the byte: the
     /// loader rounds `PointerToRawData` down to a multiple of 0x200 if `FileAlignment` is 0x200 or
-    /// more.
+    /// more. A section holds the RVAs of its mapped size (see [`SectionHeader::mapped_size`]),
+    /// so raw data after that size does not give an offset.
     #[must_use]
     pub fn rva_to_source_offset(&self, rva: u32, layout: SourceLayout) -> Option<u32> {
         if rva >= self.optional_header.size_of_image() {
@@ -226,8 +241,14 @@ impl PeHeaders {
                     return Some(rva);
                 }
                 let file_alignment = self.optional_header.file_alignment();
+                let section_alignment = self.optional_header.section_alignment();
                 self.section_headers.iter().find_map(|section| {
-                    crate::layout::section_rva_to_file_offset(section, rva, file_alignment)
+                    crate::layout::section_rva_to_file_offset(
+                        section,
+                        rva,
+                        file_alignment,
+                        section_alignment,
+                    )
                 })
             }
         }
