@@ -118,6 +118,13 @@ impl DelayImportBuilder {
         kept
     }
 
+    /// Return `true` if a DLL in `dlls` gets new tables: a new IAT and a new module handle.
+    ///
+    /// The delay-load helper writes these slots at run time.
+    pub(crate) fn has_new_tables(&self, dlls: &[DelayLoadedDll]) -> bool {
+        self.kept_descriptors(dlls).iter().any(Option::is_none)
+    }
+
     /// Validate the names in `dlls` and calculate the layout of the built
     /// table. Do not call this function for an empty list.
     fn layout(&self, dlls: &[DelayLoadedDll]) -> Result<DelayImportLayout> {

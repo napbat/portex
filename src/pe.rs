@@ -179,7 +179,7 @@ pub const MAX_NUMBER_OF_SECTIONS: usize = 65535;
 /// - The method never moves a section. If you named the target section, the method returns
 ///   an error if the data does not fit before the next section. It also returns an error if
 ///   the data needs a writable section and the section is not writable (see
-///   [`Self::update_imports`]).
+///   [`Self::update_imports`] and [`Self::update_delay_imports`]).
 /// - If you did not name a section, the method uses a fallback when the data does not fit,
 ///   when the table cannot be built at the RVA in that section (for example because a kept
 ///   import address table is in the way), or when the section is not writable and the data

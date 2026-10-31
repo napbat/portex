@@ -194,6 +194,13 @@ impl PeImage {
     /// [`Self::delay_imports`] has a DLL with the same `import_address_table_rva` and the same
     /// `imports`. See [`crate::DelayImportBuilder`].
     ///
+    /// A new DLL, or a DLL whose function list changed, gets a new IAT and a new module handle
+    /// in the written data. The delay-load helper writes these slots at run time, without a
+    /// change of protection. Thus the written data then needs a writable section. If the
+    /// target section is not writable, the function uses the fallback of an unnamed target,
+    /// and the new section of the fallback is writable. If you named the target section, the
+    /// function returns an error. Kept tables stay where they are.
+    ///
     /// # Caution
     ///
     /// A new DLL, or a DLL whose function list changed, gets a new IAT with placeholder
@@ -209,6 +216,7 @@ impl PeImage {
     /// - The descriptors cannot be serialized.
     /// - The layout update fails, or the data does not fit in the target section that you
     ///   named. See [Directory updates](crate::PeImage#directory-updates).
+    /// - The data has new tables, and the target section that you named is not writable.
     pub fn update_delay_imports(
         &mut self,
         directory: &crate::delay_import::DelayImportDirectory,
@@ -264,10 +272,18 @@ impl PeImage {
             return Err(crate::Error::invalid_section(section_name));
         };
 
+        // The delay-load helper writes a new IAT and a new module handle at run time, without
+        // a change of protection. Thus new tables need a writable section.
+        let needs_write = builder_at(0).has_new_tables(&directory.dlls);
+
         // Try to replace the data in place. Rebuild the data at the existing RVA. Do not write
-        // in place if a kept table is in the way.
+        // in place if a kept table is in the way, or if new tables need a writable section.
         if let Some(dir) = &existing_dir
             && dir.is_present()
+            && (!needs_write
+                || self
+                    .section_by_rva(dir.virtual_address)
+                    .is_some_and(|section| section.header.is_writable()))
             && let Ok((existing_data, existing_size)) =
                 builder_at(dir.virtual_address).try_build(&directory.dlls)
             && existing_data.len() <= dir.size as usize
@@ -284,10 +300,12 @@ impl PeImage {
         }
 
         // Build the data at the append RVA, and append it to the section.
-        let (base_rva, encoded_size) =
-            self.append_section_data(section_idx, target_section.is_some(), |rva| {
-                builder_at(rva).try_build(&directory.dlls)
-            })?;
+        let (base_rva, encoded_size) = self.append_section_data_with(
+            section_idx,
+            target_section.is_some(),
+            |rva| builder_at(rva).try_build(&directory.dlls),
+            |_, _, _| needs_write,
+        )?;
         self.set_data_directory(DataDirectoryType::DelayImport, base_rva, encoded_size);
 
         Ok(base_rva)
