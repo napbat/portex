@@ -70,16 +70,16 @@ impl PeHeaders {
 
         // Get the offset of the PE header.
         let relative_pe_offset = u64::try_from(dos_header.e_lfanew)
-            .map_err(|_| Error::invalid_section("e_lfanew is negative"))?;
+            .map_err(|_| Error::invalid_header("e_lfanew is negative"))?;
         if relative_pe_offset < DosHeader::MIN_PE_OFFSET as u64 {
-            return Err(Error::invalid_section(format!(
+            return Err(Error::invalid_header(format!(
                 "e_lfanew {relative_pe_offset:#x} is smaller than {:#x}: the PE signature overlaps e_magic",
                 DosHeader::MIN_PE_OFFSET
             )));
         }
         let pe_offset = base_offset
             .checked_add(relative_pe_offset)
-            .ok_or_else(|| Error::invalid_section("PE header offset overflow"))?;
+            .ok_or_else(|| Error::invalid_header("PE header offset overflow"))?;
 
         // Check the PE signature.
         verify_pe_signature(reader, pe_offset)
@@ -274,7 +274,7 @@ mod tests {
         let result = PeImage::parse(&data);
         assert!(matches!(
             &result,
-            Err(e) if matches!(e.kind, crate::error::ErrorKind::InvalidSection(_))
+            Err(e) if matches!(e.kind, crate::error::ErrorKind::InvalidHeader(_))
         ));
     }
 
