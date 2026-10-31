@@ -14,26 +14,56 @@
 //!
 //! if let Some(debug_info) = pe.debug_info()? {
 //!     for dir in &debug_info.directories {
-//!         println!("Debug type: {:?}", dir.debug_type);
+//!         println!("Debug type: {:?}", dir.get_type());
 //!         println!("  Data RVA: {:#x}", dir.address_of_raw_data);
 //!     }
-//!     if let Some(ref codeview) = debug_info.codeview {
-//!         println!("  PDB path: {}", codeview.pdb_path);
-//!         println!("  GUID: {:?}", codeview.guid);
+//!     if let Some(codeview) = debug_info.codeview()? {
+//!         println!("  PDB path: {}", codeview.pdb_path_lossy());
+//!         println!("  GUID: {}", codeview.guid_string());
 //!         println!("  Age: {}", codeview.age);
 //!     }
 //! }
 //! # Ok::<(), portex::Error>(())
 //! ```
+//!
+//! ## Changing the PDB path
+//!
+//! [`DebugInfo::data`] holds the CodeView record. Write the changed record back with
+//! [`DebugInfo::set_codeview`] before you call
+//! [`PeImage::update_debug`](crate::PeImage::update_debug).
+//!
+//! ```no_run
+//! use portex::PeImage;
+//!
+//! # let file_bytes: &[u8] = &[];
+//! let mut pe = PeImage::parse(file_bytes)?;
+//! if let Some(mut debug_info) = pe.debug_info()? {
+//!     if let Some(mut codeview) = debug_info.codeview()? {
+//!         codeview.pdb_path = b"C:\\symbols\\app.pdb".to_vec();
+//!         debug_info.set_codeview(&codeview)?;
+//!         pe.update_debug(&debug_info, None)?;
+//!     }
+//! }
+//! # Ok::<(), portex::Error>(())
+//! ```
+
+mod build;
+mod codeview;
+
+pub use build::DebugBuilder;
+pub use codeview::{CV_SIGNATURE_NB10, CV_SIGNATURE_RSDS, CodeViewRsds};
 
 use crate::prelude::*;
 use crate::{Error, Result};
 
 /// Debug types (`IMAGE_DEBUG_TYPE_*`).
+///
+/// A later release can add a variant for a value that [`Self::from_u32`] does not know now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
+#[non_exhaustive]
 pub enum DebugType {
-    /// Unknown or unrecognized type (`IMAGE_DEBUG_TYPE_UNKNOWN`).
+    /// The value 0 (`IMAGE_DEBUG_TYPE_UNKNOWN`). Tools ignore entries of this type.
     Unknown = 0,
     /// COFF debug information (`IMAGE_DEBUG_TYPE_COFF`).
     Coff = 1,
@@ -67,15 +97,27 @@ pub enum DebugType {
     Mpx = 15,
     /// PE determinism or reproducibility (`IMAGE_DEBUG_TYPE_REPRO`).
     Repro = 16,
+    /// A portable PDB file in the image (`IMAGE_DEBUG_TYPE_EMBEDDED_PORTABLE_PDB`).
+    EmbeddedPortablePdb = 17,
+    /// Sample profile-guided optimization data (`IMAGE_DEBUG_TYPE_SPGO`).
+    Spgo = 18,
+    /// A checksum of the PDB file (`IMAGE_DEBUG_TYPE_PDBCHECKSUM`).
+    PdbChecksum = 19,
     /// Extended DLL characteristics bits (`IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS`).
     ExDllCharacteristics = 20,
+    /// The location of a perf map file (`IMAGE_DEBUG_TYPE_PERFMAP`).
+    PerfMap = 21,
 }
 
 impl DebugType {
-    /// Map a raw `Type` value to a `DebugType`. An unrecognized value maps to [`Self::Unknown`].
+    /// Map a raw `Type` value to a `DebugType`.
+    ///
+    /// Returns `None` for a value that this version of the crate does not know. The value 0
+    /// maps to [`Self::Unknown`].
     #[must_use]
-    pub fn from_u32(value: u32) -> Self {
-        match value {
+    pub const fn from_u32(value: u32) -> Option<Self> {
+        Some(match value {
+            0 => Self::Unknown,
             1 => Self::Coff,
             2 => Self::CodeView,
             3 => Self::Fpo,
@@ -92,9 +134,19 @@ impl DebugType {
             14 => Self::Iltcg,
             15 => Self::Mpx,
             16 => Self::Repro,
+            17 => Self::EmbeddedPortablePdb,
+            18 => Self::Spgo,
+            19 => Self::PdbChecksum,
             20 => Self::ExDllCharacteristics,
-            _ => Self::Unknown,
-        }
+            21 => Self::PerfMap,
+            _ => return None,
+        })
+    }
+
+    /// Return the raw `Type` value.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self as u32
     }
 }
 
@@ -161,157 +213,54 @@ impl DebugDirectory {
         buf
     }
 
-    /// Return the debug type as a [`DebugType`].
+    /// Return the debug type as a [`DebugType`], or `None` for an unrecognized value.
     #[must_use]
-    pub fn get_type(&self) -> DebugType {
+    pub fn get_type(&self) -> Option<DebugType> {
         DebugType::from_u32(self.debug_type)
     }
 }
 
-/// CodeView PDB 7.0 signature (RSDS).
-pub const CV_SIGNATURE_RSDS: u32 = 0x5344_5352; // "RSDS"
-
-/// CodeView PDB 2.0 signature (NB10).
-pub const CV_SIGNATURE_NB10: u32 = 0x3031_424E; // "NB10"
-
-/// A CodeView RSDS record (PDB 7.0, `CV_INFO_PDB70`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CodeViewRsds {
-    /// The PDB GUID (16 bytes).
-    pub guid: [u8; 16],
-    /// The PDB age (revision number).
-    pub age: u32,
-    /// The path of the PDB file. The record stores it as NUL-terminated UTF-8.
-    pub pdb_path: String,
-}
-
-impl CodeViewRsds {
-    /// The minimum record size: signature (4) + GUID (16) + age (4) + NUL terminator (1).
-    pub const MIN_SIZE: usize = 25;
-
-    /// Parse an RSDS record.
-    ///
-    /// # Errors
-    /// Returns an error if the buffer is too short, the signature is not
-    /// `RSDS`, or the PDB path is not NUL-terminated valid UTF-8.
-    pub fn parse(data: &[u8]) -> Result<Self> {
-        if data.len() < Self::MIN_SIZE {
-            return Err(Error::buffer_too_small(Self::MIN_SIZE, data.len()));
-        }
-        // The length check above makes each split succeed.
-        let Some((signature, rest)) = data.split_first_chunk::<4>() else {
-            return Err(Error::buffer_too_small(Self::MIN_SIZE, data.len()));
-        };
-        if u32::from_le_bytes(*signature) != CV_SIGNATURE_RSDS {
-            return Err(Error::invalid_data_directory("Invalid RSDS signature"));
-        }
-        let Some((guid, rest)) = rest.split_first_chunk::<16>() else {
-            return Err(Error::buffer_too_small(Self::MIN_SIZE, data.len()));
-        };
-        let Some((age, path_data)) = rest.split_first_chunk::<4>() else {
-            return Err(Error::buffer_too_small(Self::MIN_SIZE, data.len()));
-        };
-        let guid = *guid;
-        let age = u32::from_le_bytes(*age);
-
-        // Read the NUL-terminated path.
-        let path = path_data
-            .iter()
-            .position(|&b| b == 0)
-            .and_then(|end| path_data.get(..end))
-            .ok_or_else(|| Error::invalid_data_directory("RSDS PDB path is not null-terminated"))?;
-        let pdb_path = String::from_utf8(path.to_vec()).map_err(|_| Error::invalid_utf8())?;
-
-        Ok(Self {
-            guid,
-            age,
-            pdb_path,
-        })
-    }
-
-    /// Serialize the record to bytes.
-    ///
-    /// # Panics
-    /// Panics if [`Self::try_to_bytes`] fails.
-    #[must_use]
-    pub fn to_bytes(&self) -> Vec<u8> {
-        self.try_to_bytes()
-            .expect("CodeView build failed: use try_to_bytes()")
-    }
-
-    /// Serialize an RSDS record. Check the path contents and the record length.
-    ///
-    /// # Errors
-    /// Returns an error if the PDB path contains a NUL byte or the record
-    /// size exceeds `u32`.
-    pub fn try_to_bytes(&self) -> Result<Vec<u8>> {
-        if self.pdb_path.as_bytes().contains(&0) {
-            return Err(Error::invalid_data_directory(
-                "CodeView PDB path contains an embedded NUL byte",
-            ));
-        }
-        let capacity = 24usize
-            .checked_add(self.pdb_path.len())
-            .and_then(|size| size.checked_add(1))
-            .ok_or_else(|| Error::invalid_data_directory("CodeView payload size overflow"))?;
-        u32::try_from(capacity)
-            .map_err(|_| Error::invalid_data_directory("CodeView payload exceeds u32"))?;
-        let mut buf = Vec::with_capacity(capacity);
-        buf.extend_from_slice(&CV_SIGNATURE_RSDS.to_le_bytes());
-        buf.extend_from_slice(&self.guid);
-        buf.extend_from_slice(&self.age.to_le_bytes());
-        buf.extend_from_slice(self.pdb_path.as_bytes());
-        buf.push(0); // Null terminator
-        Ok(buf)
-    }
-
-    /// Format the GUID as a string in the Microsoft format.
-    #[must_use]
-    pub fn guid_string(&self) -> String {
-        format!(
-            "{:08X}{:04X}{:04X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-            u32::from_le_bytes([self.guid[0], self.guid[1], self.guid[2], self.guid[3]]),
-            u16::from_le_bytes([self.guid[4], self.guid[5]]),
-            u16::from_le_bytes([self.guid[6], self.guid[7]]),
-            self.guid[8],
-            self.guid[9],
-            self.guid[10],
-            self.guid[11],
-            self.guid[12],
-            self.guid[13],
-            self.guid[14],
-            self.guid[15]
-        )
-    }
-}
-
 /// Parsed debug information.
+///
+/// [`Self::data`] holds the payload of each entry, also the CodeView record. To read the
+/// CodeView record, use [`Self::codeview`]. To change it, use [`Self::set_codeview`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DebugInfo {
     /// The entries of the debug directory.
     pub directories: Vec<DebugDirectory>,
-    /// The parsed CodeView RSDS record, if present.
-    pub codeview: Option<CodeViewRsds>,
     /// The raw payload of each directory entry, in the same order as
     /// [`Self::directories`]. `None` means that the entry has no readable payload.
     pub data: Vec<Option<Vec<u8>>>,
 }
 
 impl DebugInfo {
+    /// The maximum number of payload bytes that one parse keeps, for all entries together.
+    ///
+    /// Many entries can point to the same bytes. This limit stops a small file from using a
+    /// large quantity of memory.
+    pub const MAX_PAYLOAD_BYTES: usize = 64 << 20;
+
     /// Parse the debug directory at RVA `debug_rva`.
     ///
     /// `debug_size` is the size of the directory in bytes. `read_at_rva` reads bytes at an RVA.
+    ///
+    /// The directory has `debug_size / 28` entries. The function ignores the bytes after the
+    /// last complete entry, as the debug tools do.
     ///
     /// The function calls `read_at_rva` one time for the complete directory table. For this
     /// call, `len` can be as large as `debug_size`. The callback must return at least `len`
     /// bytes. Extra bytes are ignored.
     ///
+    /// The function does not decode the payloads. A malformed payload, for example a bad
+    /// CodeView record, does not cause an error here. An unreadable payload is `None` in
+    /// [`Self::data`].
+    ///
     /// # Errors
     /// Returns an error if one of these conditions occurs:
-    /// - The directory size is not a multiple of 28.
-    /// - The table cannot be read, or an entry is invalid.
+    /// - The table cannot be read.
     /// - A payload length does not match.
-    /// - A CodeView RSDS record is malformed.
+    /// - The payloads together are larger than [`Self::MAX_PAYLOAD_BYTES`].
     pub fn parse<F>(debug_rva: u32, debug_size: u32, read_at_rva: F) -> Result<Self>
     where
         F: Fn(u32, usize) -> Option<Vec<u8>>,
@@ -333,8 +282,8 @@ impl DebugInfo {
     /// Parse the debug directory of a raw file at RVA `debug_rva`.
     ///
     /// If an entry has no mapped RVA, the function reads its payload at `PointerToRawData` (a
-    /// file offset) through `read_at_file_offset`. The note about `read_at_rva` in
-    /// [`Self::parse`] applies also to this function.
+    /// file offset) through `read_at_file_offset`. The notes about `read_at_rva` and the
+    /// payloads in [`Self::parse`] apply also to this function.
     ///
     /// # Errors
     /// Returns an error for the same conditions as [`Self::parse`].
@@ -384,304 +333,156 @@ impl DebugInfo {
         F: Fn(u32, usize) -> Option<Vec<u8>>,
         P: Fn(&DebugDirectory) -> Option<Vec<u8>>,
     {
-        let mut directories = Vec::new();
-        let mut codeview = None;
-        let mut raw_data = Vec::new();
-        if !(debug_size as usize).is_multiple_of(DebugDirectory::SIZE) {
-            return Err(Error::invalid_data_directory(format!(
-                "debug directory size {} is not a multiple of {}",
-                debug_size,
-                DebugDirectory::SIZE
-            )));
-        }
+        let table_size = debug_size / DebugDirectory::SIZE_U32 * DebugDirectory::SIZE_U32;
         let table = crate::parse_utils::read_record_table(
             read_at_rva,
             debug_rva,
-            debug_size,
+            table_size,
             DebugDirectory::SIZE,
             "debug table",
         )?;
 
-        for data in table.as_chunks::<{ DebugDirectory::SIZE }>().0 {
+        let entries = table.as_chunks::<{ DebugDirectory::SIZE }>().0;
+        let mut directories = Vec::with_capacity(entries.len());
+        let mut raw_data = Vec::with_capacity(entries.len());
+        let mut budget = Self::MAX_PAYLOAD_BYTES;
+        for data in entries {
             let dir = DebugDirectory::parse(data)?;
-            if dir.characteristics != 0 {
-                return Err(Error::invalid_data_directory(
-                    "debug directory Characteristics must be zero",
-                ));
-            }
-            if dir.size_of_data != 0 && dir.address_of_raw_data == 0 && dir.pointer_to_raw_data == 0
-            {
-                return Err(Error::invalid_data_directory(
-                    "debug payload has a size but neither an RVA nor a file pointer",
-                ));
-            }
-
             let payload = read_payload(&dir);
-            if let Some(payload) = &payload
-                && payload.len() != dir.size_of_data as usize
-            {
-                return Err(Error::invalid_data_directory(format!(
-                    "debug payload has {} bytes but declares {}",
-                    payload.len(),
-                    dir.size_of_data
-                )));
+            if let Some(payload) = &payload {
+                if payload.len() != dir.size_of_data as usize {
+                    return Err(Error::invalid_data_directory(format!(
+                        "debug payload has {} bytes but declares {}",
+                        payload.len(),
+                        dir.size_of_data
+                    )));
+                }
+                budget = budget.checked_sub(payload.len()).ok_or_else(|| {
+                    Error::invalid_data_directory(format!(
+                        "debug payloads are larger than the limit of {} bytes",
+                        Self::MAX_PAYLOAD_BYTES
+                    ))
+                })?;
             }
-
-            // Parse the CodeView record, if present.
-            if dir.get_type() == DebugType::CodeView
-                && let Some(cv_data) = payload.as_ref()
-                && let Some(signature) = cv_data.first_chunk::<4>()
-                && u32::from_le_bytes(*signature) == CV_SIGNATURE_RSDS
-            {
-                codeview = Some(CodeViewRsds::parse(cv_data)?);
-            }
-
             directories.push(dir);
             raw_data.push(payload);
         }
 
         Ok(Self {
             directories,
-            codeview,
             data: raw_data,
         })
     }
 
-    /// Return the PDB path, if available.
-    #[must_use]
-    pub fn pdb_path(&self) -> Option<&str> {
-        self.codeview.as_ref().map(|cv| cv.pdb_path.as_str())
-    }
-}
-
-/// A builder for the debug directory.
-///
-/// The debug directory can contain many entries, for example CodeView, POGO and Repro. The
-/// most common directory has one CodeView entry with PDB information.
-///
-/// # Example
-///
-/// ```
-/// use portex::debug::{DebugBuilder, DebugType, CodeViewRsds};
-///
-/// // Create a simple CodeView entry
-/// let codeview = CodeViewRsds {
-///     guid: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-///            0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00],
-///     age: 1,
-///     pdb_path: "C:\\app\\example.pdb".to_string(),
-/// };
-///
-/// let builder = DebugBuilder::new(0x3000);
-/// let (data, dir_size, entries) = builder.build_codeview(&codeview);
-/// assert_eq!(entries.len(), 1);
-/// assert_eq!(entries[0].get_type(), DebugType::CodeView);
-/// ```
-#[derive(Debug, Clone)]
-pub struct DebugBuilder {
-    /// The RVA of the debug section.
-    base_rva: u32,
-}
-
-impl DebugBuilder {
-    /// Create a debug builder. `base_rva` is the RVA of the debug section.
-    #[must_use]
-    pub fn new(base_rva: u32) -> Self {
-        Self { base_rva }
+    /// Return the index of the first CodeView entry with an RSDS payload.
+    fn rsds_index(&self) -> Option<usize> {
+        self.directories
+            .iter()
+            .zip(&self.data)
+            .position(|(directory, payload)| {
+                directory.get_type() == Some(DebugType::CodeView)
+                    && payload.as_deref().is_some_and(codeview::is_rsds)
+            })
     }
 
-    /// Build a debug directory with one CodeView entry.
+    /// Decode the CodeView RSDS record of the first CodeView entry that holds one.
     ///
-    /// Returns the tuple (`data`, `directory_size`, `debug_directories`):
-    /// - `data` contains the raw bytes to write to the section.
-    /// - `directory_size` is the size of the directory entries, for the data directory.
-    /// - `debug_directories` contains the directory entries for inspection.
+    /// The debug tools use the first record, so this function ignores the other records.
+    /// The function does not decode NB10 records.
     ///
-    /// # Panics
-    /// Panics if [`Self::try_build_codeview`] fails.
-    #[must_use]
-    pub fn build_codeview(&self, codeview: &CodeViewRsds) -> (Vec<u8>, u32, Vec<DebugDirectory>) {
-        self.try_build_codeview(codeview)
-            .expect("debug build failed: use try_build_codeview() for fallible serialization")
-    }
-
-    /// Build a CodeView entry. Check the string length and the RVAs.
+    /// The result is a copy. To change the record, call [`Self::set_codeview`] with the
+    /// changed copy.
     ///
     /// # Errors
-    /// Returns an error if the CodeView record cannot be serialized, or if the payload RVA
-    /// overflows.
-    pub fn try_build_codeview(
-        &self,
-        codeview: &CodeViewRsds,
-    ) -> Result<(Vec<u8>, u32, Vec<DebugDirectory>)> {
-        // Layout: [DebugDirectory (28 bytes)] [CodeView data].
-        let cv_data = codeview.try_to_bytes()?;
-        let cv_offset = DebugDirectory::SIZE_U32;
-        let payload_size = u32::try_from(cv_data.len())
+    /// Returns an error if the first RSDS record is malformed (see [`CodeViewRsds::parse`]).
+    /// The other entries and payloads stay available.
+    pub fn codeview(&self) -> Result<Option<CodeViewRsds>> {
+        self.rsds_index()
+            .and_then(|index| self.data.get(index)?.as_deref())
+            .map(CodeViewRsds::parse)
+            .transpose()
+    }
+
+    /// Return the PDB path of the first RSDS record.
+    ///
+    /// Returns `None` if there is no RSDS record, or if the record is malformed. The function
+    /// replaces each invalid UTF-8 sequence with U+FFFD.
+    #[must_use]
+    pub fn pdb_path(&self) -> Option<Cow<'_, str>> {
+        let payload = self.data.get(self.rsds_index()?)?.as_deref()?;
+        let (_, _, path) = codeview::split_rsds(payload).ok()?;
+        Some(String::from_utf8_lossy(path))
+    }
+
+    /// Write a CodeView RSDS record into the debug information.
+    ///
+    /// The function replaces the payload of the first CodeView entry that holds an RSDS
+    /// record, and sets its `SizeOfData`. If no entry holds an RSDS record, the function adds
+    /// a new CodeView entry. Call [`PeImage::update_debug`](crate::PeImage::update_debug) to
+    /// write the result to the image.
+    ///
+    /// # Errors
+    /// Returns an error if the record cannot be serialized, or if [`Self::data`] has more
+    /// payloads than [`Self::directories`] has entries.
+    pub fn set_codeview(&mut self, codeview: &CodeViewRsds) -> Result<()> {
+        let bytes = codeview.try_to_bytes()?;
+        let size = u32::try_from(bytes.len())
             .map_err(|_| Error::invalid_data_directory("CodeView payload exceeds u32"))?;
-        let payload_rva = self
-            .base_rva
-            .checked_add(cv_offset)
-            .ok_or_else(|| Error::invalid_data_directory("CodeView payload RVA overflow"))?;
-
-        let dir = DebugDirectory {
-            debug_type: DebugType::CodeView as u32,
-            size_of_data: payload_size,
-            address_of_raw_data: payload_rva,
-            pointer_to_raw_data: 0, // Caller must update after section layout
-            ..Default::default()
-        };
-
-        let capacity = DebugDirectory::SIZE
-            .checked_add(cv_data.len())
-            .ok_or_else(|| Error::invalid_data_directory("CodeView payload size overflow"))?;
-        let mut data = Vec::with_capacity(capacity);
-        data.extend_from_slice(&dir.to_bytes());
-        data.extend_from_slice(&cv_data);
-
-        let dir_size = DebugDirectory::SIZE_U32;
-        Ok((data, dir_size, vec![dir]))
-    }
-
-    /// Build the debug directory from a [`DebugInfo`].
-    ///
-    /// This function rebuilds all entries and all available raw payloads.
-    ///
-    /// # Panics
-    /// Panics if [`Self::try_build`] fails.
-    #[must_use]
-    pub fn build(&self, debug_info: &DebugInfo) -> (Vec<u8>, u32, Vec<DebugDirectory>) {
-        self.try_build(debug_info)
-            .expect("debug build failed: use try_build() for fallible serialization")
-    }
-
-    /// Rebuild all debug entries and the preserved payloads. Check all offsets.
-    ///
-    /// # Errors
-    /// Returns an error if one of these conditions occurs:
-    /// - There are more payloads than directory entries.
-    /// - The CodeView record cannot be serialized.
-    /// - A size or an RVA overflows `u32`.
-    pub fn try_build(&self, debug_info: &DebugInfo) -> Result<(Vec<u8>, u32, Vec<DebugDirectory>)> {
-        if debug_info.directories.is_empty() {
-            return Ok((Vec::new(), 0, Vec::new()));
+        if let Some(index) = self.rsds_index()
+            && let (Some(directory), Some(payload)) =
+                (self.directories.get_mut(index), self.data.get_mut(index))
+        {
+            directory.size_of_data = size;
+            *payload = Some(bytes);
+            return Ok(());
         }
-        if debug_info.data.len() > debug_info.directories.len() {
+        if self.data.len() > self.directories.len() {
             return Err(Error::invalid_data_directory(
                 "debug payload list is longer than the directory list",
             ));
         }
-        let fallback_codeview = debug_info
-            .codeview
-            .as_ref()
-            .map(CodeViewRsds::try_to_bytes)
-            .transpose()?;
-
-        let dir_size_usize = debug_info
-            .directories
-            .len()
-            .checked_mul(DebugDirectory::SIZE)
-            .ok_or_else(|| Error::invalid_data_directory("debug table size overflow"))?;
-        let dir_size = u32::try_from(dir_size_usize)
-            .map_err(|_| Error::invalid_data_directory("debug table exceeds u32"))?;
-        let payload_size: usize = debug_info.directories.iter().enumerate().try_fold(
-            0usize,
-            |total, (index, directory)| {
-                let size = debug_info
-                    .data
-                    .get(index)
-                    .and_then(Option::as_ref)
-                    .map(Vec::len)
-                    .or_else(|| {
-                        (directory.get_type() == DebugType::CodeView)
-                            .then_some(fallback_codeview.as_ref())
-                            .flatten()
-                            .map(Vec::len)
-                    })
-                    .unwrap_or(0);
-                u32::try_from(size)
-                    .map_err(|_| Error::invalid_data_directory("debug payload exceeds u32"))?;
-                total
-                    .checked_add(size)
-                    .ok_or_else(|| Error::invalid_data_directory("debug payload size overflow"))
-            },
-        )?;
-        dir_size_usize
-            .checked_add(payload_size)
-            .and_then(|size| u32::try_from(size).ok())
-            .and_then(|size| self.base_rva.checked_add(size))
-            .ok_or_else(|| Error::invalid_data_directory("debug data RVA range overflow"))?;
-        let mut data = vec![0u8; dir_size_usize];
-        data.try_reserve(payload_size)
-            .map_err(|_| Error::invalid_data_directory("debug payload is too large to allocate"))?;
-        let mut dirs = Vec::with_capacity(debug_info.directories.len());
-
-        for (index, orig_dir) in debug_info.directories.iter().enumerate() {
-            let mut dir = *orig_dir;
-            let payload = debug_info
-                .data
-                .get(index)
-                .and_then(Option::as_ref)
-                .cloned()
-                .or_else(|| {
-                    (dir.get_type() == DebugType::CodeView)
-                        .then(|| fallback_codeview.clone())
-                        .flatten()
-                });
-
-            if let Some(payload) = payload {
-                dir.address_of_raw_data = self
-                    .base_rva
-                    .checked_add(u32::try_from(data.len()).map_err(|_| {
-                        Error::invalid_data_directory("debug payload offset exceeds u32")
-                    })?)
-                    .ok_or_else(|| Error::invalid_data_directory("debug payload RVA overflow"))?;
-                dir.pointer_to_raw_data = 0;
-                dir.size_of_data = u32::try_from(payload.len())
-                    .map_err(|_| Error::invalid_data_directory("debug payload exceeds u32"))?;
-                data.extend_from_slice(&payload);
-            } else {
-                dir.address_of_raw_data = 0;
-                dir.pointer_to_raw_data = 0;
-                dir.size_of_data = 0;
-            }
-            dirs.push(dir);
-        }
-
-        // `data` starts with one `DebugDirectory::SIZE` slot for each entry in `dirs`.
-        let (slots, _) = data.as_chunks_mut::<{ DebugDirectory::SIZE }>();
-        for (slot, dir) in slots.iter_mut().zip(&dirs) {
-            *slot = dir.to_bytes();
-        }
-
-        Ok((data, dir_size, dirs))
-    }
-
-    /// Calculate the size of a CodeView debug entry.
-    ///
-    /// # Panics
-    /// Panics if [`Self::try_calculate_codeview_size`] fails.
-    #[must_use]
-    pub fn calculate_codeview_size(codeview: &CodeViewRsds) -> usize {
-        Self::try_calculate_codeview_size(codeview)
-            .expect("CodeView size overflow: use try_calculate_codeview_size()")
-    }
-
-    /// Calculate the size of a CodeView debug entry. Validate the string.
-    ///
-    /// # Errors
-    /// Returns an error if the CodeView record cannot be serialized, or if the size overflows.
-    pub fn try_calculate_codeview_size(codeview: &CodeViewRsds) -> Result<usize> {
-        let payload = codeview.try_to_bytes()?;
-        DebugDirectory::SIZE
-            .checked_add(payload.len())
-            .ok_or_else(|| Error::invalid_data_directory("debug entry size overflow"))
+        self.data.resize(self.directories.len(), None);
+        self.directories.push(DebugDirectory {
+            debug_type: DebugType::CodeView.as_u32(),
+            size_of_data: size,
+            ..DebugDirectory::default()
+        });
+        self.data.push(Some(bytes));
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn codeview(path: &[u8]) -> CodeViewRsds {
+        CodeViewRsds {
+            guid: [5; 16],
+            age: 1,
+            pdb_path: path.to_vec(),
+        }
+    }
+
+    fn entry(debug_type: DebugType, size: usize, rva: u32) -> [u8; DebugDirectory::SIZE] {
+        DebugDirectory {
+            debug_type: debug_type.as_u32(),
+            size_of_data: u32::try_from(size).unwrap(),
+            address_of_raw_data: rva,
+            ..DebugDirectory::default()
+        }
+        .to_bytes()
+    }
+
+    /// Return a reader of `bytes`, which start at RVA 0.
+    fn reader(bytes: &[u8]) -> impl Fn(u32, usize) -> Option<Vec<u8>> + '_ {
+        |rva, len| {
+            let start = usize::try_from(rva).ok()?;
+            bytes
+                .get(start..start.checked_add(len)?)
+                .map(<[u8]>::to_vec)
+        }
+    }
 
     #[test]
     fn test_debug_directory_size() {
@@ -695,7 +496,7 @@ mod tests {
             time_date_stamp: 0x1234_5678,
             major_version: 1,
             minor_version: 0,
-            debug_type: DebugType::CodeView as u32,
+            debug_type: DebugType::CodeView.as_u32(),
             size_of_data: 100,
             address_of_raw_data: 0x1000,
             pointer_to_raw_data: 0x400,
@@ -707,17 +508,103 @@ mod tests {
     }
 
     #[test]
-    fn test_codeview_rsds_roundtrip() {
-        let original = CodeViewRsds {
-            guid: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
-            age: 1,
-            pdb_path: "C:\\path\\to\\file.pdb".to_string(),
+    fn known_debug_types_map_and_unknown_values_do_not() {
+        for value in 0..=21 {
+            assert_eq!(DebugType::from_u32(value).unwrap().as_u32(), value);
+        }
+        assert_eq!(DebugType::from_u32(0), Some(DebugType::Unknown));
+        assert_eq!(
+            DebugType::from_u32(17),
+            Some(DebugType::EmbeddedPortablePdb)
+        );
+        assert_eq!(DebugType::from_u32(19), Some(DebugType::PdbChecksum));
+        assert_eq!(DebugType::from_u32(21), Some(DebugType::PerfMap));
+        assert_eq!(DebugType::from_u32(22), None);
+        let directory = DebugDirectory {
+            debug_type: 0x1234,
+            ..DebugDirectory::default()
         };
+        assert_eq!(directory.get_type(), None);
+    }
 
-        let bytes = original.to_bytes();
-        let parsed = CodeViewRsds::parse(&bytes).unwrap();
-        assert_eq!(original.guid, parsed.guid);
-        assert_eq!(original.age, parsed.age);
-        assert_eq!(original.pdb_path, parsed.pdb_path);
+    #[test]
+    fn set_codeview_replaces_the_first_rsds_payload() {
+        let first = codeview(b"first.pdb").to_bytes();
+        let second = codeview(b"second.pdb").to_bytes();
+        let mut info = DebugInfo::default();
+        for payload in [&first, &second] {
+            info.directories.push(DebugDirectory {
+                debug_type: DebugType::CodeView.as_u32(),
+                size_of_data: u32::try_from(payload.len()).unwrap(),
+                ..DebugDirectory::default()
+            });
+            info.data.push(Some(payload.clone()));
+        }
+        assert_eq!(info.pdb_path().as_deref(), Some("first.pdb"));
+
+        info.set_codeview(&codeview(b"changed-name.pdb")).unwrap();
+        assert_eq!(info.directories.len(), 2);
+        assert_eq!(info.pdb_path().as_deref(), Some("changed-name.pdb"));
+        assert_eq!(
+            info.directories[0].size_of_data as usize,
+            info.data[0].as_ref().unwrap().len()
+        );
+        assert_eq!(info.data[1].as_ref(), Some(&second));
+    }
+
+    #[test]
+    fn set_codeview_adds_an_entry_when_no_rsds_record_exists() {
+        let mut info = DebugInfo::default();
+        info.directories.push(DebugDirectory {
+            debug_type: DebugType::Repro.as_u32(),
+            ..DebugDirectory::default()
+        });
+        info.set_codeview(&codeview(b"new.pdb")).unwrap();
+        assert_eq!(info.directories.len(), 2);
+        assert_eq!(info.data.len(), 2);
+        assert_eq!(info.data[0], None);
+        assert_eq!(info.codeview().unwrap(), Some(codeview(b"new.pdb")));
+    }
+
+    #[test]
+    fn a_malformed_codeview_record_fails_only_its_decode() {
+        let mut record = codeview(b"a.pdb").to_bytes();
+        record.pop();
+        let mut bytes = entry(DebugType::CodeView, record.len(), 0x40).to_vec();
+        bytes.resize(0x40, 0);
+        bytes.extend_from_slice(&record);
+
+        let info = DebugInfo::parse(0, 28, reader(&bytes)).unwrap();
+        assert_eq!(info.data[0].as_deref(), Some(record.as_slice()));
+        assert!(info.codeview().is_err());
+        assert_eq!(info.pdb_path(), None);
+    }
+
+    #[test]
+    fn file_offset_payloads_share_the_payload_budget() {
+        // Each entry has no RVA, so `parse_with_file` reads its payload at the file offset.
+        let size = 1 << 20;
+        let count = DebugInfo::MAX_PAYLOAD_BYTES / size + 1;
+        let mut table = Vec::new();
+        for _ in 0..count {
+            let mut directory = DebugDirectory::parse(&entry(DebugType::Coff, size, 0)).unwrap();
+            directory.pointer_to_raw_data = 0x1000;
+            table.extend_from_slice(&directory.to_bytes());
+        }
+        let file = vec![0x11; 0x1000 + size];
+        let table_size = u32::try_from(table.len()).unwrap();
+
+        let error =
+            DebugInfo::parse_with_file(0, table_size, reader(&table), reader(&file)).unwrap_err();
+        assert!(matches!(
+            error.kind,
+            crate::ErrorKind::InvalidDataDirectory(_)
+        ));
+
+        // The same entries without the last one fit in the budget.
+        let table_size = table_size - DebugDirectory::SIZE_U32;
+        let info =
+            DebugInfo::parse_with_file(0, table_size, reader(&table), reader(&file)).unwrap();
+        assert_eq!(info.data.len(), count - 1);
     }
 }

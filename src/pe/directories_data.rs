@@ -8,6 +8,10 @@ impl PeImage {
     /// Bound imports are a legacy optimization that makes DLL loading faster.
     /// Returns `Ok(None)` if the bound import data directory is absent.
     ///
+    /// The rule for absent directories: [`Self::imports`], [`Self::exports`],
+    /// [`Self::relocations`], [`Self::delay_imports`] and [`Self::resources`] return an empty
+    /// table. The other directory accessors, for example this function, return `Ok(None)`.
+    ///
     /// # Errors
     ///
     /// Returns an error if the directory cannot be read at its RVA, or if its
@@ -122,6 +126,9 @@ impl PeImage {
     ///
     /// The loader loads a delay-loaded DLL on first use, not at startup.
     ///
+    /// Returns an empty directory if the delay-load import data directory is absent. This
+    /// follows the rule for absent directories in [`Self::bound_imports`].
+    ///
     /// # Errors
     ///
     /// Returns an error if the delay-load descriptors, their name tables or
@@ -134,6 +141,8 @@ impl PeImage {
     ///
     /// The function uses `runtime_image_base` for legacy descriptors that hold VAs. Modern
     /// descriptors hold RVAs, and the image base has no effect on them.
+    ///
+    /// Returns an empty directory if the delay-load import data directory is absent.
     ///
     /// # Errors
     ///
@@ -272,6 +281,9 @@ impl PeImage {
     ///
     /// To also load the resource data, use `resources_with_data()`.
     ///
+    /// Returns an empty directory if the resource data directory is absent. This follows the
+    /// rule for absent directories in [`Self::bound_imports`].
+    ///
     /// # Errors
     ///
     /// Returns an error if the resource directory tree cannot be read from the
@@ -296,6 +308,8 @@ impl PeImage {
     ///
     /// This function is slower than `resources()`. It loads the data of each resource into the
     /// `Resource::data` field.
+    ///
+    /// Returns an empty directory if the resource data directory is absent.
     ///
     /// # Errors
     ///

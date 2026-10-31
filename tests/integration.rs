@@ -235,7 +235,7 @@ fn test_debug_roundtrip() {
             0x0f, 0x10,
         ],
         age: 1,
-        pdb_path: "C:\\test.pdb".to_string(),
+        pdb_path: b"C:\\test.pdb".to_vec(),
     };
     pe.update_debug_codeview(&codeview, None)
         .expect("Failed to update debug");
