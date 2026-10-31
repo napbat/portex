@@ -55,6 +55,13 @@ impl PeImage {
     /// `target_section` is `None`, the function uses ".rdata". If ".rdata" does not exist, it
     /// uses the last section.
     ///
+    /// The function keeps the original TLS index (`AddressOfIndex`); see
+    /// [`TlsBuilder::try_build_from_info`](crate::tls::TlsBuilder::try_build_from_info).
+    ///
+    /// The new block holds VAs. If the image has a base relocation directory, the function
+    /// adds a `HIGHLOW` (PE32) or `DIR64` (PE32+) relocation for each VA that is not zero.
+    /// These are the directory VA fields and the callback array entries.
+    ///
     /// # Arguments
     /// * `tls_info` - The TLS data to write.
     /// * `target_section` - The name of the section that gets the TLS data (optional).
@@ -65,7 +72,8 @@ impl PeImage {
     ///
     /// Returns an error if the data-directory table has no TLS slot and cannot
     /// be extended, if the target section does not exist, if the TLS data
-    /// cannot be serialized, or if appending it breaks the image layout.
+    /// cannot be serialized, or if appending it breaks the image layout. Also returns an
+    /// error if the base relocations cannot be parsed or written.
     pub fn update_tls(
         &mut self,
         tls_info: &crate::tls::TlsInfo,
@@ -92,16 +100,21 @@ impl PeImage {
             return Err(crate::Error::invalid_section(&section_name));
         };
 
+        // Parse the relocations before the image changes.
+        let relocations = self.relocations_for_new_vas()?;
+
         // Get the RVA for the appended data.
         let append_rva = self.prepare_section_append(section_idx)?;
 
         // Build the TLS data for that RVA.
         let builder = TlsBuilder::new(append_rva, self.image_base(), self.is_64bit());
         let (data, dir_size) = builder.try_build_from_info(tls_info)?;
+        let va_offsets = builder.va_offsets(&data);
 
         // Append the data to the section.
         self.commit_section_append(section_idx, append_rva, &data)?;
         self.set_data_directory(DataDirectoryType::Tls, append_rva, dir_size);
+        self.add_va_relocations(relocations, append_rva, &va_offsets)?;
 
         Ok(append_rva)
     }
@@ -311,14 +324,15 @@ impl PeImage {
     /// # Errors
     ///
     /// Returns an error if the CLI header cannot be parsed, or if the metadata blob cannot be
-    /// read. Also returns an error if only one of the metadata RVA and the metadata size is set.
+    /// read. Also returns an error if the metadata RVA or the metadata size is zero. A .NET
+    /// assembly always has metadata.
     pub fn clr_metadata(&self) -> Result<Option<Vec<u8>>> {
         let Some(header) = self.clr_header()? else {
             return Ok(None);
         };
         if header.metadata_rva == 0 || header.metadata_size == 0 {
             return Err(Error::invalid_data_directory(
-                "CLR header has only one of metadata RVA/size set",
+                "CLR header has a zero metadata RVA or a zero metadata size",
             ));
         }
         self.read_rva(header.metadata_rva, header.metadata_size as usize)
@@ -421,14 +435,9 @@ impl PeImage {
             crate::exception::ExceptionTable::X64(_) => {
                 self.coff_header.machine == crate::coff::MachineType::Amd64 as u16
             }
-            crate::exception::ExceptionTable::Arm(_) => matches!(
-                crate::coff::MachineType::from_u16(self.coff_header.machine),
-                Some(
-                    crate::coff::MachineType::Arm
-                        | crate::coff::MachineType::ArmNt
-                        | crate::coff::MachineType::Thumb
-                )
-            ),
+            crate::exception::ExceptionTable::Arm(_) => {
+                self.coff_header.machine == crate::coff::MachineType::ArmNt as u16
+            }
             crate::exception::ExceptionTable::Arm64(_) => matches!(
                 crate::coff::MachineType::from_u16(self.coff_header.machine),
                 Some(
@@ -474,8 +483,12 @@ impl PeImage {
     /// Write the exception directory (the `.pdata` array of `RUNTIME_FUNCTION`).
     ///
     /// This function creates the exception directory with the new function entries, or replaces
-    /// the current one. If `target_section` is `None`, the function uses ".pdata", then
-    /// ".rdata", then the last section.
+    /// the current one. The function sorts a copy of the entries by `begin_address`. If
+    /// `target_section` is `None`, the function uses ".pdata", then ".rdata", then the last
+    /// section.
+    ///
+    /// The entries are AMD64 `RUNTIME_FUNCTION` records. For an image of other machine
+    /// types, use [`Self::update_exception_table`].
     ///
     /// # Arguments
     /// * `directory` - The exception directory to write.
@@ -485,49 +498,19 @@ impl PeImage {
     ///
     /// # Errors
     ///
-    /// Returns an error if the data-directory table has no exception slot and
-    /// cannot be extended, if the target section does not exist, if the
-    /// entries cannot be serialized, or if appending them breaks the image
-    /// layout.
+    /// Returns the errors of [`Self::update_exception_table`]. Thus the function returns an
+    /// error if the image machine is not AMD64.
     pub fn update_exception(
         &mut self,
         directory: &crate::exception::ExceptionDirectory,
         target_section: Option<&str>,
     ) -> Result<u32> {
-        use crate::data_dir::DataDirectoryType;
-        use crate::exception::ExceptionBuilder;
-        self.ensure_data_directory_slot(DataDirectoryType::Exception)?;
-
-        // Find the target section.
-        let section_name: String = target_section
-            .map(str::to_string)
-            .or_else(|| {
-                if self.section_by_name(".pdata").is_some() {
-                    Some(".pdata".to_string())
-                } else if self.section_by_name(".rdata").is_some() {
-                    Some(".rdata".to_string())
-                } else {
-                    self.sections.last().map(|s| s.name().to_string())
-                }
-            })
-            .unwrap_or_else(|| ".pdata".to_string());
-
-        let section_idx = self.sections.iter().position(|s| s.name() == section_name);
-        let Some(section_idx) = section_idx else {
-            return Err(crate::Error::invalid_section(&section_name));
-        };
-
-        // Build the exception data.
-        let (data, dir_size) = ExceptionBuilder::try_build_from(directory)?;
-
-        // Get the RVA for the appended data.
-        let append_rva = self.prepare_section_append(section_idx)?;
-
-        // Append the data to the section.
-        self.commit_section_append(section_idx, append_rva, &data)?;
-        self.set_data_directory(DataDirectoryType::Exception, append_rva, dir_size);
-
-        Ok(append_rva)
+        let mut sorted = directory.clone();
+        sorted.sort();
+        self.update_exception_table(
+            &crate::exception::ExceptionTable::X64(sorted),
+            target_section,
+        )
     }
 
     /// Parse the load config directory (`IMAGE_LOAD_CONFIG_DIRECTORY32` or
@@ -579,6 +562,11 @@ impl PeImage {
     /// `target_section` is `None`, the function uses ".rdata". If ".rdata" does not exist, it
     /// uses the last section.
     ///
+    /// The structure holds VAs, for example `SecurityCookie` and the CFG pointers. If the image
+    /// has a base relocation directory, the function adds a `HIGHLOW` (PE32) or `DIR64`
+    /// (PE32+) relocation for each VA field that is not zero. This includes the VA fields in
+    /// `trailing_data`, up to `GuardMemcpyFunctionPointer`.
+    ///
     /// # Arguments
     /// * `config` - The `LoadConfig` directory to write.
     /// * `target_section` - The name of the section that gets the `LoadConfig` data (optional).
@@ -590,7 +578,7 @@ impl PeImage {
     /// Returns an error if the data-directory table has no load config slot
     /// and cannot be extended, if the target section does not exist, if the
     /// structure cannot be serialized, or if appending it breaks the image
-    /// layout.
+    /// layout. Also returns an error if the base relocations cannot be parsed or written.
     pub fn update_load_config(
         &mut self,
         config: &crate::loadconfig::LoadConfigDirectory,
@@ -620,6 +608,10 @@ impl PeImage {
         // Build the LoadConfig data.
         let builder = LoadConfigBuilder::new(self.is_64bit());
         let (data, dir_size) = builder.try_build(config)?;
+        let va_offsets = config.va_field_offsets();
+
+        // Parse the relocations before the image changes.
+        let relocations = self.relocations_for_new_vas()?;
 
         // Get the RVA for the appended data.
         let append_rva = self.prepare_section_append(section_idx)?;
@@ -627,8 +619,54 @@ impl PeImage {
         // Append the data to the section.
         self.commit_section_append(section_idx, append_rva, &data)?;
         self.set_data_directory(DataDirectoryType::LoadConfig, append_rva, dir_size);
+        self.add_va_relocations(relocations, append_rva, &va_offsets)?;
 
         Ok(append_rva)
+    }
+
+    /// Return the base relocations that get the entries for a new block of VAs.
+    ///
+    /// Returns `Ok(None)` if the image has no base relocation directory.
+    fn relocations_for_new_vas(&self) -> Result<Option<crate::reloc::RelocationTable>> {
+        let present = self
+            .data_directory(crate::data_dir::DataDirectoryType::BaseReloc)
+            .is_some_and(|directory| directory.is_present());
+        if present {
+            self.relocations().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Add a `HIGHLOW` (PE32) or `DIR64` (PE32+) relocation for the VA at each `rva + offset`.
+    ///
+    /// Then write `relocations` with [`Self::update_relocations`]. If `relocations` is `None`,
+    /// the image has no base relocation directory, and the function does nothing.
+    fn add_va_relocations(
+        &mut self,
+        relocations: Option<crate::reloc::RelocationTable>,
+        rva: u32,
+        offsets: &[usize],
+    ) -> Result<()> {
+        let Some(mut relocations) = relocations else {
+            return Ok(());
+        };
+        if offsets.is_empty() {
+            return Ok(());
+        }
+        for &offset in offsets {
+            let target = u32::try_from(offset)
+                .ok()
+                .and_then(|offset| rva.checked_add(offset))
+                .ok_or_else(|| Error::invalid_data_directory("relocated VA has no valid RVA"))?;
+            if self.is_64bit() {
+                relocations.add_dir64(target);
+            } else {
+                relocations.add_highlow(target);
+            }
+        }
+        self.update_relocations(&relocations, None)?;
+        Ok(())
     }
 
     pub(crate) fn clear_security(&mut self) {

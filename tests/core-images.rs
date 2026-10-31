@@ -443,11 +443,10 @@ fn malformed_resource_entry_order_is_rejected() {
 
 #[test]
 fn load_config_preserves_versioned_tail_and_checks_pe32_values() {
-    let config = LoadConfigDirectory32 {
-        security_cookie: 0x0040_1000,
-        trailing_data: vec![9, 8, 7, 6, 5],
-        ..Default::default()
-    };
+    let mut config = LoadConfigDirectory32::default();
+    config.size = 4;
+    config.security_cookie = 0x0040_1000;
+    config.trailing_data = vec![9, 8, 7, 6, 5];
     let bytes = config.try_to_bytes().unwrap();
     let parsed = LoadConfigDirectory32::parse(&bytes).unwrap();
     assert_eq!(parsed.trailing_data, config.trailing_data);
@@ -477,7 +476,6 @@ fn chained_unwind_info_requires_a_complete_runtime_function() {
     };
     let info = UnwindInfo {
         version_flags: 1 | (portex::exception::UNW_FLAG_CHAININFO << 3),
-        chained_info: Some(function.begin_address),
         chained_function: Some(function),
         ..Default::default()
     };
@@ -487,7 +485,6 @@ fn chained_unwind_info_requires_a_complete_runtime_function() {
 
     let incomplete = UnwindInfo {
         version_flags: info.version_flags,
-        chained_info: Some(0x1000),
         ..Default::default()
     };
     assert!(incomplete.try_to_bytes().is_err());
@@ -509,20 +506,22 @@ fn arm64_exception_records_are_architecture_aware() {
     .unwrap();
     assert!(matches!(parsed, ExceptionTable::Arm64(_)));
 
-    let reserved = PackedRuntimeFunction {
+    let link = PackedRuntimeFunction {
         begin_address: 0x1000,
         unwind_data: 3,
     }
     .to_bytes();
-    assert!(
-        ExceptionTable::parse(
-            MachineType::Arm64 as u16,
-            0x7000,
-            u32::try_from(reserved.len()).unwrap(),
-            |rva, len| read_from_blob(&reserved, 0x7000, rva, len),
-        )
-        .is_err()
-    );
+    let parsed = ExceptionTable::parse(
+        MachineType::Arm64 as u16,
+        0x7000,
+        u32::try_from(link.len()).unwrap(),
+        |rva, len| read_from_blob(&link, 0x7000, rva, len),
+    )
+    .unwrap();
+    let ExceptionTable::Arm64(directory) = parsed else {
+        panic!("expected an ARM64 table");
+    };
+    assert_eq!(directory.functions[0].parent_record_rva(), Some(0));
 }
 
 #[test]
