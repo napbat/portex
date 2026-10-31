@@ -49,17 +49,22 @@ impl PeImage {
     /// limits get the data. The RVA is aligned to [`APPEND_ALIGNMENT`], so that each structure
     /// in the data is aligned.
     ///
-    /// If `added` is `true`, the method added the section for this append. The section has no
-    /// data, and the layout gave it a `VirtualSize` of one alignment unit. Then the data starts
-    /// at the start of the section.
-    fn prepare_section_append(&mut self, section_index: usize, added: bool) -> Result<u32> {
-        self.try_update_layout()?;
-        let section = self
+    /// A new section that has no RVA yet, no data and no `VirtualSize` gets the data at its
+    /// start. The layout gives such a section a `VirtualSize` of one alignment unit. The data
+    /// does not start after that size.
+    fn prepare_section_append(&mut self, section_index: usize) -> Result<u32> {
+        let header = &self
             .sections
             .get(section_index)
-            .ok_or_else(|| Error::invalid_section("section index is out of range"))?;
+            .ok_or_else(|| Error::invalid_section("section index is out of range"))?
+            .header;
+        let new_section = header.virtual_address == 0
+            && header.virtual_size == 0
+            && self.sections[section_index].data.is_empty();
+        self.try_update_layout()?;
+        let section = &self.sections[section_index];
         // The loader uses `SizeOfRawData` as the size if `VirtualSize` is 0.
-        let virtual_end = if added {
+        let virtual_end = if new_section {
             0
         } else if section.header.virtual_size == 0 {
             section.data.len()
@@ -138,7 +143,7 @@ impl PeImage {
         needs_write: impl Fn(&Self, usize, &T) -> bool,
     ) -> Result<(u32, T)> {
         let mut needs_writable_section = false;
-        match self.try_append_at(section_index, false, &mut build, &needs_write)? {
+        match self.try_append_at(section_index, &mut build, &needs_write)? {
             Attempt::Done(image, rva, value) => {
                 *self = *image;
                 return Ok((rva, value));
@@ -157,7 +162,7 @@ impl PeImage {
         if let Some(last) = self.fallback_section_index()
             && last != section_index
         {
-            match self.try_append_at(last, false, &mut build, &needs_write)? {
+            match self.try_append_at(last, &mut build, &needs_write)? {
                 Attempt::Done(image, rva, value) => {
                     *self = *image;
                     return Ok((rva, value));
@@ -176,7 +181,7 @@ impl PeImage {
             let mut candidate = self.clone();
             candidate.try_add_section_with_data(APPEND_SECTION_NAME, Vec::new(), flags)?;
             let index = candidate.sections.len() - 1;
-            match candidate.try_append_at(index, true, &mut build, &needs_write)? {
+            match candidate.try_append_at(index, &mut build, &needs_write)? {
                 Attempt::Done(image, rva, value) => {
                     *self = *image;
                     return Ok((rva, value));
@@ -190,8 +195,7 @@ impl PeImage {
     }
 
     /// Try to append the data of `build` to the section at `section_index`, on a copy of the
-    /// image. `added` is `true` for a section that the append added (see
-    /// [`Self::prepare_section_append`]).
+    /// image.
     ///
     /// # Errors
     ///
@@ -200,12 +204,11 @@ impl PeImage {
     fn try_append_at<T>(
         &self,
         section_index: usize,
-        added: bool,
         build: &mut impl FnMut(u32) -> Result<(Vec<u8>, T)>,
         needs_write: &impl Fn(&Self, usize, &T) -> bool,
     ) -> Result<Attempt<T>> {
         let mut candidate = self.clone();
-        let rva = candidate.prepare_section_append(section_index, added)?;
+        let rva = candidate.prepare_section_append(section_index)?;
         let (data, value) = match build(rva) {
             Ok(output) => output,
             Err(error) => return Ok(Attempt::BuildFailed(error)),
@@ -236,6 +239,28 @@ impl PeImage {
             return Ok(Attempt::NoFit);
         }
         Ok(Attempt::Done(Box::new(candidate), rva, value))
+    }
+
+    /// Return the index of the section that gets appended tables when the caller names no
+    /// section and the tables go to one section.
+    ///
+    /// This is the last section, if the fallback of an append can use it (see
+    /// [`Self::append_section_data_with`]). Otherwise the method adds a new readable
+    /// `.portex` section, and returns its index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the method cannot add the section. Then the image does not change.
+    pub(super) fn default_append_section(&mut self) -> Result<usize> {
+        if let Some(index) = self.fallback_section_index() {
+            return Ok(index);
+        }
+        self.try_add_section_with_data(
+            APPEND_SECTION_NAME,
+            Vec::new(),
+            characteristics::INITIALIZED_DATA | characteristics::READ,
+        )?;
+        Ok(self.sections.len() - 1)
     }
 
     /// Return the index of the last section in RVA order, if an append can use it as the

@@ -1,13 +1,14 @@
 //! Regression tests for the append of a directory table: the fallback section, the reuse of
 //! zero raw padding, and the atomic updates of the TLS and load configuration directories.
 
-use portex::ExportTable;
+use portex::directories::RelocationTable;
 use portex::directories::{
     LoadConfigDirectory, LoadConfigDirectory64, TlsDirectory, TlsDirectory64, TlsInfo,
 };
 use portex::headers::{DataDirectoryType, MachineType};
 use portex::image::{PeBuilder, PeImage};
 use portex::section::characteristics;
+use portex::{ExportTable, ImportTable, ImportThunk};
 
 const READ_DATA: u32 = characteristics::INITIALIZED_DATA | characteristics::READ;
 
@@ -217,4 +218,73 @@ fn an_added_fallback_section_gets_the_data_at_its_start() {
     assert_eq!(image.sections.len(), 4);
     assert_eq!(image.sections[3].header.virtual_address, 0xFFFF_C000);
     assert_eq!(rva, 0xFFFF_C000);
+}
+
+#[test]
+fn rebuild_does_not_put_tables_in_a_discardable_last_section() {
+    let mut image = PeBuilder::new()
+        .machine(MachineType::Amd64)
+        .add_section(".text", vec![0xc3; 0x100], characteristics::CODE)
+        .add_section(".rdata", vec![1; 16], READ_DATA)
+        .add_section(".data", vec![2; 16], READ_DATA | characteristics::WRITE)
+        .add_section(
+            ".reloc",
+            vec![0; 16],
+            READ_DATA | characteristics::DISCARDABLE,
+        )
+        .try_build()
+        .unwrap();
+    let mut imports = ImportTable::default();
+    imports.add_dll(
+        "KERNEL32.dll",
+        vec![ImportThunk::Name {
+            hint: 0,
+            name: "ExitProcess".to_string(),
+        }],
+    );
+    image.update_imports(&imports, Some(".rdata")).unwrap();
+    let mut exports = ExportTable::default();
+    exports.set_dll_name("rebuild.dll");
+    exports.add_export(Some("Function"), 0x1000);
+    image.update_exports(&exports, Some(".rdata")).unwrap();
+    let mut relocations = RelocationTable::default();
+    relocations.add_dir64(0x1010);
+    image
+        .update_relocations(&relocations, Some(".reloc"))
+        .unwrap();
+    let base = image.image_base();
+    let tls = TlsInfo {
+        directory: Some(TlsDirectory::Tls64(TlsDirectory64 {
+            address_of_index: base + 0x3000,
+            ..TlsDirectory64::default()
+        })),
+        callback_rvas: vec![0x1000],
+        image_base: base,
+    };
+    image.update_tls(&tls, Some(".rdata")).unwrap();
+    let mut image = PeImage::parse(&image.try_build().unwrap()).unwrap();
+
+    // Before the fix, the rebuild put every table in the last section, `.reloc`. The base
+    // relocations can stay in `.reloc`: the loader uses them only while it loads the image.
+    image.rebuild_supported_directories(None).unwrap();
+    let image = PeImage::parse(&image.try_build().unwrap()).unwrap();
+    assert_eq!(image.sections.len(), 5);
+    assert_eq!(image.sections[4].name(), ".portex");
+    for directory in [
+        DataDirectoryType::Import,
+        DataDirectoryType::Iat,
+        DataDirectoryType::Export,
+        DataDirectoryType::Tls,
+    ] {
+        let rva = image.data_directory(directory).unwrap().virtual_address;
+        let section = image.section_by_rva(rva).unwrap();
+        assert_eq!(
+            section.header.characteristics & characteristics::DISCARDABLE,
+            0,
+            "{directory:?} is in section '{}'",
+            section.name()
+        );
+    }
+    assert_eq!(image.exports().unwrap().exports.len(), 1);
+    assert_eq!(image.tls().unwrap().unwrap().callback_rvas, [0x1000]);
 }

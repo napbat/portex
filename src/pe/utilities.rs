@@ -107,9 +107,13 @@ impl PeImage {
     /// Use this method after structural changes to sections. It makes sure that all data
     /// directory content has the correct alignment and layout.
     ///
-    /// The operation is atomic. It appends the rebuilt tables to one section. If you do not
-    /// supply a target section, the method uses the last section, so that the RVAs of existing
-    /// sections do not move. The method intentionally does not touch these directories:
+    /// The operation is atomic. It appends the rebuilt tables to one section, so that the RVAs
+    /// of existing sections do not move. If you do not supply a target section, the method
+    /// uses the last section, with the rules of the append fallback (see
+    /// [Directory updates](crate::PeImage#directory-updates)): if the last section is not
+    /// readable, has uninitialized data, is discardable or is `.rsrc`, the method adds a new
+    /// `.portex` section for the tables. The method intentionally does not touch these
+    /// directories:
     /// - Security (raw-file state)
     /// - CLR metadata
     /// - Directories with an encoding that Portex does not own
@@ -121,7 +125,8 @@ impl PeImage {
     ///
     /// # Errors
     ///
-    /// Returns an error if any data directory fails to parse or rebuild.
+    /// Returns an error if any data directory fails to parse or rebuild. Also returns an error
+    /// if the method adds a `.portex` section and another section already has this name.
     pub fn rebuild_supported_directories(&mut self, target_section: Option<&str>) -> Result<()> {
         // Parse all directories before you change anything.
         let imports = self.imports()?;
@@ -135,19 +140,29 @@ impl PeImage {
         let exceptions = self.exception_table()?;
         let load_config = self.load_config()?;
 
-        let selected_section = target_section
-            .map(ToString::to_string)
-            .or_else(|| {
-                self.sections
-                    .last()
-                    .map(|section| section.name().to_string())
-            })
-            .ok_or_else(|| Error::invalid_section("image has no target section"))?;
-        if self.section_by_name(&selected_section).is_none() {
-            return Err(Error::invalid_section(&selected_section));
-        }
-        let target_section = Some(selected_section.as_str());
         let mut rebuilt = self.clone();
+        let selected_section = if let Some(name) = target_section {
+            if self.section_by_name(name).is_none() {
+                return Err(Error::invalid_section(name));
+            }
+            name.to_string()
+        } else {
+            let index = rebuilt.default_append_section()?;
+            let name = rebuilt.sections[index].name().to_string();
+            // The update methods find the section by its name. The name must be unique.
+            if rebuilt
+                .sections
+                .iter()
+                .position(|section| section.name() == name)
+                != Some(index)
+            {
+                return Err(Error::invalid_section(format!(
+                    "the target section '{name}' does not have a unique name"
+                )));
+            }
+            name
+        };
+        let target_section = Some(selected_section.as_str());
 
         // Rebuild each directory, but only if it is not empty.
         if !imports.is_empty() {
