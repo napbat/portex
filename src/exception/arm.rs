@@ -12,6 +12,9 @@ use crate::{Error, Result};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PackedRuntimeFunction {
     /// RVA of the first instruction in the function or fragment.
+    ///
+    /// For ARM NT, bit 0 is the Thumb bit. Linkers set it for Thumb code, so the value is
+    /// odd. The function starts at `begin_address & !1`.
     pub begin_address: u32,
     /// The architecture-specific packed unwind word, or the exception data RVA plus flags.
     pub unwind_data: u32,
@@ -44,7 +47,12 @@ impl PackedRuntimeFunction {
         bytes
     }
 
-    /// Return the low-bit discriminator that the ARM exception ABI defines.
+    /// Return the low-bit discriminator (`Flag`) that the ARM exception ABI defines.
+    ///
+    /// - 0: `unwind_data` is the RVA of an `.xdata` record.
+    /// - 1: packed unwind data.
+    /// - 2: packed unwind data for a fragment without a prolog.
+    /// - 3: ARM64 `.pdata` record link (reserved for ARM NT).
     #[must_use]
     pub const fn flag(self) -> u8 {
         self.unwind_data.to_le_bytes()[0] & 0b11
@@ -60,10 +68,26 @@ impl PackedRuntimeFunction {
         }
     }
 
+    /// Return the RVA of the parent `.pdata` record if [`Self::flag`] is 3.
+    ///
+    /// On ARM64, `Flag` 3 marks a record link: the record describes a jump island, and the
+    /// upper 30 bits of `unwind_data` are the RVA of the `.pdata` record of its parent
+    /// function. On ARM NT, `Flag` 3 is reserved.
+    #[must_use]
+    pub const fn parent_record_rva(self) -> Option<u32> {
+        if self.flag() == 3 {
+            Some(self.unwind_data & !0b11)
+        } else {
+            None
+        }
+    }
+
     /// Return `true` if this record encodes the unwind description directly.
+    ///
+    /// This is the case for [`Self::flag`] 1 and 2.
     #[must_use]
     pub const fn is_packed(self) -> bool {
-        self.flag() != 0
+        matches!(self.flag(), 1 | 2)
     }
 }
 
@@ -122,11 +146,22 @@ impl PackedExceptionDirectory {
             .expect("packed exception-directory build failed: use try_to_bytes()")
     }
 
-    /// Serialize to bytes.
+    /// Serialize to bytes after validation.
     ///
     /// # Errors
-    /// Returns an error if the table size exceeds `u32`.
+    /// Returns an error if [`Self::validate`] fails.
     pub fn try_to_bytes(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let byte_size = self.byte_size()?;
+        let mut bytes = Vec::with_capacity(byte_size);
+        for function in &self.functions {
+            bytes.extend_from_slice(&function.to_bytes());
+        }
+        Ok(bytes)
+    }
+
+    /// Return the table size in bytes. The size must fit in `u32`.
+    fn byte_size(&self) -> Result<usize> {
         let byte_size = self
             .functions
             .len()
@@ -134,11 +169,33 @@ impl PackedExceptionDirectory {
             .ok_or_else(|| Error::invalid_data_directory("exception table size overflow"))?;
         u32::try_from(byte_size)
             .map_err(|_| Error::invalid_data_directory("exception table size exceeds u32"))?;
-        let mut bytes = Vec::with_capacity(byte_size);
-        for function in &self.functions {
-            bytes.extend_from_slice(&function.to_bytes());
+        Ok(byte_size)
+    }
+
+    /// Check the record order and the table size.
+    ///
+    /// The unwinder does a binary search on `begin_address`. Thus the records must be in
+    /// strictly ascending `begin_address` order. The table size must fit in `u32`.
+    ///
+    /// # Errors
+    /// Returns an error that describes the first violation.
+    pub fn validate(&self) -> Result<()> {
+        self.byte_size()?;
+        for (index, pair) in self.functions.windows(2).enumerate() {
+            if pair[1].begin_address <= pair[0].begin_address {
+                return Err(Error::invalid_data_directory(format!(
+                    "ARM runtime-function record {} is unsorted or a duplicate",
+                    index + 1
+                )));
+            }
         }
-        Ok(bytes)
+        Ok(())
+    }
+
+    /// Sort the records by `begin_address`.
+    pub fn sort(&mut self) {
+        self.functions
+            .sort_by_key(|function| function.begin_address);
     }
 
     /// Number of records.
@@ -165,5 +222,45 @@ mod tests {
         let size = u32::MAX - u32::MAX % 8;
         let result = PackedExceptionDirectory::parse(0x1000, size, |_, _| None);
         assert!(result.is_err());
+    }
+
+    /// Before the fix, `is_packed` was true for a `Flag` 3 record link.
+    #[test]
+    fn record_link_is_not_packed_and_has_a_parent() {
+        let link = PackedRuntimeFunction {
+            begin_address: 0x2000,
+            unwind_data: 0x1000 | 3,
+        };
+        assert!(!link.is_packed());
+        assert_eq!(link.parent_record_rva(), Some(0x1000));
+        assert_eq!(link.exception_data_rva(), None);
+        let packed = PackedRuntimeFunction {
+            begin_address: 0x1000,
+            unwind_data: 0x0020_0011,
+        };
+        assert!(packed.is_packed());
+        assert_eq!(packed.parent_record_rva(), None);
+    }
+
+    /// Before the fix, the records were written in caller order without a check.
+    #[test]
+    fn serialization_requires_ascending_records() {
+        let mut directory = PackedExceptionDirectory {
+            functions: vec![
+                PackedRuntimeFunction {
+                    begin_address: 0x2000,
+                    unwind_data: 1,
+                },
+                PackedRuntimeFunction {
+                    begin_address: 0x1000,
+                    unwind_data: 1,
+                },
+            ],
+        };
+        assert!(directory.try_to_bytes().is_err());
+        directory.sort();
+        assert_eq!(directory.try_to_bytes().unwrap().len(), 16);
+        directory.functions[1].begin_address = 0x1000;
+        assert!(directory.try_to_bytes().is_err());
     }
 }

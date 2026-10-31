@@ -260,11 +260,9 @@ fn test_loadconfig_roundtrip() {
         .build();
 
     // Create a `LoadConfig` with a security cookie.
-    let config64 = LoadConfigDirectory64 {
-        size: u32::try_from(LoadConfigDirectory64::MIN_SIZE).unwrap(),
-        security_cookie: 0x0001_4000_2000, // VA of the security cookie
-        ..Default::default()
-    };
+    let mut config64 = LoadConfigDirectory64::default();
+    config64.size = u32::try_from(LoadConfigDirectory64::MIN_SIZE).unwrap();
+    config64.security_cookie = 0x0001_4000_2000; // VA of the security cookie
     let loadconfig = LoadConfigDirectory::Config64(config64);
 
     pe.update_load_config(&loadconfig, None)
@@ -290,14 +288,12 @@ fn test_loadconfig_reads_the_structure_size_of_a_short_32bit_directory() {
         .add_section(".text", vec![0xCC; 0x200], 0x6000_0020)
         .add_section(".rdata", vec![0x00; 0x200], 0x4000_0040)
         .build();
-    let config = LoadConfigDirectory32 {
-        size: 0xc0,
-        security_cookie: 0x0040_2000,
-        guard_cf_function_count: 3,
-        guard_flags: 0x0001_0500,
-        trailing_data: vec![0x5a; 0xc0 - LoadConfigDirectory32::SIZE_WITH_CFG],
-        ..Default::default()
-    };
+    let mut config = LoadConfigDirectory32::default();
+    config.size = 0xc0;
+    config.security_cookie = 0x0040_2000;
+    config.guard_cf_function_count = 3;
+    config.guard_flags = 0x0001_0500;
+    config.trailing_data = vec![0x5a; 0xc0 - LoadConfigDirectory32::SIZE_WITH_CFG];
     let rva = pe
         .update_load_config(&LoadConfigDirectory::Config32(config.clone()), None)
         .expect("the load configuration is written");

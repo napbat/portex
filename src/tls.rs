@@ -211,7 +211,7 @@ pub struct TlsInfo {
     /// The TLS directory.
     pub directory: Option<TlsDirectory>,
     /// Callback RVAs, converted from the VAs in the callback array.
-    pub callback_rvas: Vec<u64>,
+    pub callback_rvas: Vec<u32>,
     /// Image base that converts the absolute VAs of the directory to RVAs.
     pub image_base: u64,
 }
@@ -313,7 +313,7 @@ fn read_callback_rvas<F>(
     image_base: u64,
     is_64bit: bool,
     read_at_rva: &F,
-) -> Result<Vec<u64>>
+) -> Result<Vec<u32>>
 where
     F: Fn(u32, usize) -> Option<Vec<u8>>,
 {
@@ -364,7 +364,7 @@ where
                 "TLS callback VA {callback_address:#x} is outside the 32-bit RVA space"
             ))
         })?;
-        callback_rvas.push(u64::from(callback_rva));
+        callback_rvas.push(callback_rva);
         offset = offset
             .checked_add(ptr_stride)
             .ok_or_else(|| Error::invalid_data_directory("TLS callback-array size overflow"))?;
@@ -408,6 +408,8 @@ pub struct TlsBuilder {
 /// The byte layout of the TLS block that [`TlsBuilder`] emits.
 ///
 /// The block is `[directory][TLS index (4 bytes)][padding][null-terminated callback array]`.
+/// The block always holds the index slot. If the rebuilt directory keeps its original
+/// `AddressOfIndex`, the slot stays zero and is not used.
 struct TlsLayout {
     /// Size of the TLS directory structure. This is also the offset of the TLS index.
     dir_size: usize,
@@ -456,7 +458,7 @@ impl TlsBuilder {
         &self,
         raw_data_start_rva: u32,
         raw_data_end_rva: u32,
-        callback_rvas: &[u64],
+        callback_rvas: &[u32],
     ) -> (Vec<u8>, u32) {
         self.try_build(raw_data_start_rva, raw_data_end_rva, callback_rvas)
             .expect("TLS build failed: use try_build() for fallible serialization")
@@ -464,31 +466,42 @@ impl TlsBuilder {
 
     /// Build the TLS data with checked VA, RVA and size arithmetic.
     ///
+    /// `AddressOfIndex` points to the 4-byte index slot in the new block.
+    ///
     /// # Errors
     ///
     /// Returns an error in these conditions:
     /// - The raw data range is reversed, or only one end of it is zero.
-    /// - A callback RVA exceeds `u32`.
     /// - The block size or an RVA or VA calculation overflows.
     /// - A PE32 VA does not fit in 32 bits.
     pub fn try_build(
         &self,
         raw_data_start_rva: u32,
         raw_data_end_rva: u32,
-        callback_rvas: &[u64],
+        callback_rvas: &[u32],
     ) -> Result<(Vec<u8>, u32)> {
-        self.build_block(raw_data_start_rva, raw_data_end_rva, callback_rvas, 0, 0)
+        self.build_block(
+            raw_data_start_rva,
+            raw_data_end_rva,
+            callback_rvas,
+            0,
+            0,
+            None,
+        )
     }
 
     /// Build the TLS block with the given `SizeOfZeroFill` and
     /// `Characteristics` values.
+    ///
+    /// If `index_address` is `None`, `AddressOfIndex` points to the index slot in the block.
     fn build_block(
         &self,
         raw_data_start_rva: u32,
         raw_data_end_rva: u32,
-        callback_rvas: &[u64],
+        callback_rvas: &[u32],
         size_of_zero_fill: u32,
         characteristics: u32,
+        index_address: Option<u64>,
     ) -> Result<(Vec<u8>, u32)> {
         if raw_data_end_rva < raw_data_start_rva {
             return Err(Error::invalid_data_directory(
@@ -522,7 +535,10 @@ impl TlsBuilder {
                 )?,
             )
         };
-        let index_address = self.block_va(layout.dir_size, "TLS index")?;
+        let index_address = match index_address {
+            Some(address) => address,
+            None => self.block_va(layout.dir_size, "TLS index")?,
+        };
         let array_address = if callback_rvas.is_empty() {
             0 // No callbacks
         } else {
@@ -548,8 +564,6 @@ impl TlsBuilder {
 
         // Write the callback array.
         for &callback_rva in callback_rvas {
-            let callback_rva = u32::try_from(callback_rva)
-                .map_err(|_| Error::invalid_data_directory("TLS callback RVA exceeds u32"))?;
             let callback_address =
                 checked_va(self.image_base, u64::from(callback_rva), "TLS callback")?;
             self.push_pointer(&mut data, callback_address)?;
@@ -665,11 +679,17 @@ impl TlsBuilder {
     /// The function rebases the VA fields to the image base of the builder. It keeps the
     /// `SizeOfZeroFill` and `Characteristics` values.
     ///
+    /// The function also keeps the TLS index (`AddressOfIndex`), rebased in the same way. The
+    /// code of the image reads its TLS slot number from this address. If `AddressOfIndex` is
+    /// zero, or if `tls_info` has no directory, the function points `AddressOfIndex` to a new
+    /// zeroed slot in the block.
+    ///
     /// # Errors
     ///
     /// Returns an error in these conditions:
     /// - The directory bitness is not the same as the bitness of the builder.
-    /// - A raw data VA is outside the 32-bit RVA space of `tls_info.image_base`.
+    /// - A raw data VA or the index VA is outside the 32-bit RVA space of
+    ///   `tls_info.image_base`.
     /// - [`Self::try_build`] fails.
     pub fn try_build_from_info(&self, tls_info: &TlsInfo) -> Result<(Vec<u8>, u32)> {
         if matches!(tls_info.directory, Some(TlsDirectory::Tls64(_))) != self.is_64bit
@@ -679,21 +699,29 @@ impl TlsBuilder {
                 "TLS directory bitness does not match the target image",
             ));
         }
-        let (raw_start, raw_end, size_of_zero_fill, characteristics) = match &tls_info.directory {
-            Some(TlsDirectory::Tls32(dir)) => {
-                let start = va_to_rva(
+        let (raw_start_va, raw_end_va, index_va, size_of_zero_fill, characteristics) =
+            match &tls_info.directory {
+                Some(TlsDirectory::Tls32(dir)) => (
                     u64::from(dir.start_address_of_raw_data),
-                    tls_info.image_base,
-                )?;
-                let end = va_to_rva(u64::from(dir.end_address_of_raw_data), tls_info.image_base)?;
-                (start, end, dir.size_of_zero_fill, dir.characteristics)
-            }
-            Some(TlsDirectory::Tls64(dir)) => {
-                let start = va_to_rva(dir.start_address_of_raw_data, tls_info.image_base)?;
-                let end = va_to_rva(dir.end_address_of_raw_data, tls_info.image_base)?;
-                (start, end, dir.size_of_zero_fill, dir.characteristics)
-            }
-            None => (0, 0, 0, 0),
+                    u64::from(dir.end_address_of_raw_data),
+                    u64::from(dir.address_of_index),
+                    dir.size_of_zero_fill,
+                    dir.characteristics,
+                ),
+                Some(TlsDirectory::Tls64(dir)) => (
+                    dir.start_address_of_raw_data,
+                    dir.end_address_of_raw_data,
+                    dir.address_of_index,
+                    dir.size_of_zero_fill,
+                    dir.characteristics,
+                ),
+                None => (0, 0, 0, 0, 0),
+            };
+        let raw_start = va_to_rva(raw_start_va, tls_info.image_base)?;
+        let raw_end = va_to_rva(raw_end_va, tls_info.image_base)?;
+        let index_address = match va_to_rva(index_va, tls_info.image_base)? {
+            0 => None,
+            rva => Some(checked_va(self.image_base, u64::from(rva), "TLS index")?),
         };
 
         self.build_block(
@@ -702,7 +730,30 @@ impl TlsBuilder {
             &tls_info.callback_rvas,
             size_of_zero_fill,
             characteristics,
+            index_address,
         )
+    }
+
+    /// Return the offsets in `block` of the VAs that need base relocations.
+    ///
+    /// `block` is a block that this builder made. The offsets are those of the directory VA
+    /// fields and of the callback array entries that are not zero, in ascending order.
+    pub(crate) fn va_offsets(&self, block: &[u8]) -> Vec<usize> {
+        let pointer_size = if self.is_64bit { 8 } else { 4 };
+        let directory_fields = (0..4).map(|index| index * pointer_size);
+        let callbacks = self
+            .layout(0)
+            .map_or(block.len(), |layout| layout.callbacks_offset);
+        let callback_slots = (callbacks..block.len()).step_by(pointer_size);
+        directory_fields
+            .chain(callback_slots)
+            .filter(|&offset| {
+                block
+                    .get(offset..)
+                    .and_then(|rest| rest.get(..pointer_size))
+                    .is_some_and(|value| value.iter().any(|&byte| byte != 0))
+            })
+            .collect()
     }
 
     /// Calculate the size in bytes of the TLS data.
@@ -790,5 +841,53 @@ mod tests {
         let bytes = original.to_bytes();
         let parsed = TlsDirectory64::parse(&bytes).unwrap();
         assert_eq!(original, parsed);
+    }
+
+    /// Before the fix, the rebuild pointed `AddressOfIndex` to a new slot in the block. The
+    /// code of the image still read the original `_tls_index`.
+    #[test]
+    fn rebuild_keeps_the_original_index_address() {
+        let base = 0x0000_0001_4000_0000;
+        let info = TlsInfo {
+            directory: Some(TlsDirectory::Tls64(TlsDirectory64 {
+                start_address_of_raw_data: base + 0x2000,
+                end_address_of_raw_data: base + 0x2010,
+                address_of_index: base + 0x2100,
+                ..TlsDirectory64::default()
+            })),
+            callback_rvas: vec![0x1000],
+            image_base: base,
+        };
+        let new_base = 0x0000_0001_8000_0000;
+        let builder = TlsBuilder::new(0x3000, new_base, true);
+        let (block, _) = builder.try_build_from_info(&info).unwrap();
+        let TlsDirectory::Tls64(directory) = TlsDirectory::parse(&block, true).unwrap() else {
+            panic!("expected a PE32+ directory");
+        };
+        assert_eq!(directory.address_of_index, new_base + 0x2100);
+        assert_eq!(directory.start_address_of_raw_data, new_base + 0x2000);
+
+        // Without an index, the block gets its own slot.
+        let empty = TlsInfo {
+            directory: None,
+            ..info
+        };
+        let (block, _) = builder.try_build_from_info(&empty).unwrap();
+        let TlsDirectory::Tls64(directory) = TlsDirectory::parse(&block, true).unwrap() else {
+            panic!("expected a PE32+ directory");
+        };
+        assert_eq!(directory.address_of_index, new_base + 0x3000 + 40);
+    }
+
+    #[test]
+    fn va_offsets_list_the_directory_fields_and_callbacks() {
+        let builder = TlsBuilder::new(0x3000, 0x0040_0000, false);
+        let (block, _) = builder
+            .try_build(0x2000, 0x2010, &[0x1000, 0x1010])
+            .unwrap();
+        // Start, end, index, callbacks, then two callbacks at offset 28 (24 + 4).
+        assert_eq!(builder.va_offsets(&block), [0, 4, 8, 12, 28, 32]);
+        let (block, _) = builder.try_build(0, 0, &[]).unwrap();
+        assert_eq!(builder.va_offsets(&block), [8]);
     }
 }
