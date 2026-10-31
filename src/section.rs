@@ -514,6 +514,43 @@ impl Section {
         Ok(offset)
     }
 
+    /// Write appended bytes at `offset` from the section start, and grow `VirtualSize` to
+    /// their end.
+    ///
+    /// The bytes can reuse zero raw padding after `VirtualSize`. The method fills the space
+    /// between the data and `offset` with zeros.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a nonzero byte is in the range of the new bytes, if the end exceeds
+    /// `u32`, or if the memory for the data cannot be allocated. In that case, the section does
+    /// not change.
+    pub(crate) fn try_write_appended(&mut self, offset: usize, data: &[u8]) -> Result<()> {
+        let too_large = || Error::invalid_section("section data exceeds u32");
+        let end = offset.checked_add(data.len()).ok_or_else(too_large)?;
+        let new_virtual_size = u32::try_from(end).map_err(|_| too_large())?;
+        let overlap = self
+            .data
+            .get(offset..end.min(self.data.len()))
+            .unwrap_or_default();
+        if overlap.iter().any(|&byte| byte != 0) {
+            return Err(Error::invalid_section(
+                "an append must not overwrite nonzero section data",
+            ));
+        }
+        if let Some(additional) = end.checked_sub(self.data.len()) {
+            self.data
+                .try_reserve(additional)
+                .map_err(|_| Error::invalid_section("section data is too large to allocate"))?;
+            self.data.resize(end, 0);
+        }
+        self.data[offset..end].copy_from_slice(data);
+        self.mapped_raw_size = None;
+        self.mapped_data_len = 0;
+        self.header.virtual_size = self.header.virtual_size.max(new_virtual_size);
+        Ok(())
+    }
+
     /// Mark every byte in this section as initialized raw data for the file.
     ///
     /// When portex parses a mapped image, `data` keeps the virtual zero-fill. The section also

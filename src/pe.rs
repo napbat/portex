@@ -173,13 +173,22 @@ pub const MAX_NUMBER_OF_SECTIONS: usize = 65535;
 /// table over the current one. When an `update_*` method appends a table to a section, these
 /// rules apply:
 ///
-/// - The data starts at an 8-byte aligned RVA after the `VirtualSize` of the section. The
-///   method fills the space before it with zeros.
-/// - The method never moves a section. If the data does not fit before the next section and
-///   you named the target section, the method returns an error.
-/// - If you did not name a section, the method appends the data to the last section. If the
-///   last section is not readable or has uninitialized data, the method adds a new `.portex`
-///   section.
+/// - The data starts at an 8-byte aligned RVA after the `VirtualSize` of the section and
+///   after the last nonzero byte of the section data. Thus zero raw padding after
+///   `VirtualSize` can hold the data. The method fills the space before the data with zeros.
+/// - The method never moves a section. If you named the target section, the method returns
+///   an error if the data does not fit before the next section. It also returns an error if
+///   the data needs a writable section and the section is not writable (see
+///   [`Self::update_imports`]).
+/// - If you did not name a section, the method uses a fallback when the data does not fit,
+///   when the table cannot be built at the RVA in that section (for example because a kept
+///   import address table is in the way), or when the section is not writable and the data
+///   needs a writable section. The fallback is the last section. The method does not use the
+///   last section if it is not readable, has uninitialized data, is discardable (a driver can
+///   free it after the load) or is `.rsrc` (resource editors write it again). Then the method
+///   adds a new `.portex` section. This section is writable only if the data needs it.
+/// - If an `update_*` method returns an error, the image does not change. The exception is
+///   a data directory table that the method extended to hold the new directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeImage {
     /// The DOS header (`IMAGE_DOS_HEADER`).
@@ -280,8 +289,10 @@ pub struct PeHeaders {
     pub pe_offset: u64,
 }
 
+mod append;
 mod build;
 mod directories_data;
+mod directories_imports;
 mod directories_runtime;
 mod edit;
 mod headers;
