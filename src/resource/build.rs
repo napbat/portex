@@ -1,8 +1,9 @@
 use super::{
-    Error, ResourceDataEntry, ResourceDirectory, ResourceDirectoryEntry, ResourceDirectoryHeader,
-    ResourceId, ResourceType, Result,
+    Error, NAME_LENGTH_SIZE, NAME_UNIT_SIZE, ResourceDataEntry, ResourceDirectory,
+    ResourceDirectoryEntry, ResourceDirectoryHeader, ResourceId, ResourceType, Result,
 };
 use crate::prelude::*;
+use nostdio::WriteLe;
 
 /// A resource entry that owns its data, used to build a resource directory.
 #[derive(Debug, Clone)]
@@ -664,9 +665,9 @@ fn write_language_data(data: &mut [u8], base_rva: u32, lang: &LanguageLayout<'_>
 fn write_string_name(data: &mut [u8], offset: u32, units: &[u16]) -> Result<()> {
     let count = checked_u16_count(units.len(), "resource-name UTF-16 unit")?;
     let mut bytes = Vec::with_capacity(name_string_size(units)?);
-    bytes.extend_from_slice(&count.to_le_bytes());
+    bytes.write_u16_le(count)?;
     for unit in units {
-        bytes.extend_from_slice(&unit.to_le_bytes());
+        bytes.write_u16_le(*unit)?;
     }
     write_bytes(data, offset as usize, &bytes)
 }
@@ -674,9 +675,10 @@ fn write_string_name(data: &mut [u8], offset: u32, units: &[u16]) -> Result<()> 
 fn resource_name_size(units: &[u16]) -> Result<u64> {
     let units = units.len();
     checked_u16_count(units, "resource-name UTF-16 unit")?;
-    (units as u64)
-        .checked_mul(2)
-        .and_then(|size| size.checked_add(2))
+    units
+        .checked_mul(NAME_UNIT_SIZE)
+        .and_then(|size| size.checked_add(NAME_LENGTH_SIZE))
+        .and_then(|size| u64::try_from(size).ok())
         .ok_or_else(|| Error::invalid_data_directory("resource-name size overflow"))
 }
 

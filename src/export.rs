@@ -51,6 +51,10 @@
 //! # Ok::<(), portex::Error>(())
 //! ```
 
+use core::mem::{offset_of, size_of};
+
+use nostdio::ReadLe;
+
 use crate::prelude::*;
 use crate::{Error, Result};
 
@@ -60,6 +64,69 @@ use crate::{Error, Result};
 /// PE files.
 const MAX_NAME_LEN: usize = 4096;
 const MAX_EXPORT_FUNCTIONS: u32 = 1_048_576;
+
+/// The layout of `IMAGE_EXPORT_DIRECTORY`.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the
+/// width of each field.
+#[repr(C)]
+pub(crate) struct ImageExportDirectory {
+    pub(crate) characteristics: u32,
+    pub(crate) time_date_stamp: u32,
+    pub(crate) major_version: u16,
+    pub(crate) minor_version: u16,
+    pub(crate) name: u32,
+    pub(crate) base: u32,
+    pub(crate) number_of_functions: u32,
+    pub(crate) number_of_names: u32,
+    pub(crate) address_of_functions: u32,
+    pub(crate) address_of_names: u32,
+    pub(crate) address_of_name_ordinals: u32,
+}
+
+const _: () = {
+    assert!(size_of::<ImageExportDirectory>() == 40);
+    assert!(offset_of!(ImageExportDirectory, name) == 12);
+    assert!(offset_of!(ImageExportDirectory, number_of_functions) == 20);
+    assert!(offset_of!(ImageExportDirectory, address_of_name_ordinals) == 36);
+};
+
+/// The type of one entry of the export address table: the RVA of a function or a forwarder.
+type ExportAddressEntry = u32;
+/// The type of one entry of the export name pointer table: the RVA of a name.
+type ExportNamePointer = u32;
+/// The type of one entry of the export ordinal table: an index into the export address table.
+type ExportOrdinal = u16;
+
+/// The size of one export address table entry, in bytes.
+const ADDRESS_ENTRY_SIZE: usize = size_of::<ExportAddressEntry>();
+/// The size of one export name pointer table entry, in bytes.
+const NAME_POINTER_SIZE: usize = size_of::<ExportNamePointer>();
+/// The size of one export ordinal table entry, in bytes.
+const ORDINAL_SIZE: usize = size_of::<ExportOrdinal>();
+/// [`ADDRESS_ENTRY_SIZE`] as `u32`, for RVA arithmetic.
+pub(crate) const ADDRESS_ENTRY_SIZE_U32: u32 = ExportAddressEntry::BITS / u8::BITS;
+/// [`NAME_POINTER_SIZE`] as `u32`, for RVA arithmetic.
+pub(crate) const NAME_POINTER_SIZE_U32: u32 = ExportNamePointer::BITS / u8::BITS;
+/// [`ORDINAL_SIZE`] as `u32`, for RVA arithmetic.
+pub(crate) const ORDINAL_SIZE_U32: u32 = ExportOrdinal::BITS / u8::BITS;
+
+const _: () = {
+    assert!(ADDRESS_ENTRY_SIZE == 4 && ADDRESS_ENTRY_SIZE_U32 == 4);
+    assert!(NAME_POINTER_SIZE == 4 && NAME_POINTER_SIZE_U32 == 4);
+    assert!(ORDINAL_SIZE == 2 && ORDINAL_SIZE_U32 == 2);
+};
+
+/// Copy `bytes` into `buf` at `offset`. The caller gives an offset and a width from a mirror
+/// struct that fit in `buf`.
+fn put(buf: &mut [u8], offset: usize, bytes: &[u8]) {
+    if let Some(dst) = buf
+        .get_mut(offset..)
+        .and_then(|rest| rest.get_mut(..bytes.len()))
+    {
+        dst.copy_from_slice(bytes);
+    }
+}
 
 /// `IMAGE_EXPORT_DIRECTORY`: the 40-byte header of the export data directory.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -90,7 +157,7 @@ pub struct ExportDirectory {
 
 impl ExportDirectory {
     /// Size of a serialized `IMAGE_EXPORT_DIRECTORY` in bytes.
-    pub const SIZE: usize = 40;
+    pub const SIZE: usize = size_of::<ImageExportDirectory>();
 
     /// Parse an export directory from bytes.
     ///
@@ -99,22 +166,23 @@ impl ExportDirectory {
     /// Returns [`Error::buffer_too_small`] if `data` is shorter than
     /// [`Self::SIZE`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let Some(d) = data.first_chunk::<{ Self::SIZE }>() else {
+        let Some(mut d) = data.get(..Self::SIZE) else {
             return Err(Error::buffer_too_small(Self::SIZE, data.len()));
         };
 
+        // The fields are in the order of `ImageExportDirectory`, without padding.
         Ok(Self {
-            characteristics: u32::from_le_bytes([d[0], d[1], d[2], d[3]]),
-            time_date_stamp: u32::from_le_bytes([d[4], d[5], d[6], d[7]]),
-            major_version: u16::from_le_bytes([d[8], d[9]]),
-            minor_version: u16::from_le_bytes([d[10], d[11]]),
-            name_rva: u32::from_le_bytes([d[12], d[13], d[14], d[15]]),
-            base: u32::from_le_bytes([d[16], d[17], d[18], d[19]]),
-            number_of_functions: u32::from_le_bytes([d[20], d[21], d[22], d[23]]),
-            number_of_names: u32::from_le_bytes([d[24], d[25], d[26], d[27]]),
-            address_of_functions: u32::from_le_bytes([d[28], d[29], d[30], d[31]]),
-            address_of_names: u32::from_le_bytes([d[32], d[33], d[34], d[35]]),
-            address_of_name_ordinals: u32::from_le_bytes([d[36], d[37], d[38], d[39]]),
+            characteristics: d.read_u32_le()?,
+            time_date_stamp: d.read_u32_le()?,
+            major_version: d.read_u16_le()?,
+            minor_version: d.read_u16_le()?,
+            name_rva: d.read_u32_le()?,
+            base: d.read_u32_le()?,
+            number_of_functions: d.read_u32_le()?,
+            number_of_names: d.read_u32_le()?,
+            address_of_functions: d.read_u32_le()?,
+            address_of_names: d.read_u32_le()?,
+            address_of_name_ordinals: d.read_u32_le()?,
         })
     }
 
@@ -142,17 +210,54 @@ impl ExportDirectory {
     }
 
     fn encode(&self, buf: &mut [u8; ExportDirectory::SIZE]) {
-        buf[0..4].copy_from_slice(&self.characteristics.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.time_date_stamp.to_le_bytes());
-        buf[8..10].copy_from_slice(&self.major_version.to_le_bytes());
-        buf[10..12].copy_from_slice(&self.minor_version.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.name_rva.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.base.to_le_bytes());
-        buf[20..24].copy_from_slice(&self.number_of_functions.to_le_bytes());
-        buf[24..28].copy_from_slice(&self.number_of_names.to_le_bytes());
-        buf[28..32].copy_from_slice(&self.address_of_functions.to_le_bytes());
-        buf[32..36].copy_from_slice(&self.address_of_names.to_le_bytes());
-        buf[36..40].copy_from_slice(&self.address_of_name_ordinals.to_le_bytes());
+        type M = ImageExportDirectory;
+        put(
+            buf,
+            offset_of!(M, characteristics),
+            &self.characteristics.to_le_bytes(),
+        );
+        put(
+            buf,
+            offset_of!(M, time_date_stamp),
+            &self.time_date_stamp.to_le_bytes(),
+        );
+        put(
+            buf,
+            offset_of!(M, major_version),
+            &self.major_version.to_le_bytes(),
+        );
+        put(
+            buf,
+            offset_of!(M, minor_version),
+            &self.minor_version.to_le_bytes(),
+        );
+        put(buf, offset_of!(M, name), &self.name_rva.to_le_bytes());
+        put(buf, offset_of!(M, base), &self.base.to_le_bytes());
+        put(
+            buf,
+            offset_of!(M, number_of_functions),
+            &self.number_of_functions.to_le_bytes(),
+        );
+        put(
+            buf,
+            offset_of!(M, number_of_names),
+            &self.number_of_names.to_le_bytes(),
+        );
+        put(
+            buf,
+            offset_of!(M, address_of_functions),
+            &self.address_of_functions.to_le_bytes(),
+        );
+        put(
+            buf,
+            offset_of!(M, address_of_names),
+            &self.address_of_names.to_le_bytes(),
+        );
+        put(
+            buf,
+            offset_of!(M, address_of_name_ordinals),
+            &self.address_of_name_ordinals.to_le_bytes(),
+        );
     }
 }
 

@@ -1,8 +1,13 @@
 //! Raw views of the resource directory: directories, entries and data entries.
 
+use core::mem::offset_of;
+
 use super::{RawField, at, check_range, read_u16, read_u32};
 use crate::Result;
-use crate::resource::{ResourceDataEntry, ResourceDirectoryEntry, ResourceDirectoryHeader};
+use crate::resource::{
+    ImageResourceDataEntry, ImageResourceDirectory as M, ImageResourceDirectoryEntry,
+    ResourceDataEntry, ResourceDirectoryEntry, ResourceDirectoryHeader,
+};
 
 /// The high bit of a resource directory entry field.
 const HIGH_BIT: u32 = 0x8000_0000;
@@ -37,15 +42,16 @@ impl RawResourceDirectory {
     /// Returns an error if the directory is not in `data`.
     pub fn parse(data: &[u8], offset: usize) -> Result<Self> {
         check_range(data, offset, Self::SIZE)?;
+        let word = |delta| read_u32(data, at(offset, delta)?);
         let half = |delta| read_u16(data, at(offset, delta)?);
         Ok(Self {
             offset,
-            characteristics: read_u32(data, offset)?,
-            time_date_stamp: read_u32(data, at(offset, 4)?)?,
-            major_version: half(8)?,
-            minor_version: half(10)?,
-            number_of_named_entries: half(12)?,
-            number_of_id_entries: half(14)?,
+            characteristics: word(offset_of!(M, characteristics))?,
+            time_date_stamp: word(offset_of!(M, time_date_stamp))?,
+            major_version: half(offset_of!(M, major_version))?,
+            minor_version: half(offset_of!(M, minor_version))?,
+            number_of_named_entries: half(offset_of!(M, number_of_named_entries))?,
+            number_of_id_entries: half(offset_of!(M, number_of_id_entries))?,
         })
     }
 
@@ -90,8 +96,17 @@ impl RawResourceEntry {
         check_range(data, offset, Self::SIZE)?;
         Ok(Self {
             offset,
-            name_or_id: read_u32(data, offset)?,
-            offset_to_data: read_u32(data, at(offset, 4)?)?,
+            name_or_id: read_u32(
+                data,
+                at(offset, offset_of!(ImageResourceDirectoryEntry, name))?,
+            )?,
+            offset_to_data: read_u32(
+                data,
+                at(
+                    offset,
+                    offset_of!(ImageResourceDirectoryEntry, offset_to_data),
+                )?,
+            )?,
         })
     }
 
@@ -151,10 +166,10 @@ impl RawResourceDataEntry {
         let word = |delta| read_u32(data, at(offset, delta)?);
         Ok(Self {
             offset,
-            offset_to_data: word(0)?,
-            size: word(4)?,
-            code_page: word(8)?,
-            reserved: word(12)?,
+            offset_to_data: word(offset_of!(ImageResourceDataEntry, offset_to_data))?,
+            size: word(offset_of!(ImageResourceDataEntry, size))?,
+            code_page: word(offset_of!(ImageResourceDataEntry, code_page))?,
+            reserved: word(offset_of!(ImageResourceDataEntry, reserved))?,
         })
     }
 }

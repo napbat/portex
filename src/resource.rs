@@ -50,8 +50,92 @@
 //! # Ok::<(), portex::Error>(())
 //! ```
 
+use core::mem::{offset_of, size_of};
+
+use nostdio::ReadLe;
+
 use crate::prelude::*;
 use crate::{Error, Result};
+
+/// The layout of `IMAGE_RESOURCE_DIRECTORY`.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the
+/// width of each field.
+#[repr(C)]
+pub(crate) struct ImageResourceDirectory {
+    pub(crate) characteristics: u32,
+    pub(crate) time_date_stamp: u32,
+    pub(crate) major_version: u16,
+    pub(crate) minor_version: u16,
+    pub(crate) number_of_named_entries: u16,
+    pub(crate) number_of_id_entries: u16,
+}
+
+/// The layout of `IMAGE_RESOURCE_DIRECTORY_ENTRY`.
+///
+/// The two fields are unions of bit fields in `winnt.h`. Each union is one `DWORD`.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the
+/// width of each field.
+#[repr(C)]
+pub(crate) struct ImageResourceDirectoryEntry {
+    pub(crate) name: u32,
+    pub(crate) offset_to_data: u32,
+}
+
+/// The layout of `IMAGE_RESOURCE_DATA_ENTRY`.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the
+/// width of each field.
+#[repr(C)]
+pub(crate) struct ImageResourceDataEntry {
+    pub(crate) offset_to_data: u32,
+    pub(crate) size: u32,
+    pub(crate) code_page: u32,
+    pub(crate) reserved: u32,
+}
+
+/// The layout of `IMAGE_RESOURCE_DIR_STRING_U`: a length in UTF-16 units, then the units.
+///
+/// `NameString` has a variable length. The mirror holds one unit, as `winnt.h` does.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the
+/// width of each field.
+#[repr(C)]
+struct ImageResourceDirStringU {
+    length: u16,
+    name_string: [u16; 1],
+}
+
+/// The size of the length prefix of a resource name string, in bytes.
+pub(crate) const NAME_LENGTH_SIZE: usize = offset_of!(ImageResourceDirStringU, name_string);
+/// [`NAME_LENGTH_SIZE`] as `u32`, for RVA arithmetic.
+pub(crate) const NAME_LENGTH_SIZE_U32: u32 = u16::BITS / u8::BITS;
+/// The size of one UTF-16 unit of a resource name string, in bytes.
+pub(crate) const NAME_UNIT_SIZE: usize = size_of::<u16>();
+
+const _: () = {
+    assert!(size_of::<ImageResourceDirectory>() == 16);
+    assert!(offset_of!(ImageResourceDirectory, major_version) == 8);
+    assert!(offset_of!(ImageResourceDirectory, number_of_id_entries) == 14);
+    assert!(size_of::<ImageResourceDirectoryEntry>() == 8);
+    assert!(offset_of!(ImageResourceDirectoryEntry, offset_to_data) == 4);
+    assert!(size_of::<ImageResourceDataEntry>() == 16);
+    assert!(offset_of!(ImageResourceDataEntry, code_page) == 8);
+    assert!(offset_of!(ImageResourceDirStringU, length) == 0);
+    assert!(NAME_LENGTH_SIZE == 2 && NAME_LENGTH_SIZE_U32 == 2);
+};
+
+/// Copy `bytes` into `buf` at `offset`. The caller gives an offset and a width from a mirror
+/// struct that fit in `buf`.
+fn put(buf: &mut [u8], offset: usize, bytes: &[u8]) {
+    if let Some(dst) = buf
+        .get_mut(offset..)
+        .and_then(|rest| rest.get_mut(..bytes.len()))
+    {
+        dst.copy_from_slice(bytes);
+    }
+}
 
 /// Standard resource types (`RT_*` values used as level-1 IDs of the resource tree).
 ///
@@ -230,7 +314,7 @@ pub struct ResourceDirectoryHeader {
 
 impl ResourceDirectoryHeader {
     /// Size of `IMAGE_RESOURCE_DIRECTORY` in bytes.
-    pub const SIZE: usize = 16;
+    pub const SIZE: usize = size_of::<ImageResourceDirectory>();
 
     /// Parse an `IMAGE_RESOURCE_DIRECTORY` from little-endian bytes.
     ///
@@ -238,17 +322,18 @@ impl ResourceDirectoryHeader {
     ///
     /// Returns a buffer-too-small error if `data` is shorter than [`Self::SIZE`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        if data.len() < Self::SIZE {
+        let Some(mut data) = data.get(..Self::SIZE) else {
             return Err(Error::buffer_too_small(Self::SIZE, data.len()));
-        }
+        };
 
+        // The fields are in the order of `ImageResourceDirectory`, without padding.
         Ok(Self {
-            characteristics: u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
-            time_date_stamp: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
-            major_version: u16::from_le_bytes([data[8], data[9]]),
-            minor_version: u16::from_le_bytes([data[10], data[11]]),
-            number_of_named_entries: u16::from_le_bytes([data[12], data[13]]),
-            number_of_id_entries: u16::from_le_bytes([data[14], data[15]]),
+            characteristics: data.read_u32_le()?,
+            time_date_stamp: data.read_u32_le()?,
+            major_version: data.read_u16_le()?,
+            minor_version: data.read_u16_le()?,
+            number_of_named_entries: data.read_u16_le()?,
+            number_of_id_entries: data.read_u16_le()?,
         })
     }
 
@@ -256,12 +341,36 @@ impl ResourceDirectoryHeader {
     #[must_use]
     pub fn to_bytes(self) -> [u8; Self::SIZE] {
         let mut buf = [0u8; Self::SIZE];
-        buf[0..4].copy_from_slice(&self.characteristics.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.time_date_stamp.to_le_bytes());
-        buf[8..10].copy_from_slice(&self.major_version.to_le_bytes());
-        buf[10..12].copy_from_slice(&self.minor_version.to_le_bytes());
-        buf[12..14].copy_from_slice(&self.number_of_named_entries.to_le_bytes());
-        buf[14..16].copy_from_slice(&self.number_of_id_entries.to_le_bytes());
+        put(
+            &mut buf,
+            offset_of!(ImageResourceDirectory, characteristics),
+            &self.characteristics.to_le_bytes(),
+        );
+        put(
+            &mut buf,
+            offset_of!(ImageResourceDirectory, time_date_stamp),
+            &self.time_date_stamp.to_le_bytes(),
+        );
+        put(
+            &mut buf,
+            offset_of!(ImageResourceDirectory, major_version),
+            &self.major_version.to_le_bytes(),
+        );
+        put(
+            &mut buf,
+            offset_of!(ImageResourceDirectory, minor_version),
+            &self.minor_version.to_le_bytes(),
+        );
+        put(
+            &mut buf,
+            offset_of!(ImageResourceDirectory, number_of_named_entries),
+            &self.number_of_named_entries.to_le_bytes(),
+        );
+        put(
+            &mut buf,
+            offset_of!(ImageResourceDirectory, number_of_id_entries),
+            &self.number_of_id_entries.to_le_bytes(),
+        );
         buf
     }
 
@@ -287,7 +396,7 @@ pub struct ResourceDirectoryEntry {
 
 impl ResourceDirectoryEntry {
     /// Size of `IMAGE_RESOURCE_DIRECTORY_ENTRY` in bytes.
-    pub const SIZE: usize = 8;
+    pub const SIZE: usize = size_of::<ImageResourceDirectoryEntry>();
 
     /// Parse an `IMAGE_RESOURCE_DIRECTORY_ENTRY` from little-endian bytes.
     ///
@@ -295,13 +404,14 @@ impl ResourceDirectoryEntry {
     ///
     /// Returns a buffer-too-small error if `data` is shorter than [`Self::SIZE`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        if data.len() < Self::SIZE {
+        let Some(mut data) = data.get(..Self::SIZE) else {
             return Err(Error::buffer_too_small(Self::SIZE, data.len()));
-        }
+        };
 
+        // The fields are in the order of `ImageResourceDirectoryEntry`, without padding.
         Ok(Self {
-            name_or_id: u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
-            offset_to_data: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
+            name_or_id: data.read_u32_le()?,
+            offset_to_data: data.read_u32_le()?,
         })
     }
 
@@ -309,8 +419,16 @@ impl ResourceDirectoryEntry {
     #[must_use]
     pub fn to_bytes(self) -> [u8; Self::SIZE] {
         let mut buf = [0u8; Self::SIZE];
-        buf[0..4].copy_from_slice(&self.name_or_id.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.offset_to_data.to_le_bytes());
+        put(
+            &mut buf,
+            offset_of!(ImageResourceDirectoryEntry, name),
+            &self.name_or_id.to_le_bytes(),
+        );
+        put(
+            &mut buf,
+            offset_of!(ImageResourceDirectoryEntry, offset_to_data),
+            &self.offset_to_data.to_le_bytes(),
+        );
         buf
     }
 
@@ -333,8 +451,8 @@ impl ResourceDirectoryEntry {
     /// The value is valid only if [`Self::is_named`] is false.
     #[must_use]
     pub fn id(self) -> u16 {
-        let [low, high, _, _] = self.name_or_id.to_le_bytes();
-        u16::from_le_bytes([low, high])
+        // The mask keeps 16 bits, so the conversion cannot fail.
+        u16::try_from(self.name_or_id & u32::from(u16::MAX)).unwrap_or_default()
     }
 
     /// Check if this entry points to a subdirectory instead of a data entry.
@@ -368,7 +486,7 @@ pub struct ResourceDataEntry {
 
 impl ResourceDataEntry {
     /// Size of `IMAGE_RESOURCE_DATA_ENTRY` in bytes.
-    pub const SIZE: usize = 16;
+    pub const SIZE: usize = size_of::<ImageResourceDataEntry>();
 
     /// Parse an `IMAGE_RESOURCE_DATA_ENTRY` from little-endian bytes.
     ///
@@ -376,15 +494,16 @@ impl ResourceDataEntry {
     ///
     /// Returns a buffer-too-small error if `data` is shorter than [`Self::SIZE`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        if data.len() < Self::SIZE {
+        let Some(mut data) = data.get(..Self::SIZE) else {
             return Err(Error::buffer_too_small(Self::SIZE, data.len()));
-        }
+        };
 
+        // The fields are in the order of `ImageResourceDataEntry`, without padding.
         Ok(Self {
-            offset_to_data: u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
-            size: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
-            code_page: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
-            reserved: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
+            offset_to_data: data.read_u32_le()?,
+            size: data.read_u32_le()?,
+            code_page: data.read_u32_le()?,
+            reserved: data.read_u32_le()?,
         })
     }
 
@@ -392,10 +511,26 @@ impl ResourceDataEntry {
     #[must_use]
     pub fn to_bytes(self) -> [u8; Self::SIZE] {
         let mut buf = [0u8; Self::SIZE];
-        buf[0..4].copy_from_slice(&self.offset_to_data.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.size.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.code_page.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.reserved.to_le_bytes());
+        put(
+            &mut buf,
+            offset_of!(ImageResourceDataEntry, offset_to_data),
+            &self.offset_to_data.to_le_bytes(),
+        );
+        put(
+            &mut buf,
+            offset_of!(ImageResourceDataEntry, size),
+            &self.size.to_le_bytes(),
+        );
+        put(
+            &mut buf,
+            offset_of!(ImageResourceDataEntry, code_page),
+            &self.code_page.to_le_bytes(),
+        );
+        put(
+            &mut buf,
+            offset_of!(ImageResourceDataEntry, reserved),
+            &self.reserved.to_le_bytes(),
+        );
         buf
     }
 }

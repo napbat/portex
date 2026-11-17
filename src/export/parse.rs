@@ -1,9 +1,11 @@
 //! Export table parsing.
 
 use super::{
-    ExportAddress, ExportDirectory, ExportTable, ExportedFunction, MAX_EXPORT_FUNCTIONS,
-    MAX_NAME_LEN,
+    ADDRESS_ENTRY_SIZE, ADDRESS_ENTRY_SIZE_U32, ExportAddress, ExportDirectory, ExportTable,
+    ExportedFunction, MAX_EXPORT_FUNCTIONS, MAX_NAME_LEN, NAME_POINTER_SIZE, NAME_POINTER_SIZE_U32,
+    ORDINAL_SIZE, ORDINAL_SIZE_U32,
 };
+use crate::parse_utils::{u16_at, u32_at};
 use crate::prelude::*;
 use crate::{Error, Result};
 
@@ -136,7 +138,7 @@ impl ExportTable {
         crate::parse_utils::bounded_table_range(
             dir.address_of_functions,
             dir.number_of_functions,
-            4,
+            ADDRESS_ENTRY_SIZE,
             export_rva,
             export_size,
             "export address table",
@@ -144,7 +146,7 @@ impl ExportTable {
         crate::parse_utils::bounded_table_range(
             dir.address_of_names,
             dir.number_of_names,
-            4,
+            NAME_POINTER_SIZE,
             export_rva,
             export_size,
             "export name-pointer table",
@@ -152,7 +154,7 @@ impl ExportTable {
         crate::parse_utils::bounded_table_range(
             dir.address_of_name_ordinals,
             dir.number_of_names,
-            2,
+            ORDINAL_SIZE,
             export_rva,
             export_size,
             "export ordinal table",
@@ -178,17 +180,19 @@ impl ExportTable {
         for i in 0..dir.number_of_functions {
             let addr_rva = dir
                 .address_of_functions
-                .checked_add(i.checked_mul(4).ok_or_else(|| {
+                .checked_add(i.checked_mul(ADDRESS_ENTRY_SIZE_U32).ok_or_else(|| {
                     Error::invalid_data_directory("export address-table offset overflow")
                 })?)
                 .ok_or_else(|| {
                     Error::invalid_data_directory("export address-table RVA overflow")
                 })?;
-            let func_rva = u32::from_le_bytes(read_array_rva(
+            let func_rva = read_table_entry(
                 read_at_rva,
                 addr_rva,
+                ADDRESS_ENTRY_SIZE,
+                u32_at,
                 "export address entry",
-            )?);
+            )?;
 
             if func_rva == 0 {
                 continue; // Empty slot.
@@ -242,24 +246,27 @@ impl ExportTable {
         // Read the name RVA.
         let name_ptr_rva = dir
             .address_of_names
-            .checked_add(index.checked_mul(4).ok_or_else(|| {
+            .checked_add(index.checked_mul(NAME_POINTER_SIZE_U32).ok_or_else(|| {
                 Error::invalid_data_directory("export name-table offset overflow")
             })?)
             .ok_or_else(|| Error::invalid_data_directory("export name-table RVA overflow"))?;
-        let name_rva = u32::from_le_bytes(read_array_rva(
+        let name_rva = read_table_entry(
             read_at_rva,
             name_ptr_rva,
+            NAME_POINTER_SIZE,
+            u32_at,
             "export name pointer",
-        )?);
+        )?;
 
         // Read the ordinal index.
         let ord_rva = dir
             .address_of_name_ordinals
-            .checked_add(index.checked_mul(2).ok_or_else(|| {
+            .checked_add(index.checked_mul(ORDINAL_SIZE_U32).ok_or_else(|| {
                 Error::invalid_data_directory("export ordinal-table offset overflow")
             })?)
             .ok_or_else(|| Error::invalid_data_directory("export ordinal-table RVA overflow"))?;
-        let ord_index = u16::from_le_bytes(read_array_rva(read_at_rva, ord_rva, "export ordinal")?);
+        let ord_index =
+            read_table_entry(read_at_rva, ord_rva, ORDINAL_SIZE, u16_at, "export ordinal")?;
 
         // Read the name.
         let name = if let Some(name) = binder.names.get(&name_rva) {
@@ -353,17 +360,17 @@ fn eat_slot_map(dir: &ExportDirectory, exports: &[ExportedFunction]) -> Result<V
     Ok(slots)
 }
 
-/// Read exactly `N` bytes at `rva` through `read_at_rva`.
-///
-/// # Errors
-///
-/// Returns an error if the function cannot read the bytes.
-fn read_array_rva<const N: usize, F>(read_at_rva: &F, rva: u32, context: &str) -> Result<[u8; N]>
+/// Read the table entry of `size` bytes at `rva` and decode it with `decode`.
+fn read_table_entry<T, F>(
+    read_at_rva: &F,
+    rva: u32,
+    size: usize,
+    decode: fn(&[u8], usize) -> Option<T>,
+    context: &str,
+) -> Result<T>
 where
     F: Fn(u32, usize) -> Option<Vec<u8>>,
 {
-    let data = crate::parse_utils::read_exact_rva(read_at_rva, rva, N, context)?;
-    data.first_chunk::<N>()
-        .copied()
-        .ok_or_else(|| Error::buffer_too_small(N, data.len()))
+    let data = crate::parse_utils::read_exact_rva(read_at_rva, rva, size, context)?;
+    decode(&data, 0).ok_or_else(|| Error::buffer_too_small(size, data.len()))
 }

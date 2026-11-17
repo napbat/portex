@@ -1,6 +1,11 @@
 //! Export table building.
 
-use super::{ExportAddress, ExportDirectory, ExportTable, MAX_EXPORT_FUNCTIONS};
+use nostdio::WriteLe;
+
+use super::{
+    ADDRESS_ENTRY_SIZE, ExportAddress, ExportDirectory, ExportTable, MAX_EXPORT_FUNCTIONS,
+    NAME_POINTER_SIZE, ORDINAL_SIZE,
+};
 use crate::prelude::*;
 use crate::{Error, Result};
 
@@ -228,15 +233,15 @@ fn export_layout(table: &ExportTable) -> Result<ExportLayout> {
     let dimensions = export_dimensions(table)?;
     let eat_size = dimensions
         .function_count
-        .checked_mul(4)
+        .checked_mul(ADDRESS_ENTRY_SIZE)
         .ok_or_else(|| Error::invalid_data_directory("export address-table size overflow"))?;
     let name_ptr_size = dimensions
         .named_count
-        .checked_mul(4)
+        .checked_mul(NAME_POINTER_SIZE)
         .ok_or_else(|| Error::invalid_data_directory("export name-table size overflow"))?;
     let ordinal_size = dimensions
         .named_count
-        .checked_mul(2)
+        .checked_mul(ORDINAL_SIZE)
         .ok_or_else(|| Error::invalid_data_directory("export ordinal-table size overflow"))?;
     let dll_name_size = checked_string_size(&table.dll_name, "export DLL name")?;
 
@@ -302,17 +307,17 @@ fn write_tables(
     eat_entries: &[u32],
     names: &[NameEntry<'_>],
 ) -> Result<()> {
-    let eat = table_region(data, ExportDirectory::SIZE, layout.name_ptr_offset)?;
-    for (slot, rva) in eat.as_chunks_mut::<4>().0.iter_mut().zip(eat_entries) {
-        *slot = rva.to_le_bytes();
+    let mut eat = table_region(data, ExportDirectory::SIZE, layout.name_ptr_offset)?;
+    for rva in eat_entries {
+        eat.write_u32_le(*rva)?;
     }
-    let name_ptrs = table_region(data, layout.name_ptr_offset, layout.ordinal_table_offset)?;
-    for (slot, entry) in name_ptrs.as_chunks_mut::<4>().0.iter_mut().zip(names) {
-        *slot = entry.rva.to_le_bytes();
+    let mut name_ptrs = table_region(data, layout.name_ptr_offset, layout.ordinal_table_offset)?;
+    for entry in names {
+        name_ptrs.write_u32_le(entry.rva)?;
     }
-    let ordinals = table_region(data, layout.ordinal_table_offset, layout.dll_name_offset)?;
-    for (slot, entry) in ordinals.as_chunks_mut::<2>().0.iter_mut().zip(names) {
-        *slot = entry.eat_index.to_le_bytes();
+    let mut ordinals = table_region(data, layout.ordinal_table_offset, layout.dll_name_offset)?;
+    for entry in names {
+        ordinals.write_u16_le(entry.eat_index)?;
     }
     Ok(())
 }

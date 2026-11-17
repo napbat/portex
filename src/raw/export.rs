@@ -1,8 +1,13 @@
 //! A raw view of the export directory.
 
+use core::mem::offset_of;
+
 use super::{RawField, at, check_range, read_u16, read_u32};
 use crate::Result;
-use crate::export::ExportDirectory;
+use crate::export::{
+    ADDRESS_ENTRY_SIZE_U32, ExportDirectory, ImageExportDirectory as M, NAME_POINTER_SIZE_U32,
+    ORDINAL_SIZE_U32,
+};
 
 /// The export directory (`IMAGE_EXPORT_DIRECTORY`) and the offsets of its fields.
 ///
@@ -49,19 +54,20 @@ impl RawExportDirectory {
     pub fn parse(data: &[u8], offset: usize) -> Result<Self> {
         check_range(data, offset, Self::SIZE)?;
         let word = |delta| read_u32(data, at(offset, delta)?);
+        let half = |delta| read_u16(data, at(offset, delta)?);
         Ok(Self {
             offset,
-            characteristics: word(0)?,
-            time_date_stamp: word(4)?,
-            major_version: read_u16(data, at(offset, 8)?)?,
-            minor_version: read_u16(data, at(offset, 10)?)?,
-            name_rva: word(12)?,
-            base: word(16)?,
-            number_of_functions: word(20)?,
-            number_of_names: word(24)?,
-            address_of_functions: word(28)?,
-            address_of_names: word(32)?,
-            address_of_name_ordinals: word(36)?,
+            characteristics: word(offset_of!(M, characteristics))?,
+            time_date_stamp: word(offset_of!(M, time_date_stamp))?,
+            major_version: half(offset_of!(M, major_version))?,
+            minor_version: half(offset_of!(M, minor_version))?,
+            name_rva: word(offset_of!(M, name))?,
+            base: word(offset_of!(M, base))?,
+            number_of_functions: word(offset_of!(M, number_of_functions))?,
+            number_of_names: word(offset_of!(M, number_of_names))?,
+            address_of_functions: word(offset_of!(M, address_of_functions))?,
+            address_of_names: word(offset_of!(M, address_of_names))?,
+            address_of_name_ordinals: word(offset_of!(M, address_of_name_ordinals))?,
         })
     }
 
@@ -69,21 +75,25 @@ impl RawExportDirectory {
     /// fit in `u32`.
     #[must_use]
     pub fn address_table_size(&self) -> Option<u32> {
-        self.number_of_functions.value.checked_mul(4)
+        self.number_of_functions
+            .value
+            .checked_mul(ADDRESS_ENTRY_SIZE_U32)
     }
 
     /// Return the size of the export name pointer table in bytes, or `None` if the size does
     /// not fit in `u32`.
     #[must_use]
     pub fn name_table_size(&self) -> Option<u32> {
-        self.number_of_names.value.checked_mul(4)
+        self.number_of_names
+            .value
+            .checked_mul(NAME_POINTER_SIZE_U32)
     }
 
     /// Return the size of the export ordinal table in bytes, or `None` if the size does not
     /// fit in `u32`.
     #[must_use]
     pub fn ordinal_table_size(&self) -> Option<u32> {
-        self.number_of_names.value.checked_mul(2)
+        self.number_of_names.value.checked_mul(ORDINAL_SIZE_U32)
     }
 
     /// Return the values of the fields as an [`ExportDirectory`].

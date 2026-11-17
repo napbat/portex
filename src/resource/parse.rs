@@ -1,8 +1,10 @@
 use super::{
-    Error, Resource, ResourceDataEntry, ResourceDirectory, ResourceDirectoryEntry,
-    ResourceDirectoryHeader, ResourceId, ResourceType, Result, checked_resource_rva,
+    Error, NAME_LENGTH_SIZE, NAME_LENGTH_SIZE_U32, NAME_UNIT_SIZE, Resource, ResourceDataEntry,
+    ResourceDirectory, ResourceDirectoryEntry, ResourceDirectoryHeader, ResourceId, ResourceType,
+    Result, checked_resource_rva,
 };
 use crate::prelude::*;
+use nostdio::ReadLe;
 
 /// Maximum number of directory entries that the parser visits, for all tree levels together.
 const MAX_VISITED_ENTRIES: usize = 262_144;
@@ -517,23 +519,26 @@ where
             self.rsrc_rva,
             self.rsrc_size,
             entry.name_offset(),
-            2,
+            NAME_LENGTH_SIZE,
             "resource name length",
         )?;
         // A resource name is a Unicode string with a length prefix.
         let len_data = crate::parse_utils::read_exact_rva(
             self.read_at_rva,
             name_offset,
-            2,
+            NAME_LENGTH_SIZE,
             "resource name length",
         )?;
-        let len = usize::from(u16::from_le_bytes([len_data[0], len_data[1]]));
+        let len = usize::from(
+            crate::parse_utils::u16_at(&len_data, 0)
+                .ok_or_else(|| Error::buffer_too_small(NAME_LENGTH_SIZE, len_data.len()))?,
+        );
         let byte_len = len
-            .checked_mul(2)
+            .checked_mul(NAME_UNIT_SIZE)
             .ok_or_else(|| Error::invalid_data_directory("resource name length overflow"))?;
         let string_relative = entry
             .name_offset()
-            .checked_add(2)
+            .checked_add(NAME_LENGTH_SIZE_U32)
             .ok_or_else(|| Error::invalid_data_directory("resource name offset overflow"))?;
         let string_rva = checked_resource_rva(
             self.rsrc_rva,
@@ -551,12 +556,10 @@ where
         )?;
 
         // Convert the UTF-16LE units to a `String`.
-        let chars: Vec<u16> = name_data
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|unit| u16::from_le_bytes(*unit))
-            .collect();
+        let mut units = name_data.as_slice();
+        let chars = (0..len)
+            .map(|_| units.read_u16_le())
+            .collect::<core::result::Result<Vec<u16>, _>>()?;
         let name = String::from_utf16(&chars)
             .map_err(|_| Error::invalid_data_directory("resource name contains invalid UTF-16"))?;
         Ok(ResourceId::Name(name))
