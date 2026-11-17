@@ -4,7 +4,7 @@ use nostdio::{Cursor, Seek, Write, WriteLe};
 
 use super::{DelayImportDirectory, DelayLoadDescriptor, DelayLoadedDll};
 use crate::import::{
-    IMAGE_ORDINAL_FLAG32, IMAGE_ORDINAL_FLAG64, ImportThunk, skip_to_even, split_parts,
+    IMAGE_ORDINAL_FLAG32, IMAGE_ORDINAL_FLAG64, ImportThunk, skip_to_even, split_parts, thunk_size,
 };
 use crate::prelude::*;
 use crate::{Error, Result};
@@ -283,7 +283,7 @@ impl DelayImportBuilder {
     /// Serialize `dlls` into a new buffer with the parts at the offsets in
     /// `layout`.
     fn write_table(&self, dlls: &[DelayLoadedDll], layout: &DelayImportLayout) -> Result<Vec<u8>> {
-        let thunk_skip = self.thunk_skip();
+        let thunk_skip = self.thunk_skip()?;
         let mut data = vec![0u8; layout.total_size];
 
         // The parts are in this order: descriptors, IAT, INT, module handles,
@@ -378,14 +378,16 @@ impl DelayImportBuilder {
         Ok(data)
     }
 
-    /// Size of one thunk or module handle: 8 bytes for PE32+, 4 bytes for PE32.
+    /// Return the size of one thunk or module handle (`IMAGE_THUNK_DATA64` or
+    /// `IMAGE_THUNK_DATA32`).
     fn thunk_size(&self) -> usize {
-        if self.is_64bit { 8 } else { 4 }
+        thunk_size(self.is_64bit)
     }
 
     /// Return the size of one thunk or module handle as a cursor offset.
-    fn thunk_skip(&self) -> i64 {
-        if self.is_64bit { 8 } else { 4 }
+    fn thunk_skip(&self) -> Result<i64> {
+        i64::try_from(self.thunk_size())
+            .map_err(|_| Error::invalid_data_directory("delay-import thunk size exceeds i64"))
     }
 
     /// Return the RVA of byte `position` in the part that starts at byte `start` of the built

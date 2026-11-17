@@ -8,8 +8,14 @@
 //! It also keeps each thunk table, hint/name entry and DLL name that it read, by RVA. A table
 //! or a name that many descriptors or thunks share is thus read only one time.
 
+use core::mem::offset_of;
+
 use super::budget::{MAX_NAME_LEN, NameBudget};
-use super::{IMAGE_ORDINAL_FLAG32, IMAGE_ORDINAL_FLAG64, ImportThunk};
+use super::{
+    IMAGE_ORDINAL_FLAG32, IMAGE_ORDINAL_FLAG64, ImageImportByName, ImportThunk, thunk_at,
+    thunk_size,
+};
+use crate::parse_utils::u16_at;
 use crate::prelude::*;
 use crate::{Error, Result};
 
@@ -125,7 +131,7 @@ where
     }
 
     fn read_list(&mut self, rva: u32, names: NameAddress) -> Result<ThunkList> {
-        let unit: usize = if self.is_64bit { 8 } else { 4 };
+        let unit = thunk_size(self.is_64bit);
         let mut list = ThunkList {
             thunks: Vec::new(),
             name_bytes: 0,
@@ -141,10 +147,8 @@ where
             let bytes = read_chunk(self.read, at, want.saturating_mul(unit), unit)
                 .ok_or_else(|| Error::invalid_rva(at))?;
             for entry in bytes.chunks_exact(unit) {
-                let value = entry
-                    .iter()
-                    .rev()
-                    .fold(0u64, |value, &byte| (value << 8) | u64::from(byte));
+                let value = thunk_at(entry, 0, self.is_64bit)
+                    .ok_or_else(|| Error::buffer_too_small(unit, entry.len()))?;
                 if value == 0 {
                     return Ok(list);
                 }
@@ -180,8 +184,7 @@ where
         };
         if value & ordinal_flag != 0 {
             // The loader uses only the low 16 bits (`IMAGE_ORDINAL`). It ignores the other bits.
-            let [low, high, ..] = value.to_le_bytes();
-            return Ok(ImportThunk::Ordinal(u16::from_le_bytes([low, high])));
+            return Ok(ImportThunk::Ordinal(ImportThunk::ordinal_from_64(value)));
         }
         let hint_name_rva = match names {
             NameAddress::Rva => u32::try_from(value).ok(),
@@ -210,14 +213,16 @@ where
         let entry = if let Some(entry) = self.hint_names.get(&rva) {
             entry.clone()
         } else {
-            let bytes = read_terminated(self.read, rva, 2, self.context)?;
+            let name_offset = offset_of!(ImageImportByName, name);
+            let bytes = read_terminated(self.read, rva, name_offset, self.context)?;
             self.names
                 .add_source(u64::from(rva), bytes.len().saturating_add(1));
-            let (hint, name) = bytes
-                .split_first_chunk::<2>()
-                .ok_or_else(|| Error::buffer_too_small(2, bytes.len()))?;
+            let hint = u16_at(&bytes, offset_of!(ImageImportByName, hint));
+            let (Some(hint), Some(name)) = (hint, bytes.get(name_offset..)) else {
+                return Err(Error::buffer_too_small(name_offset, bytes.len()));
+            };
             let name = String::from_utf8(name.to_vec()).map_err(|_| Error::invalid_utf8())?;
-            let entry = (u16::from_le_bytes(*hint), name);
+            let entry = (hint, name);
             self.hint_names.insert(rva, entry.clone());
             entry
         };

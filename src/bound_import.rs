@@ -24,9 +24,43 @@
 //! # Ok::<(), portex::Error>(())
 //! ```
 
+use core::mem::{offset_of, size_of};
+
+use nostdio::{ReadLe, WriteLe};
+
 use crate::import::{MAX_NAME_LEN, NameBudget};
 use crate::prelude::*;
 use crate::{Error, Result};
+
+/// The layout of `IMAGE_BOUND_IMPORT_DESCRIPTOR`.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the
+/// width of each field.
+#[repr(C)]
+struct ImageBoundImportDescriptor {
+    time_date_stamp: u32,
+    offset_module_name: u16,
+    number_of_module_forwarder_refs: u16,
+}
+
+/// The layout of `IMAGE_BOUND_FORWARDER_REF`.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the
+/// width of each field.
+#[repr(C)]
+struct ImageBoundForwarderRef {
+    time_date_stamp: u32,
+    offset_module_name: u16,
+    reserved: u16,
+}
+
+const _: () = {
+    assert!(size_of::<ImageBoundImportDescriptor>() == 8);
+    assert!(offset_of!(ImageBoundImportDescriptor, offset_module_name) == 4);
+    assert!(offset_of!(ImageBoundImportDescriptor, number_of_module_forwarder_refs) == 6);
+    assert!(size_of::<ImageBoundForwarderRef>() == 8);
+    assert!(offset_of!(ImageBoundForwarderRef, reserved) == 6);
+};
 
 /// A forwarder reference of a bound import (`IMAGE_BOUND_FORWARDER_REF`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,7 +77,7 @@ pub struct BoundForwarderRef {
 
 impl BoundForwarderRef {
     /// Size of the structure in bytes.
-    pub const SIZE: usize = 8;
+    pub const SIZE: usize = size_of::<ImageBoundForwarderRef>();
 
     /// Parse the structure from raw bytes. `module_name` stays empty.
     ///
@@ -51,14 +85,16 @@ impl BoundForwarderRef {
     ///
     /// Returns `ErrorKind::BufferTooSmall` if `data` is shorter than [`Self::SIZE`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let Some(&[t0, t1, t2, t3, n0, n1, r0, r1]) = data.first_chunk::<8>() else {
+        let Some(data) = data.first_chunk::<{ Self::SIZE }>() else {
             return Err(Error::buffer_too_small(Self::SIZE, data.len()));
         };
 
+        // Read the fields in the order of `ImageBoundForwarderRef`.
+        let mut fields: &[u8] = data;
         Ok(Self {
-            time_date_stamp: u32::from_le_bytes([t0, t1, t2, t3]),
-            offset_module_name: u16::from_le_bytes([n0, n1]),
-            reserved: u16::from_le_bytes([r0, r1]),
+            time_date_stamp: fields.read_u32_le()?,
+            offset_module_name: fields.read_u16_le()?,
+            reserved: fields.read_u16_le()?,
             module_name: String::new(), // Resolved later
         })
     }
@@ -81,7 +117,7 @@ pub struct BoundImportDescriptor {
 
 impl BoundImportDescriptor {
     /// Size of the structure in bytes.
-    pub const SIZE: usize = 8;
+    pub const SIZE: usize = size_of::<ImageBoundImportDescriptor>();
 
     /// Parse the structure from raw bytes.
     ///
@@ -92,14 +128,16 @@ impl BoundImportDescriptor {
     ///
     /// Returns `ErrorKind::BufferTooSmall` if `data` is shorter than [`Self::SIZE`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let Some(&[t0, t1, t2, t3, n0, n1, c0, c1]) = data.first_chunk::<8>() else {
+        let Some(data) = data.first_chunk::<{ Self::SIZE }>() else {
             return Err(Error::buffer_too_small(Self::SIZE, data.len()));
         };
 
+        // Read the fields in the order of `ImageBoundImportDescriptor`.
+        let mut fields: &[u8] = data;
         Ok(Self {
-            time_date_stamp: u32::from_le_bytes([t0, t1, t2, t3]),
-            offset_module_name: u16::from_le_bytes([n0, n1]),
-            number_of_module_forwarder_refs: u16::from_le_bytes([c0, c1]),
+            time_date_stamp: fields.read_u32_le()?,
+            offset_module_name: fields.read_u16_le()?,
+            number_of_module_forwarder_refs: fields.read_u16_le()?,
             module_name: String::new(), // Resolved later
             forwarder_refs: Vec::new(), // Parsed later
         })
@@ -356,8 +394,8 @@ impl BoundImportBuilder {
             .try_fold(BoundImportDescriptor::SIZE, |size, desc| {
                 desc.forwarder_refs
                     .len()
-                    .checked_add(1)?
-                    .checked_mul(BoundImportDescriptor::SIZE)
+                    .checked_mul(BoundForwarderRef::SIZE)?
+                    .checked_add(BoundImportDescriptor::SIZE)
                     .and_then(|records| size.checked_add(records))
             })
             .ok_or_else(|| {
@@ -378,9 +416,10 @@ impl BoundImportBuilder {
             })?;
             let forwarder_count = u16::try_from(desc.forwarder_refs.len())
                 .map_err(|_| Error::invalid_data_directory("bound-forwarder count exceeds u16"))?;
-            data.extend_from_slice(&desc.time_date_stamp.to_le_bytes());
-            data.extend_from_slice(&name_offset.to_le_bytes());
-            data.extend_from_slice(&forwarder_count.to_le_bytes());
+            // Write the fields in the order of `ImageBoundImportDescriptor`.
+            data.write_u32_le(desc.time_date_stamp)?;
+            data.write_u16_le(name_offset)?;
+            data.write_u16_le(forwarder_count)?;
             names.extend_from_slice(desc.module_name.as_bytes());
             names.push(0);
 
@@ -388,9 +427,10 @@ impl BoundImportBuilder {
                 let fwd_name_offset = next_name_offset(&names).ok_or_else(|| {
                     Error::invalid_data_directory("bound-forwarder name offset exceeds u16")
                 })?;
-                data.extend_from_slice(&fwd.time_date_stamp.to_le_bytes());
-                data.extend_from_slice(&fwd_name_offset.to_le_bytes());
-                data.extend_from_slice(&fwd.reserved.to_le_bytes());
+                // Write the fields in the order of `ImageBoundForwarderRef`.
+                data.write_u32_le(fwd.time_date_stamp)?;
+                data.write_u16_le(fwd_name_offset)?;
+                data.write_u16_le(fwd.reserved)?;
                 names.extend_from_slice(fwd.module_name.as_bytes());
                 names.push(0);
             }

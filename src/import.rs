@@ -64,6 +64,11 @@ pub use build::ImportTableBuilder;
 pub(crate) use parts::{skip_to_even, split_parts};
 pub(crate) use walk::{NameAddress, ThunkWalker};
 
+use core::mem::{offset_of, size_of};
+
+use nostdio::ReadLe;
+
+use crate::parse_utils::{u32_at, u64_at};
 use crate::prelude::*;
 use crate::{Error, Result};
 
@@ -74,7 +79,82 @@ pub(crate) const IMAGE_ORDINAL_FLAG32: u32 = 0x8000_0000;
 /// `IMAGE_ORDINAL_FLAG64`: high bit of a PE32+ thunk marks an import by ordinal.
 pub(crate) const IMAGE_ORDINAL_FLAG64: u64 = 0x8000_0000_0000_0000;
 
-/// Import descriptor (`IMAGE_IMPORT_DESCRIPTOR`, 20 bytes).
+/// The layout of `IMAGE_IMPORT_DESCRIPTOR`.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the
+/// width of each field.
+#[repr(C)]
+pub(crate) struct ImageImportDescriptor {
+    /// `OriginalFirstThunk`, in a union with `Characteristics`.
+    pub(crate) original_first_thunk: u32,
+    pub(crate) time_date_stamp: u32,
+    pub(crate) forwarder_chain: u32,
+    pub(crate) name: u32,
+    pub(crate) first_thunk: u32,
+}
+
+/// The layout of `IMAGE_THUNK_DATA32`: one union of 32-bit values.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the
+/// width of each field.
+#[repr(C)]
+struct ImageThunkData32 {
+    /// `u1`: `ForwarderString`, `Function`, `Ordinal` or `AddressOfData`.
+    u1: u32,
+}
+
+/// The layout of `IMAGE_THUNK_DATA64`: one union of 64-bit values.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the
+/// width of each field.
+#[repr(C)]
+struct ImageThunkData64 {
+    /// `u1`: `ForwarderString`, `Function`, `Ordinal` or `AddressOfData`.
+    u1: u64,
+}
+
+/// The layout of `IMAGE_IMPORT_BY_NAME`.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the
+/// width of each field.
+#[repr(C)]
+pub(crate) struct ImageImportByName {
+    pub(crate) hint: u16,
+    /// The first byte of the null-terminated name.
+    pub(crate) name: [u8; 1],
+}
+
+const _: () = {
+    assert!(size_of::<ImageImportDescriptor>() == 20);
+    assert!(offset_of!(ImageImportDescriptor, name) == 12);
+    assert!(offset_of!(ImageImportDescriptor, first_thunk) == 16);
+    assert!(size_of::<ImageThunkData32>() == 4);
+    assert!(size_of::<ImageThunkData64>() == 8);
+    assert!(offset_of!(ImageImportByName, name) == 2);
+};
+
+/// Return the size in bytes of one thunk (`IMAGE_THUNK_DATA64` for PE32+,
+/// `IMAGE_THUNK_DATA32` for PE32).
+pub(crate) const fn thunk_size(is_64bit: bool) -> usize {
+    if is_64bit {
+        size_of::<ImageThunkData64>()
+    } else {
+        size_of::<ImageThunkData32>()
+    }
+}
+
+/// Read the thunk value at `offset` of `data`: a `u64` for PE32+, a `u32` for PE32.
+///
+/// Return `None` if `data` does not hold the complete thunk.
+pub(crate) fn thunk_at(data: &[u8], offset: usize, is_64bit: bool) -> Option<u64> {
+    if is_64bit {
+        u64_at(data, offset.checked_add(offset_of!(ImageThunkData64, u1))?)
+    } else {
+        u32_at(data, offset.checked_add(offset_of!(ImageThunkData32, u1))?).map(u64::from)
+    }
+}
+
+/// Import descriptor (`IMAGE_IMPORT_DESCRIPTOR`).
 ///
 /// One descriptor describes one imported DLL.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -93,9 +173,13 @@ pub struct ImportDescriptor {
 
 impl ImportDescriptor {
     /// Size of the on-disk structure in bytes.
-    pub const SIZE: usize = Self::SIZE_U32 as usize;
+    pub const SIZE: usize = size_of::<ImageImportDescriptor>();
     /// [`Self::SIZE`] as a `u32`, for RVA arithmetic.
-    const SIZE_U32: u32 = 20;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the size of `IMAGE_IMPORT_DESCRIPTOR` is 20"
+    )]
+    const SIZE_U32: u32 = Self::SIZE as u32;
 
     /// Return `true` if all fields are zero.
     ///
@@ -127,12 +211,14 @@ impl ImportDescriptor {
             return Err(Error::buffer_too_small(Self::SIZE, data.len()));
         };
 
+        // Read the fields in the order of `ImageImportDescriptor`.
+        let mut fields: &[u8] = data;
         Ok(Self {
-            original_first_thunk: u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
-            time_date_stamp: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
-            forwarder_chain: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
-            name_rva: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
-            first_thunk: u32::from_le_bytes([data[16], data[17], data[18], data[19]]),
+            original_first_thunk: fields.read_u32_le()?,
+            time_date_stamp: fields.read_u32_le()?,
+            forwarder_chain: fields.read_u32_le()?,
+            name_rva: fields.read_u32_le()?,
+            first_thunk: fields.read_u32_le()?,
         })
     }
 
@@ -159,11 +245,32 @@ impl ImportDescriptor {
     /// Return the fields as the on-disk structure.
     fn to_array(&self) -> [u8; Self::SIZE] {
         let mut buf = [0u8; Self::SIZE];
-        buf[0..4].copy_from_slice(&self.original_first_thunk.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.time_date_stamp.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.forwarder_chain.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.name_rva.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.first_thunk.to_le_bytes());
+        let fields = [
+            (
+                offset_of!(ImageImportDescriptor, original_first_thunk),
+                self.original_first_thunk,
+            ),
+            (
+                offset_of!(ImageImportDescriptor, time_date_stamp),
+                self.time_date_stamp,
+            ),
+            (
+                offset_of!(ImageImportDescriptor, forwarder_chain),
+                self.forwarder_chain,
+            ),
+            (offset_of!(ImageImportDescriptor, name), self.name_rva),
+            (
+                offset_of!(ImageImportDescriptor, first_thunk),
+                self.first_thunk,
+            ),
+        ];
+        for (offset, value) in fields {
+            let bytes = value.to_le_bytes();
+            // The const asserts of `ImageImportDescriptor` keep each field in `buf`.
+            if let Some(field) = buf.get_mut(offset..offset + bytes.len()) {
+                field.copy_from_slice(&bytes);
+            }
+        }
         buf
     }
 }
@@ -203,8 +310,8 @@ impl ImportThunk {
     /// Use only the low 16 bits, as the loader does (`IMAGE_ORDINAL32`).
     #[must_use]
     pub fn ordinal_from_32(value: u32) -> u16 {
-        let [low, high, ..] = value.to_le_bytes();
-        u16::from_le_bytes([low, high])
+        // The mask keeps the value in `u16`, so the conversion cannot fail.
+        u16::try_from(value & u32::from(u16::MAX)).unwrap_or_default()
     }
 
     /// Get the ordinal from a PE32+ thunk value.
@@ -212,8 +319,8 @@ impl ImportThunk {
     /// Use only the low 16 bits, as the loader does (`IMAGE_ORDINAL64`).
     #[must_use]
     pub fn ordinal_from_64(value: u64) -> u16 {
-        let [low, high, ..] = value.to_le_bytes();
-        u16::from_le_bytes([low, high])
+        // The mask keeps the value in `u16`, so the conversion cannot fail.
+        u16::try_from(value & u64::from(u16::MAX)).unwrap_or_default()
     }
 
     /// Get the RVA of the hint/name entry from a PE32 thunk value.
@@ -225,8 +332,8 @@ impl ImportThunk {
     /// Get the RVA of the hint/name entry from a PE32+ thunk value.
     #[must_use]
     pub fn hint_name_rva_from_64(value: u64) -> u32 {
-        let [b0, b1, b2, b3, ..] = value.to_le_bytes();
-        u32::from_le_bytes([b0, b1, b2, b3]) & 0x7FFF_FFFF
+        // The mask keeps the value in `u32`, so the conversion cannot fail.
+        u32::try_from(value & 0x7FFF_FFFF).unwrap_or_default()
     }
 }
 

@@ -1,8 +1,10 @@
 //! Raw views of the import directory: descriptors, address tables and hint/name entries.
 
+use core::mem::offset_of;
+
 use super::{RawCursor, RawField, at, read_u8, read_u16, read_u32, read_u64};
 use crate::Result;
-use crate::import::ImportDescriptor;
+use crate::import::{ImageImportByName, ImageImportDescriptor, ImportDescriptor, thunk_size};
 
 /// The rule that ends a list of import descriptors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -49,11 +51,26 @@ impl RawImportDescriptor {
         super::check_range(data, offset, Self::SIZE)?;
         Ok(Self {
             offset,
-            original_first_thunk: read_u32(data, offset)?,
-            time_date_stamp: read_u32(data, at(offset, 4)?)?,
-            forwarder_chain: read_u32(data, at(offset, 8)?)?,
-            name_rva: read_u32(data, at(offset, 12)?)?,
-            first_thunk: read_u32(data, at(offset, 16)?)?,
+            original_first_thunk: read_u32(
+                data,
+                at(
+                    offset,
+                    offset_of!(ImageImportDescriptor, original_first_thunk),
+                )?,
+            )?,
+            time_date_stamp: read_u32(
+                data,
+                at(offset, offset_of!(ImageImportDescriptor, time_date_stamp))?,
+            )?,
+            forwarder_chain: read_u32(
+                data,
+                at(offset, offset_of!(ImageImportDescriptor, forwarder_chain))?,
+            )?,
+            name_rva: read_u32(data, at(offset, offset_of!(ImageImportDescriptor, name))?)?,
+            first_thunk: read_u32(
+                data,
+                at(offset, offset_of!(ImageImportDescriptor, first_thunk))?,
+            )?,
         })
     }
 
@@ -149,7 +166,7 @@ impl RawAddressTable {
     /// table.
     #[must_use]
     pub const fn zero_terminated(offset: usize, size: usize, is_64bit: bool) -> Self {
-        let width = if is_64bit { 8 } else { 4 };
+        let width = thunk_size(is_64bit);
         Self {
             offset,
             remaining: size / width,
@@ -175,7 +192,7 @@ impl RawAddressTable {
     /// Return the size of one entry in bytes: 4 or 8.
     #[must_use]
     pub const fn entry_size(&self) -> usize {
-        if self.is_64bit { 8 } else { 4 }
+        thunk_size(self.is_64bit)
     }
 }
 
@@ -221,26 +238,27 @@ pub struct RawImportByName {
 impl RawImportByName {
     /// Read the hint/name entry at `offset`, with at most `size` bytes.
     ///
-    /// Return `None` if `size` is 2 or less, or if no zero byte ends the name in the first
-    /// `size` bytes of the entry. The method reads the name bytes one at a time, and stops at
-    /// the zero byte.
+    /// Return `None` if `size` holds no name byte after the hint, or if no zero byte ends the
+    /// name in the first `size` bytes of the entry. The method reads the name bytes one at a
+    /// time, and stops at the zero byte.
     ///
     /// # Errors
     ///
     /// Returns an error if a byte that the method reads is not in `data`.
     pub fn parse(data: &[u8], offset: usize, size: usize) -> Result<Option<Self>> {
-        if size <= 2 {
+        let name_start = offset_of!(ImageImportByName, name);
+        if size <= name_start {
             return Ok(None);
         }
-        let hint = read_u16(data, offset)?;
-        let name_offset = at(offset, 2)?;
-        for index in 2..size {
+        let hint = read_u16(data, at(offset, offset_of!(ImageImportByName, hint))?)?;
+        let name_offset = at(offset, name_start)?;
+        for index in name_start..size {
             if read_u8(data, at(offset, index)?)?.value == 0 {
                 return Ok(Some(Self {
                     offset,
                     hint,
                     name_offset,
-                    name_len: index - 2,
+                    name_len: index - name_start,
                 }));
             }
         }
@@ -253,7 +271,14 @@ impl RawImportByName {
     /// not set.
     #[must_use]
     pub const fn size(&self) -> Option<usize> {
-        self.name_len.checked_add(3)
+        // The hint, the name and the zero terminator.
+        match self
+            .name_len
+            .checked_add(offset_of!(ImageImportByName, name))
+        {
+            Some(len) => len.checked_add(1),
+            None => None,
+        }
     }
 
     /// Return the name bytes in `data`, or `None` if they are not in `data`.
