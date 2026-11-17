@@ -2,10 +2,10 @@
 
 use core::mem::{offset_of, size_of};
 
-use super::{RawCursor, RawField, at, read_u16};
+use super::{RawCursor, RawField, at, fixed, read_u16};
+use crate::Result;
 use crate::parse_utils::le_u32;
 use crate::reloc::{ImageBaseRelocation, RelocationEntry, RelocationType};
-use crate::{Error, Result};
 
 /// A base relocation block header (`IMAGE_BASE_RELOCATION`) and the offsets of its fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,9 +31,7 @@ impl RawRelocationBlock {
         const N: usize = RawRelocationBlock::HEADER_SIZE;
         const VIRTUAL_ADDRESS: usize = offset_of!(ImageBaseRelocation, virtual_address);
         const SIZE_OF_BLOCK: usize = offset_of!(ImageBaseRelocation, size_of_block);
-        let Some(raw) = data.get(offset..).and_then(<[u8]>::first_chunk::<N>) else {
-            return Err(Error::offset_out_of_bounds(offset, data.len()));
-        };
+        let raw = fixed::<N>(data, offset)?;
         // The header is in `data`, so `offset + N` does not overflow.
         Ok(Self {
             offset,

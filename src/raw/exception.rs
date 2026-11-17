@@ -2,13 +2,13 @@
 
 use core::mem::{offset_of, size_of};
 
-use super::{RawCursor, RawField, at};
+use super::{RawCursor, RawField, at, fixed};
+use crate::Result;
 use crate::exception::{
     ImageRuntimeFunctionEntry, RuntimeFunction, UNW_FLAG_CHAININFO, UNW_FLAG_EHANDLER,
     UNW_FLAG_UHANDLER, UnwindInfoHeader, unwind_codes_end,
 };
 use crate::parse_utils::{le_u8, le_u32};
-use crate::{Error, Result};
 
 /// An x64 `RUNTIME_FUNCTION` record and the offsets of its fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,9 +37,7 @@ impl RawRuntimeFunction {
         const BEGIN: usize = offset_of!(ImageRuntimeFunctionEntry, begin_address);
         const END: usize = offset_of!(ImageRuntimeFunctionEntry, end_address);
         const UNWIND: usize = offset_of!(ImageRuntimeFunctionEntry, unwind_info_address);
-        let Some(raw) = data.get(offset..).and_then(<[u8]>::first_chunk::<N>) else {
-            return Err(Error::offset_out_of_bounds(offset, data.len()));
-        };
+        let raw = fixed::<N>(data, offset)?;
         // The record is in `data`, so `offset + N` does not overflow.
         Ok(Self {
             offset,
@@ -149,9 +147,7 @@ impl RawUnwindInfo {
         const PROLOG: usize = offset_of!(UnwindInfoHeader, size_of_prolog);
         const CODES: usize = offset_of!(UnwindInfoHeader, count_of_codes);
         const FRAME: usize = offset_of!(UnwindInfoHeader, frame_register_and_offset);
-        let Some(raw) = data.get(offset..).and_then(<[u8]>::first_chunk::<N>) else {
-            return Err(Error::offset_out_of_bounds(offset, data.len()));
-        };
+        let raw = fixed::<N>(data, offset)?;
         // The header is in `data`, so `offset + N` does not overflow.
         let field = |at: usize, value: u8| RawField {
             offset: offset + at,

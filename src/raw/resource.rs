@@ -2,13 +2,13 @@
 
 use core::mem::offset_of;
 
-use super::RawField;
+use super::{RawField, fixed};
+use crate::Result;
 use crate::parse_utils::{le_u16, le_u32};
 use crate::resource::{
     ImageResourceDataEntry, ImageResourceDirectory as M, ImageResourceDirectoryEntry,
     ResourceDataEntry, ResourceDirectoryEntry, ResourceDirectoryHeader,
 };
-use crate::{Error, Result};
 
 /// The high bit of a resource directory entry field.
 const HIGH_BIT: u32 = 0x8000_0000;
@@ -43,9 +43,7 @@ impl RawResourceDirectory {
     /// Returns an error if the directory is not in `data`.
     pub fn parse(data: &[u8], offset: usize) -> Result<Self> {
         const N: usize = RawResourceDirectory::SIZE;
-        let Some(raw) = data.get(offset..).and_then(<[u8]>::first_chunk::<N>) else {
-            return Err(Error::offset_out_of_bounds(offset, data.len()));
-        };
+        let raw = fixed::<N>(data, offset)?;
         Ok(Self {
             offset,
             characteristics: RawField {
@@ -115,9 +113,7 @@ impl RawResourceEntry {
     pub fn parse(data: &[u8], offset: usize) -> Result<Self> {
         type E = ImageResourceDirectoryEntry;
         const N: usize = RawResourceEntry::SIZE;
-        let Some(raw) = data.get(offset..).and_then(<[u8]>::first_chunk::<N>) else {
-            return Err(Error::offset_out_of_bounds(offset, data.len()));
-        };
+        let raw = fixed::<N>(data, offset)?;
         Ok(Self {
             offset,
             name_or_id: RawField {
@@ -185,9 +181,7 @@ impl RawResourceDataEntry {
     pub fn parse(data: &[u8], offset: usize) -> Result<Self> {
         type D = ImageResourceDataEntry;
         const N: usize = RawResourceDataEntry::SIZE;
-        let Some(raw) = data.get(offset..).and_then(<[u8]>::first_chunk::<N>) else {
-            return Err(Error::offset_out_of_bounds(offset, data.len()));
-        };
+        let raw = fixed::<N>(data, offset)?;
         Ok(Self {
             offset,
             offset_to_data: RawField {

@@ -141,14 +141,12 @@ pub(crate) fn at(base: usize, delta: usize) -> Result<usize> {
         .ok_or_else(|| Error::offset_out_of_bounds(base, usize::MAX))
 }
 
-/// Make sure that `size` bytes at `offset` are in `data`.
-pub(crate) fn check_range(data: &[u8], offset: usize, size: usize) -> Result<()> {
-    if offset
-        .checked_add(size)
-        .is_some_and(|end| end <= data.len())
-    {
-        Ok(())
-    } else {
-        Err(Error::offset_out_of_bounds(offset, data.len()))
-    }
+/// Return the fixed-size structure of `N` bytes at `offset` of `data`.
+///
+/// Return an `OffsetOutOfBounds` error if `data` does not hold the complete structure. After
+/// this check, `offset + N` does not overflow.
+pub(crate) fn fixed<const N: usize>(data: &[u8], offset: usize) -> Result<&[u8; N]> {
+    data.get(offset..)
+        .and_then(<[u8]>::first_chunk::<N>)
+        .ok_or_else(|| Error::offset_out_of_bounds(offset, data.len()))
 }

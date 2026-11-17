@@ -2,11 +2,11 @@
 
 use core::mem::offset_of;
 
-use super::{RawCursor, RawField, at, read_u8, read_u32, read_u64};
+use super::{RawCursor, RawField, at, fixed, read_u8, read_u32, read_u64};
+use crate::Result;
 use crate::import::ImageImportByName as ByName;
 use crate::import::{ImageImportDescriptor, ImportDescriptor, thunk_size};
 use crate::parse_utils::{le_u16, le_u32};
-use crate::{Error, Result};
 
 /// The rule that ends a list of import descriptors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -52,10 +52,7 @@ impl RawImportDescriptor {
     pub fn parse(data: &[u8], offset: usize) -> Result<Self> {
         type Mirror = ImageImportDescriptor;
         const N: usize = RawImportDescriptor::SIZE;
-        let raw = data
-            .get(offset..)
-            .and_then(<[u8]>::first_chunk::<N>)
-            .ok_or_else(|| Error::offset_out_of_bounds(offset, data.len()))?;
+        let raw = fixed::<N>(data, offset)?;
         Ok(Self {
             offset,
             original_first_thunk: RawField {
@@ -261,10 +258,7 @@ impl RawImportByName {
         if size <= name_start {
             return Ok(None);
         }
-        let raw = data
-            .get(offset..)
-            .and_then(<[u8]>::first_chunk::<N>)
-            .ok_or_else(|| Error::offset_out_of_bounds(offset, data.len()))?;
+        let raw = fixed::<N>(data, offset)?;
         let hint = RawField {
             offset: at(offset, offset_of!(ByName, hint))?,
             value: le_u16::<N, { offset_of!(ByName, hint) }>(raw),

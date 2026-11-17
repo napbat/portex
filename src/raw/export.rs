@@ -2,13 +2,13 @@
 
 use core::mem::offset_of;
 
-use super::RawField;
+use super::{RawField, fixed};
+use crate::Result;
 use crate::export::{
     ADDRESS_ENTRY_SIZE_U32, ExportDirectory, ImageExportDirectory as M, NAME_POINTER_SIZE_U32,
     ORDINAL_SIZE_U32,
 };
 use crate::parse_utils::{le_u16, le_u32};
-use crate::{Error, Result};
 
 /// The export directory (`IMAGE_EXPORT_DIRECTORY`) and the offsets of its fields.
 ///
@@ -54,9 +54,7 @@ impl RawExportDirectory {
     /// Returns an error if the directory is not in `data`.
     pub fn parse(data: &[u8], offset: usize) -> Result<Self> {
         const N: usize = RawExportDirectory::SIZE;
-        let Some(raw) = data.get(offset..).and_then(<[u8]>::first_chunk::<N>) else {
-            return Err(Error::offset_out_of_bounds(offset, data.len()));
-        };
+        let raw = fixed::<N>(data, offset)?;
         Ok(Self {
             offset,
             characteristics: RawField {
