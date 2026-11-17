@@ -28,7 +28,7 @@ pub use build::DelayImportBuilder;
 use core::mem::{offset_of, size_of};
 
 use crate::import::{ImportThunk, NameAddress, ThunkWalker};
-use crate::parse_utils::{le_u32, put_u32};
+use crate::parse_utils::{le_u32, put_u32, size_u32};
 use crate::prelude::*;
 use crate::{Error, Result};
 
@@ -88,10 +88,7 @@ impl DelayLoadDescriptor {
     /// Size of the structure in bytes.
     pub const SIZE: usize = size_of::<ImageDelayloadDescriptor>();
     /// [`Self::SIZE`] as a `u32`, for RVA arithmetic.
-    ///
-    /// The structure is eight `u32` fields; a const assert below checks this against
-    /// [`Self::SIZE`].
-    const SIZE_U32: u32 = 8 * (u32::BITS / u8::BITS);
+    const SIZE_U32: u32 = size_u32(Self::SIZE);
 
     /// Parse a descriptor from raw bytes.
     ///

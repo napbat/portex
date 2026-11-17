@@ -68,7 +68,7 @@ use core::mem::{offset_of, size_of};
 
 use nostdio::ReadLe;
 
-use crate::parse_utils::{le_u32, put_u32};
+use crate::parse_utils::{le_u32, put_u32, size_u32};
 use crate::prelude::*;
 use crate::{Error, Result};
 
@@ -181,10 +181,7 @@ impl ImportDescriptor {
     /// Size of the on-disk structure in bytes.
     pub const SIZE: usize = size_of::<ImageImportDescriptor>();
     /// [`Self::SIZE`] as a `u32`, for RVA arithmetic.
-    ///
-    /// The structure is five `u32` fields; a const assert below checks this against
-    /// [`Self::SIZE`].
-    const SIZE_U32: u32 = 5 * (u32::BITS / u8::BITS);
+    const SIZE_U32: u32 = size_u32(Self::SIZE);
 
     /// Return `true` if all fields are zero.
     ///

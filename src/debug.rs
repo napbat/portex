@@ -55,7 +55,7 @@ pub use codeview::{CV_SIGNATURE_NB10, CV_SIGNATURE_RSDS, CodeViewRsds};
 
 use core::mem::{offset_of, size_of};
 
-use crate::parse_utils::{le_u16, le_u32, put_u16, put_u32};
+use crate::parse_utils::{le_u16, le_u32, put_u16, put_u32, size_u32};
 use crate::prelude::*;
 use crate::{Error, Result};
 
@@ -64,22 +64,21 @@ use crate::{Error, Result};
 /// Portex does not read the structure through this type. The type gives the offset and the width
 /// of each field.
 #[repr(C)]
-struct ImageDebugDirectory {
-    characteristics: u32,
-    time_date_stamp: u32,
-    major_version: u16,
-    minor_version: u16,
-    r#type: u32,
-    size_of_data: u32,
-    address_of_raw_data: u32,
-    pointer_to_raw_data: u32,
+pub(crate) struct ImageDebugDirectory {
+    pub(crate) characteristics: u32,
+    pub(crate) time_date_stamp: u32,
+    pub(crate) major_version: u16,
+    pub(crate) minor_version: u16,
+    pub(crate) r#type: u32,
+    pub(crate) size_of_data: u32,
+    pub(crate) address_of_raw_data: u32,
+    pub(crate) pointer_to_raw_data: u32,
 }
 
 const _: () = {
     assert!(size_of::<ImageDebugDirectory>() == 0x1c);
     assert!(offset_of!(ImageDebugDirectory, r#type) == 0x0c);
     assert!(offset_of!(ImageDebugDirectory, pointer_to_raw_data) == 0x18);
-    assert!(DebugDirectory::SIZE_U32 as usize == DebugDirectory::SIZE);
 };
 
 /// Debug types (`IMAGE_DEBUG_TYPE_*`).
@@ -200,8 +199,8 @@ pub struct DebugDirectory {
 impl DebugDirectory {
     /// Size of one `IMAGE_DEBUG_DIRECTORY` entry in bytes.
     pub const SIZE: usize = size_of::<ImageDebugDirectory>();
-    /// [`Self::SIZE`] as a `u32`. A compile-time assertion keeps it equal to [`Self::SIZE`].
-    const SIZE_U32: u32 = 0x1c;
+    /// [`Self::SIZE`] as a `u32`.
+    const SIZE_U32: u32 = size_u32(Self::SIZE);
 
     /// Parse an entry from little-endian bytes.
     ///

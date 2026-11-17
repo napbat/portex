@@ -26,19 +26,10 @@
 
 use core::mem::{offset_of, size_of};
 
-use crate::parse_utils::{le_u16, le_u32, put_u16, put_u32};
+use crate::data_dir::ImageDataDirectory;
+use crate::parse_utils::{le_u16, le_u32, put_u16, put_u32, size_u32};
 use crate::prelude::*;
 use crate::{Error, Result};
-
-/// The layout of `IMAGE_DATA_DIRECTORY`.
-///
-/// Portex does not read the structure through this type. The type gives the offset and the width
-/// of each field.
-#[repr(C)]
-struct ImageDataDirectory {
-    virtual_address: u32,
-    size: u32,
-}
 
 /// The layout of `IMAGE_COR20_HEADER`.
 ///
@@ -61,12 +52,10 @@ struct ImageCor20Header {
 }
 
 const _: () = {
-    assert!(size_of::<ImageDataDirectory>() == 8);
     assert!(size_of::<ImageCor20Header>() == 0x48);
     assert!(offset_of!(ImageCor20Header, meta_data) == 0x08);
     assert!(offset_of!(ImageCor20Header, entry_point_token) == 0x14);
     assert!(offset_of!(ImageCor20Header, managed_native_header.size) == 0x44);
-    assert!(CliHeader::SIZE_U32 as usize == CliHeader::SIZE);
 };
 
 /// CLI header (`IMAGE_COR20_HEADER`).
@@ -119,9 +108,8 @@ pub struct CliHeader {
 impl CliHeader {
     /// Size of the CLI header in bytes.
     pub const SIZE: usize = size_of::<ImageCor20Header>();
-    /// Size of the CLI header in bytes, as the `u32` stored in `cb`. A compile-time assertion
-    /// keeps it equal to [`Self::SIZE`].
-    pub const SIZE_U32: u32 = 0x48;
+    /// Size of the CLI header in bytes, as the `u32` stored in `cb`.
+    pub const SIZE_U32: u32 = size_u32(Self::SIZE);
 
     /// `COMIMAGE_FLAGS_ILONLY`: the image contains only IL code.
     pub const FLAG_ILONLY: u32 = 0x0000_0001;
