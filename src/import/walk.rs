@@ -12,10 +12,10 @@ use core::mem::offset_of;
 
 use super::budget::{MAX_NAME_LEN, NameBudget};
 use super::{
-    IMAGE_ORDINAL_FLAG32, IMAGE_ORDINAL_FLAG64, ImageImportByName, ImportThunk, thunk_at,
-    thunk_size,
+    HINT_SIZE, IMAGE_ORDINAL_FLAG32, IMAGE_ORDINAL_FLAG64, ImageImportByName, ImportThunk,
+    thunk_at, thunk_size,
 };
-use crate::parse_utils::u16_at;
+use crate::parse_utils::le_u16;
 use crate::prelude::*;
 use crate::{Error, Result};
 
@@ -217,10 +217,11 @@ where
             let bytes = read_terminated(self.read, rva, name_offset, self.context)?;
             self.names
                 .add_source(u64::from(rva), bytes.len().saturating_add(1));
-            let hint = u16_at(&bytes, offset_of!(ImageImportByName, hint));
-            let (Some(hint), Some(name)) = (hint, bytes.get(name_offset..)) else {
+            // The fixed header of `IMAGE_IMPORT_BY_NAME` is the hint before the name.
+            let Some((raw, name)) = bytes.split_first_chunk::<HINT_SIZE>() else {
                 return Err(Error::buffer_too_small(name_offset, bytes.len()));
             };
+            let hint = le_u16::<HINT_SIZE, { offset_of!(ImageImportByName, hint) }>(raw);
             let name = String::from_utf8(name.to_vec()).map_err(|_| Error::invalid_utf8())?;
             let entry = (hint, name);
             self.hint_names.insert(rva, entry.clone());

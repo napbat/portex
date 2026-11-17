@@ -2,9 +2,11 @@
 
 use core::mem::offset_of;
 
-use super::{RawCursor, RawField, at, read_u8, read_u16, read_u32, read_u64};
-use crate::Result;
-use crate::import::{ImageImportByName, ImageImportDescriptor, ImportDescriptor, thunk_size};
+use super::{RawCursor, RawField, at, read_u8, read_u32, read_u64};
+use crate::import::ImageImportByName as ByName;
+use crate::import::{ImageImportDescriptor, ImportDescriptor, thunk_size};
+use crate::parse_utils::{le_u16, le_u32};
+use crate::{Error, Result};
 
 /// The rule that ends a list of import descriptors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -48,29 +50,34 @@ impl RawImportDescriptor {
     ///
     /// Returns an error if the descriptor is not in `data`.
     pub fn parse(data: &[u8], offset: usize) -> Result<Self> {
-        super::check_range(data, offset, Self::SIZE)?;
+        type Mirror = ImageImportDescriptor;
+        const N: usize = RawImportDescriptor::SIZE;
+        let raw = data
+            .get(offset..)
+            .and_then(<[u8]>::first_chunk::<N>)
+            .ok_or_else(|| Error::offset_out_of_bounds(offset, data.len()))?;
         Ok(Self {
             offset,
-            original_first_thunk: read_u32(
-                data,
-                at(
-                    offset,
-                    offset_of!(ImageImportDescriptor, original_first_thunk),
-                )?,
-            )?,
-            time_date_stamp: read_u32(
-                data,
-                at(offset, offset_of!(ImageImportDescriptor, time_date_stamp))?,
-            )?,
-            forwarder_chain: read_u32(
-                data,
-                at(offset, offset_of!(ImageImportDescriptor, forwarder_chain))?,
-            )?,
-            name_rva: read_u32(data, at(offset, offset_of!(ImageImportDescriptor, name))?)?,
-            first_thunk: read_u32(
-                data,
-                at(offset, offset_of!(ImageImportDescriptor, first_thunk))?,
-            )?,
+            original_first_thunk: RawField {
+                offset: at(offset, offset_of!(Mirror, original_first_thunk))?,
+                value: le_u32::<N, { offset_of!(Mirror, original_first_thunk) }>(raw),
+            },
+            time_date_stamp: RawField {
+                offset: at(offset, offset_of!(Mirror, time_date_stamp))?,
+                value: le_u32::<N, { offset_of!(Mirror, time_date_stamp) }>(raw),
+            },
+            forwarder_chain: RawField {
+                offset: at(offset, offset_of!(Mirror, forwarder_chain))?,
+                value: le_u32::<N, { offset_of!(Mirror, forwarder_chain) }>(raw),
+            },
+            name_rva: RawField {
+                offset: at(offset, offset_of!(Mirror, name))?,
+                value: le_u32::<N, { offset_of!(Mirror, name) }>(raw),
+            },
+            first_thunk: RawField {
+                offset: at(offset, offset_of!(Mirror, first_thunk))?,
+                value: le_u32::<N, { offset_of!(Mirror, first_thunk) }>(raw),
+            },
         })
     }
 
@@ -203,6 +210,8 @@ impl RawCursor for RawAddressTable {
         if self.remaining == 0 {
             return Ok(None);
         }
+        // A thunk list is a run of entries up to a zero entry or a count, so each entry is read
+        // at its run-time offset rather than from a fixed structure.
         let entry = if self.is_64bit {
             read_u64(data, self.offset)?
         } else {
@@ -246,11 +255,20 @@ impl RawImportByName {
     ///
     /// Returns an error if a byte that the method reads is not in `data`.
     pub fn parse(data: &[u8], offset: usize, size: usize) -> Result<Option<Self>> {
-        let name_start = offset_of!(ImageImportByName, name);
+        // The fixed header of `IMAGE_IMPORT_BY_NAME` is the hint before the name.
+        const N: usize = offset_of!(ByName, name);
+        let name_start = N;
         if size <= name_start {
             return Ok(None);
         }
-        let hint = read_u16(data, at(offset, offset_of!(ImageImportByName, hint))?)?;
+        let raw = data
+            .get(offset..)
+            .and_then(<[u8]>::first_chunk::<N>)
+            .ok_or_else(|| Error::offset_out_of_bounds(offset, data.len()))?;
+        let hint = RawField {
+            offset: at(offset, offset_of!(ByName, hint))?,
+            value: le_u16::<N, { offset_of!(ByName, hint) }>(raw),
+        };
         let name_offset = at(offset, name_start)?;
         for index in name_start..size {
             if read_u8(data, at(offset, index)?)?.value == 0 {
@@ -272,10 +290,7 @@ impl RawImportByName {
     #[must_use]
     pub const fn size(&self) -> Option<usize> {
         // The hint, the name and the zero terminator.
-        match self
-            .name_len
-            .checked_add(offset_of!(ImageImportByName, name))
-        {
+        match self.name_len.checked_add(offset_of!(ByName, name)) {
             Some(len) => len.checked_add(1),
             None => None,
         }

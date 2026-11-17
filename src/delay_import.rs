@@ -27,9 +27,8 @@ pub use build::DelayImportBuilder;
 
 use core::mem::{offset_of, size_of};
 
-use nostdio::ReadLe;
-
 use crate::import::{ImportThunk, NameAddress, ThunkWalker};
+use crate::parse_utils::{le_u32, put_u32};
 use crate::prelude::*;
 use crate::{Error, Result};
 
@@ -57,6 +56,7 @@ const _: () = {
     assert!(size_of::<ImageDelayloadDescriptor>() == 32);
     assert!(offset_of!(ImageDelayloadDescriptor, import_address_table_rva) == 12);
     assert!(offset_of!(ImageDelayloadDescriptor, time_date_stamp) == 28);
+    assert!(size_of::<ImageDelayloadDescriptor>() == size_of::<[u32; 8]>());
 };
 
 /// Delay-load descriptor (`IMAGE_DELAYLOAD_DESCRIPTOR`).
@@ -88,11 +88,10 @@ impl DelayLoadDescriptor {
     /// Size of the structure in bytes.
     pub const SIZE: usize = size_of::<ImageDelayloadDescriptor>();
     /// [`Self::SIZE`] as a `u32`, for RVA arithmetic.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the size of `IMAGE_DELAYLOAD_DESCRIPTOR` is 32"
-    )]
-    const SIZE_U32: u32 = Self::SIZE as u32;
+    ///
+    /// The structure is eight `u32` fields; a const assert below checks this against
+    /// [`Self::SIZE`].
+    const SIZE_U32: u32 = 8 * (u32::BITS / u8::BITS);
 
     /// Parse a descriptor from raw bytes.
     ///
@@ -102,21 +101,28 @@ impl DelayLoadDescriptor {
     ///
     /// Returns `ErrorKind::BufferTooSmall` if `data` is shorter than [`Self::SIZE`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let Some(data) = data.first_chunk::<{ Self::SIZE }>() else {
+        type Mirror = ImageDelayloadDescriptor;
+        const N: usize = DelayLoadDescriptor::SIZE;
+        let Some(raw) = data.first_chunk::<N>() else {
             return Err(Error::buffer_too_small(Self::SIZE, data.len()));
         };
-
-        // Read the fields in the order of `ImageDelayloadDescriptor`.
-        let mut fields: &[u8] = data;
         Ok(Self {
-            attributes: fields.read_u32_le()?,
-            dll_name_rva: fields.read_u32_le()?,
-            module_handle_rva: fields.read_u32_le()?,
-            import_address_table_rva: fields.read_u32_le()?,
-            import_name_table_rva: fields.read_u32_le()?,
-            bound_import_address_table_rva: fields.read_u32_le()?,
-            unload_information_table_rva: fields.read_u32_le()?,
-            time_date_stamp: fields.read_u32_le()?,
+            attributes: le_u32::<N, { offset_of!(Mirror, attributes) }>(raw),
+            dll_name_rva: le_u32::<N, { offset_of!(Mirror, dll_name_rva) }>(raw),
+            module_handle_rva: le_u32::<N, { offset_of!(Mirror, module_handle_rva) }>(raw),
+            import_address_table_rva: le_u32::<N, { offset_of!(Mirror, import_address_table_rva) }>(
+                raw,
+            ),
+            import_name_table_rva: le_u32::<N, { offset_of!(Mirror, import_name_table_rva) }>(raw),
+            bound_import_address_table_rva: le_u32::<
+                N,
+                { offset_of!(Mirror, bound_import_address_table_rva) },
+            >(raw),
+            unload_information_table_rva: le_u32::<
+                N,
+                { offset_of!(Mirror, unload_information_table_rva) },
+            >(raw),
+            time_date_stamp: le_u32::<N, { offset_of!(Mirror, time_date_stamp) }>(raw),
         })
     }
 
@@ -138,40 +144,29 @@ impl DelayLoadDescriptor {
     /// Return the fields as the on-disk structure.
     fn to_array(self) -> [u8; Self::SIZE] {
         type Mirror = ImageDelayloadDescriptor;
-        let fields = [
-            (offset_of!(Mirror, attributes), self.attributes),
-            (offset_of!(Mirror, dll_name_rva), self.dll_name_rva),
-            (
-                offset_of!(Mirror, module_handle_rva),
-                self.module_handle_rva,
-            ),
-            (
-                offset_of!(Mirror, import_address_table_rva),
-                self.import_address_table_rva,
-            ),
-            (
-                offset_of!(Mirror, import_name_table_rva),
-                self.import_name_table_rva,
-            ),
-            (
-                offset_of!(Mirror, bound_import_address_table_rva),
-                self.bound_import_address_table_rva,
-            ),
-            (
-                offset_of!(Mirror, unload_information_table_rva),
-                self.unload_information_table_rva,
-            ),
-            (offset_of!(Mirror, time_date_stamp), self.time_date_stamp),
-        ];
-        let mut buf = [0u8; Self::SIZE];
-        for (offset, value) in fields {
-            let bytes = value.to_le_bytes();
-            // The const asserts of `ImageDelayloadDescriptor` keep each field in `buf`.
-            if let Some(field) = buf.get_mut(offset..offset + bytes.len()) {
-                field.copy_from_slice(&bytes);
-            }
-        }
-        buf
+        const N: usize = DelayLoadDescriptor::SIZE;
+        let mut raw = [0u8; N];
+        put_u32::<N, { offset_of!(Mirror, attributes) }>(&mut raw, self.attributes);
+        put_u32::<N, { offset_of!(Mirror, dll_name_rva) }>(&mut raw, self.dll_name_rva);
+        put_u32::<N, { offset_of!(Mirror, module_handle_rva) }>(&mut raw, self.module_handle_rva);
+        put_u32::<N, { offset_of!(Mirror, import_address_table_rva) }>(
+            &mut raw,
+            self.import_address_table_rva,
+        );
+        put_u32::<N, { offset_of!(Mirror, import_name_table_rva) }>(
+            &mut raw,
+            self.import_name_table_rva,
+        );
+        put_u32::<N, { offset_of!(Mirror, bound_import_address_table_rva) }>(
+            &mut raw,
+            self.bound_import_address_table_rva,
+        );
+        put_u32::<N, { offset_of!(Mirror, unload_information_table_rva) }>(
+            &mut raw,
+            self.unload_information_table_rva,
+        );
+        put_u32::<N, { offset_of!(Mirror, time_date_stamp) }>(&mut raw, self.time_date_stamp);
+        raw
     }
 
     /// Convert the VAs of a legacy descriptor to RVAs with `image_base`.

@@ -1,11 +1,15 @@
 //! Serialization of a delay-load import table.
 
+use core::mem::offset_of;
+
 use nostdio::{Cursor, Seek, Write, WriteLe};
 
 use super::{DelayImportDirectory, DelayLoadDescriptor, DelayLoadedDll};
+use crate::import::{HINT_SIZE, ImageImportByName};
 use crate::import::{
     IMAGE_ORDINAL_FLAG32, IMAGE_ORDINAL_FLAG64, ImportThunk, skip_to_even, split_parts, thunk_size,
 };
+use crate::parse_utils::put_u16;
 use crate::prelude::*;
 use crate::{Error, Result};
 
@@ -350,7 +354,11 @@ impl DelayImportBuilder {
                         // Write the hint/name entry: hint, name, null terminator,
                         // and padding to an even offset in the part.
                         let hint_name_rva = self.rva_at(hint_name_start, hint_name.position())?;
-                        hint_name.write_u16_le(*hint)?;
+                        let mut raw = [0u8; HINT_SIZE];
+                        put_u16::<HINT_SIZE, { offset_of!(ImageImportByName, hint) }>(
+                            &mut raw, *hint,
+                        );
+                        hint_name.write_all(&raw)?;
                         hint_name.write_all(name.as_bytes())?;
                         hint_name.seek_relative(1)?;
                         skip_to_even(&mut hint_name)?;

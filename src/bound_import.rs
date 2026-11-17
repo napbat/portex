@@ -26,9 +26,8 @@
 
 use core::mem::{offset_of, size_of};
 
-use nostdio::{ReadLe, WriteLe};
-
 use crate::import::{MAX_NAME_LEN, NameBudget};
+use crate::parse_utils::{le_u16, le_u32, put_u16, put_u32};
 use crate::prelude::*;
 use crate::{Error, Result};
 
@@ -85,16 +84,15 @@ impl BoundForwarderRef {
     ///
     /// Returns `ErrorKind::BufferTooSmall` if `data` is shorter than [`Self::SIZE`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let Some(data) = data.first_chunk::<{ Self::SIZE }>() else {
+        type Mirror = ImageBoundForwarderRef;
+        const N: usize = BoundForwarderRef::SIZE;
+        let Some(raw) = data.first_chunk::<N>() else {
             return Err(Error::buffer_too_small(Self::SIZE, data.len()));
         };
-
-        // Read the fields in the order of `ImageBoundForwarderRef`.
-        let mut fields: &[u8] = data;
         Ok(Self {
-            time_date_stamp: fields.read_u32_le()?,
-            offset_module_name: fields.read_u16_le()?,
-            reserved: fields.read_u16_le()?,
+            time_date_stamp: le_u32::<N, { offset_of!(Mirror, time_date_stamp) }>(raw),
+            offset_module_name: le_u16::<N, { offset_of!(Mirror, offset_module_name) }>(raw),
+            reserved: le_u16::<N, { offset_of!(Mirror, reserved) }>(raw),
             module_name: String::new(), // Resolved later
         })
     }
@@ -128,16 +126,18 @@ impl BoundImportDescriptor {
     ///
     /// Returns `ErrorKind::BufferTooSmall` if `data` is shorter than [`Self::SIZE`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let Some(data) = data.first_chunk::<{ Self::SIZE }>() else {
+        type Mirror = ImageBoundImportDescriptor;
+        const N: usize = BoundImportDescriptor::SIZE;
+        let Some(raw) = data.first_chunk::<N>() else {
             return Err(Error::buffer_too_small(Self::SIZE, data.len()));
         };
-
-        // Read the fields in the order of `ImageBoundImportDescriptor`.
-        let mut fields: &[u8] = data;
         Ok(Self {
-            time_date_stamp: fields.read_u32_le()?,
-            offset_module_name: fields.read_u16_le()?,
-            number_of_module_forwarder_refs: fields.read_u16_le()?,
+            time_date_stamp: le_u32::<N, { offset_of!(Mirror, time_date_stamp) }>(raw),
+            offset_module_name: le_u16::<N, { offset_of!(Mirror, offset_module_name) }>(raw),
+            number_of_module_forwarder_refs: le_u16::<
+                N,
+                { offset_of!(Mirror, number_of_module_forwarder_refs) },
+            >(raw),
             module_name: String::new(), // Resolved later
             forwarder_refs: Vec::new(), // Parsed later
         })
@@ -416,10 +416,21 @@ impl BoundImportBuilder {
             })?;
             let forwarder_count = u16::try_from(desc.forwarder_refs.len())
                 .map_err(|_| Error::invalid_data_directory("bound-forwarder count exceeds u16"))?;
-            // Write the fields in the order of `ImageBoundImportDescriptor`.
-            data.write_u32_le(desc.time_date_stamp)?;
-            data.write_u16_le(name_offset)?;
-            data.write_u16_le(forwarder_count)?;
+            {
+                type Mirror = ImageBoundImportDescriptor;
+                const N: usize = BoundImportDescriptor::SIZE;
+                let mut raw = [0u8; N];
+                put_u32::<N, { offset_of!(Mirror, time_date_stamp) }>(
+                    &mut raw,
+                    desc.time_date_stamp,
+                );
+                put_u16::<N, { offset_of!(Mirror, offset_module_name) }>(&mut raw, name_offset);
+                put_u16::<N, { offset_of!(Mirror, number_of_module_forwarder_refs) }>(
+                    &mut raw,
+                    forwarder_count,
+                );
+                data.extend_from_slice(&raw);
+            }
             names.extend_from_slice(desc.module_name.as_bytes());
             names.push(0);
 
@@ -427,10 +438,21 @@ impl BoundImportBuilder {
                 let fwd_name_offset = next_name_offset(&names).ok_or_else(|| {
                     Error::invalid_data_directory("bound-forwarder name offset exceeds u16")
                 })?;
-                // Write the fields in the order of `ImageBoundForwarderRef`.
-                data.write_u32_le(fwd.time_date_stamp)?;
-                data.write_u16_le(fwd_name_offset)?;
-                data.write_u16_le(fwd.reserved)?;
+                {
+                    type Mirror = ImageBoundForwarderRef;
+                    const N: usize = BoundForwarderRef::SIZE;
+                    let mut raw = [0u8; N];
+                    put_u32::<N, { offset_of!(Mirror, time_date_stamp) }>(
+                        &mut raw,
+                        fwd.time_date_stamp,
+                    );
+                    put_u16::<N, { offset_of!(Mirror, offset_module_name) }>(
+                        &mut raw,
+                        fwd_name_offset,
+                    );
+                    put_u16::<N, { offset_of!(Mirror, reserved) }>(&mut raw, fwd.reserved);
+                    data.extend_from_slice(&raw);
+                }
                 names.extend_from_slice(fwd.module_name.as_bytes());
                 names.push(0);
             }

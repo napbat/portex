@@ -68,7 +68,7 @@ use core::mem::{offset_of, size_of};
 
 use nostdio::ReadLe;
 
-use crate::parse_utils::{u32_at, u64_at};
+use crate::parse_utils::{le_u32, put_u32};
 use crate::prelude::*;
 use crate::{Error, Result};
 
@@ -131,7 +131,11 @@ const _: () = {
     assert!(size_of::<ImageThunkData32>() == 4);
     assert!(size_of::<ImageThunkData64>() == 8);
     assert!(offset_of!(ImageImportByName, name) == 2);
+    assert!(size_of::<ImageImportDescriptor>() == size_of::<[u32; 5]>());
 };
+
+/// The size of the fixed header of `IMAGE_IMPORT_BY_NAME`: the hint before the name.
+pub(crate) const HINT_SIZE: usize = offset_of!(ImageImportByName, name);
 
 /// Return the size in bytes of one thunk (`IMAGE_THUNK_DATA64` for PE32+,
 /// `IMAGE_THUNK_DATA32` for PE32).
@@ -147,10 +151,12 @@ pub(crate) const fn thunk_size(is_64bit: bool) -> usize {
 ///
 /// Return `None` if `data` does not hold the complete thunk.
 pub(crate) fn thunk_at(data: &[u8], offset: usize, is_64bit: bool) -> Option<u64> {
+    // A thunk list is a run of thunks up to a zero thunk; the walker reads it with a cursor.
+    let mut rest = data.get(offset..)?;
     if is_64bit {
-        u64_at(data, offset.checked_add(offset_of!(ImageThunkData64, u1))?)
+        rest.read_u64_le().ok()
     } else {
-        u32_at(data, offset.checked_add(offset_of!(ImageThunkData32, u1))?).map(u64::from)
+        rest.read_u32_le().ok().map(u64::from)
     }
 }
 
@@ -175,11 +181,10 @@ impl ImportDescriptor {
     /// Size of the on-disk structure in bytes.
     pub const SIZE: usize = size_of::<ImageImportDescriptor>();
     /// [`Self::SIZE`] as a `u32`, for RVA arithmetic.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the size of `IMAGE_IMPORT_DESCRIPTOR` is 20"
-    )]
-    const SIZE_U32: u32 = Self::SIZE as u32;
+    ///
+    /// The structure is five `u32` fields; a const assert below checks this against
+    /// [`Self::SIZE`].
+    const SIZE_U32: u32 = 5 * (u32::BITS / u8::BITS);
 
     /// Return `true` if all fields are zero.
     ///
@@ -207,18 +212,17 @@ impl ImportDescriptor {
     ///
     /// Returns `ErrorKind::BufferTooSmall` if `data` is shorter than [`Self::SIZE`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let Some(data) = data.first_chunk::<{ Self::SIZE }>() else {
+        type Mirror = ImageImportDescriptor;
+        const N: usize = ImportDescriptor::SIZE;
+        let Some(raw) = data.first_chunk::<N>() else {
             return Err(Error::buffer_too_small(Self::SIZE, data.len()));
         };
-
-        // Read the fields in the order of `ImageImportDescriptor`.
-        let mut fields: &[u8] = data;
         Ok(Self {
-            original_first_thunk: fields.read_u32_le()?,
-            time_date_stamp: fields.read_u32_le()?,
-            forwarder_chain: fields.read_u32_le()?,
-            name_rva: fields.read_u32_le()?,
-            first_thunk: fields.read_u32_le()?,
+            original_first_thunk: le_u32::<N, { offset_of!(Mirror, original_first_thunk) }>(raw),
+            time_date_stamp: le_u32::<N, { offset_of!(Mirror, time_date_stamp) }>(raw),
+            forwarder_chain: le_u32::<N, { offset_of!(Mirror, forwarder_chain) }>(raw),
+            name_rva: le_u32::<N, { offset_of!(Mirror, name) }>(raw),
+            first_thunk: le_u32::<N, { offset_of!(Mirror, first_thunk) }>(raw),
         })
     }
 
@@ -244,34 +248,18 @@ impl ImportDescriptor {
 
     /// Return the fields as the on-disk structure.
     fn to_array(&self) -> [u8; Self::SIZE] {
-        let mut buf = [0u8; Self::SIZE];
-        let fields = [
-            (
-                offset_of!(ImageImportDescriptor, original_first_thunk),
-                self.original_first_thunk,
-            ),
-            (
-                offset_of!(ImageImportDescriptor, time_date_stamp),
-                self.time_date_stamp,
-            ),
-            (
-                offset_of!(ImageImportDescriptor, forwarder_chain),
-                self.forwarder_chain,
-            ),
-            (offset_of!(ImageImportDescriptor, name), self.name_rva),
-            (
-                offset_of!(ImageImportDescriptor, first_thunk),
-                self.first_thunk,
-            ),
-        ];
-        for (offset, value) in fields {
-            let bytes = value.to_le_bytes();
-            // The const asserts of `ImageImportDescriptor` keep each field in `buf`.
-            if let Some(field) = buf.get_mut(offset..offset + bytes.len()) {
-                field.copy_from_slice(&bytes);
-            }
-        }
-        buf
+        type Mirror = ImageImportDescriptor;
+        const N: usize = ImportDescriptor::SIZE;
+        let mut raw = [0u8; N];
+        put_u32::<N, { offset_of!(Mirror, original_first_thunk) }>(
+            &mut raw,
+            self.original_first_thunk,
+        );
+        put_u32::<N, { offset_of!(Mirror, time_date_stamp) }>(&mut raw, self.time_date_stamp);
+        put_u32::<N, { offset_of!(Mirror, forwarder_chain) }>(&mut raw, self.forwarder_chain);
+        put_u32::<N, { offset_of!(Mirror, name) }>(&mut raw, self.name_rva);
+        put_u32::<N, { offset_of!(Mirror, first_thunk) }>(&mut raw, self.first_thunk);
+        raw
     }
 }
 
