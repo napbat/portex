@@ -98,6 +98,15 @@ Follow the Cargo package layout:
   and overlays byte for byte.
 - In docs for a spec structure, name the Windows structure (for example
   `IMAGE_TLS_DIRECTORY`). For an address field, say if it is an RVA, a VA or a file offset.
+- Do not write a byte offset or a structure size by hand. Mirror each fixed structure in a
+  private `#[repr(C)]` struct named after the `winnt.h` type (for example `ImageDosHeader`),
+  with `#[repr(C, packed(N))]` where `winnt.h` packs it. Take offsets and sizes from
+  `core::mem::offset_of!` and `size_of`, and assert the `winnt.h` anchors in a `const _` block.
+- Read a fixed structure as one `[u8; N]` after one bounds check, and decode its fields with
+  `parse_utils::le_*::<N, O>`. Write it with `put_*::<N, O>`. Where Portex tolerates a
+  structure that ends early, use `zero_extended` and keep the behavior for a missing field.
+- Use `nostdio::ReadLe` and `WriteLe` cursors only for data whose length depends on the data,
+  such as relocation entries or name tables. Do not add another decode helper.
 - Do not use language features or library APIs newer than Rust 1.88 (`rust-version`).
 - portex is published on crates.io. A breaking change to the public API needs a new minor
   version while the version is `0.x`. List each breaking change in the pull request.
