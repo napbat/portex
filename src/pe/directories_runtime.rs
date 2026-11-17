@@ -1,4 +1,8 @@
+use nostdio::WriteLe;
+
 use super::PeImage;
+use crate::load_config::LoadConfigField;
+use crate::parse_utils::le_u32;
 use crate::prelude::*;
 use crate::{Error, Result};
 
@@ -316,7 +320,7 @@ impl PeImage {
         let mut bytes = vec![0; crate::dos::DosHeader::SIZE];
         self.dos_header.write(&mut bytes).ok()?;
         bytes.extend_from_slice(&self.dos_stub);
-        bytes.extend_from_slice(&crate::coff::PE_SIGNATURE.to_le_bytes());
+        bytes.write_u32_le(crate::coff::PE_SIGNATURE).ok()?;
         crate::rich::RichHeader::parse(&bytes)
     }
 
@@ -484,6 +488,7 @@ impl PeImage {
     /// cannot be read at the directory RVA, or if the structure is malformed.
     pub fn load_config(&self) -> Result<Option<crate::load_config::LoadConfigDirectory>> {
         use crate::data_dir::DataDirectoryType;
+        const N: usize = LoadConfigField::Size.end(false);
 
         let Some(directory) = self
             .data_directory(DataDirectoryType::LoadConfig)
@@ -493,10 +498,10 @@ impl PeImage {
         };
         let invalid = || crate::Error::invalid_rva(directory.virtual_address);
         let header = self
-            .read_rva(directory.virtual_address, core::mem::size_of::<u32>())
+            .read_rva(directory.virtual_address, N)
             .ok_or_else(invalid)?;
-        let header: [u8; 4] = header.as_slice().try_into().map_err(|_| invalid())?;
-        let size = u32::from_le_bytes(header);
+        let header = header.first_chunk::<N>().ok_or_else(invalid)?;
+        let size = le_u32::<N, { LoadConfigField::Size.offset(false) }>(header);
         let length = if size == 0 { directory.size } else { size };
         let data = self
             .read_rva(directory.virtual_address, length as usize)

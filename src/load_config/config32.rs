@@ -1,7 +1,8 @@
 //! The PE32 load configuration directory (`IMAGE_LOAD_CONFIG_DIRECTORY32`).
 
-use super::{LoadConfigField as Field, directory_field, directory_prefix, guard_flags};
+use super::{LoadConfigField as Field, directory_prefix, guard_flags};
 use crate::Result;
+use crate::parse_utils::{le_u16, le_u32, zero_extended};
 use crate::prelude::*;
 
 /// `IMAGE_LOAD_CONFIG_DIRECTORY32`, with every field of the Windows SDK 10.0.26100.
@@ -130,12 +131,13 @@ pub struct LoadConfigDirectory32 {
 }
 
 impl LoadConfigDirectory32 {
-    /// Default output size, without the optional SafeSEH and CFG fields.
-    pub const MIN_SIZE: usize = 64;
+    /// Default output size, without the optional SafeSEH and CFG fields. This is the offset of
+    /// `SEHandlerTable`.
+    pub const MIN_SIZE: usize = Field::SeHandlerTable.offset(false);
     /// Size up to and including `GuardFlags`.
-    pub const SIZE_WITH_CFG: usize = 92;
+    pub const SIZE_WITH_CFG: usize = Field::GuardFlags.end(false);
     /// Size up to and including `UmaFunctionPointers`, the last field that this type knows.
-    pub const KNOWN_SIZE: usize = 0xc4;
+    pub const KNOWN_SIZE: usize = Field::UmaFunctionPointers.end(false);
 
     /// Parse a versioned prefix of whole fields. Legacy short records are also valid.
     ///
@@ -145,71 +147,81 @@ impl LoadConfigDirectory32 {
     /// or an `InvalidDataDirectory` error if the declared size exceeds `data`
     /// or truncates a field.
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let (size, data) = directory_prefix(data)?;
-        let word =
-            |field: Field| directory_field(data, field.offset(false)).map(u32::from_le_bytes);
-        let half =
-            |field: Field| directory_field(data, field.offset(false)).map(u16::from_le_bytes);
+        const N: usize = LoadConfigDirectory32::KNOWN_SIZE;
+        let (size, data) = directory_prefix(data, false)?;
+        // `directory_prefix` rejects a cut field, so each field is whole or absent. An
+        // absent field reads as zero.
+        let (raw, _) = zero_extended::<N>(data);
+        // Decode the field `$field` of the zero-extended structure with `$read`.
+        macro_rules! get {
+            ($read:ident, $field:ident) => {
+                $read::<N, { Field::$field.offset(false) }>(&raw)
+            };
+        }
+
         Ok(Self {
             size,
-            time_date_stamp: word(Field::TimeDateStamp)?,
-            major_version: half(Field::MajorVersion)?,
-            minor_version: half(Field::MinorVersion)?,
-            global_flags_clear: word(Field::GlobalFlagsClear)?,
-            global_flags_set: word(Field::GlobalFlagsSet)?,
-            critical_section_default_timeout: word(Field::CriticalSectionDefaultTimeout)?,
-            de_commit_free_block_threshold: word(Field::DeCommitFreeBlockThreshold)?,
-            de_commit_total_free_threshold: word(Field::DeCommitTotalFreeThreshold)?,
-            lock_prefix_table: word(Field::LockPrefixTable)?,
-            maximum_allocation_size: word(Field::MaximumAllocationSize)?,
-            virtual_memory_threshold: word(Field::VirtualMemoryThreshold)?,
-            process_affinity_mask: word(Field::ProcessAffinityMask)?,
-            process_heap_flags: word(Field::ProcessHeapFlags)?,
-            csd_version: half(Field::CsdVersion)?,
-            dependent_load_flags: half(Field::DependentLoadFlags)?,
-            edit_list: word(Field::EditList)?,
-            security_cookie: word(Field::SecurityCookie)?,
-            se_handler_table: word(Field::SeHandlerTable)?,
-            se_handler_count: word(Field::SeHandlerCount)?,
-            guard_cf_check_function_pointer: word(Field::GuardCfCheckFunctionPointer)?,
-            guard_cf_dispatch_function_pointer: word(Field::GuardCfDispatchFunctionPointer)?,
-            guard_cf_function_table: word(Field::GuardCfFunctionTable)?,
-            guard_cf_function_count: word(Field::GuardCfFunctionCount)?,
-            guard_flags: word(Field::GuardFlags)?,
-            code_integrity_flags: half(Field::CodeIntegrityFlags)?,
-            code_integrity_catalog: half(Field::CodeIntegrityCatalog)?,
-            code_integrity_catalog_offset: word(Field::CodeIntegrityCatalogOffset)?,
-            code_integrity_reserved: word(Field::CodeIntegrityReserved)?,
-            guard_address_taken_iat_entry_table: word(Field::GuardAddressTakenIatEntryTable)?,
-            guard_address_taken_iat_entry_count: word(Field::GuardAddressTakenIatEntryCount)?,
-            guard_long_jump_target_table: word(Field::GuardLongJumpTargetTable)?,
-            guard_long_jump_target_count: word(Field::GuardLongJumpTargetCount)?,
-            dynamic_value_reloc_table: word(Field::DynamicValueRelocTable)?,
-            chpe_metadata_pointer: word(Field::ChpeMetadataPointer)?,
-            guard_rf_failure_routine: word(Field::GuardRfFailureRoutine)?,
-            guard_rf_failure_routine_function_pointer: word(
-                Field::GuardRfFailureRoutineFunctionPointer,
-            )?,
-            dynamic_value_reloc_table_offset: word(Field::DynamicValueRelocTableOffset)?,
-            dynamic_value_reloc_table_section: half(Field::DynamicValueRelocTableSection)?,
-            reserved2: half(Field::Reserved2)?,
-            guard_rf_verify_stack_pointer_function_pointer: word(
-                Field::GuardRfVerifyStackPointerFunctionPointer,
-            )?,
-            hot_patch_table_offset: word(Field::HotPatchTableOffset)?,
-            reserved3: word(Field::Reserved3)?,
-            enclave_configuration_pointer: word(Field::EnclaveConfigurationPointer)?,
-            volatile_metadata_pointer: word(Field::VolatileMetadataPointer)?,
-            guard_eh_continuation_table: word(Field::GuardEhContinuationTable)?,
-            guard_eh_continuation_count: word(Field::GuardEhContinuationCount)?,
-            guard_xfg_check_function_pointer: word(Field::GuardXfgCheckFunctionPointer)?,
-            guard_xfg_dispatch_function_pointer: word(Field::GuardXfgDispatchFunctionPointer)?,
-            guard_xfg_table_dispatch_function_pointer: word(
-                Field::GuardXfgTableDispatchFunctionPointer,
-            )?,
-            cast_guard_os_determined_failure_mode: word(Field::CastGuardOsDeterminedFailureMode)?,
-            guard_memcpy_function_pointer: word(Field::GuardMemcpyFunctionPointer)?,
-            uma_function_pointers: word(Field::UmaFunctionPointers)?,
+            time_date_stamp: get!(le_u32, TimeDateStamp),
+            major_version: get!(le_u16, MajorVersion),
+            minor_version: get!(le_u16, MinorVersion),
+            global_flags_clear: get!(le_u32, GlobalFlagsClear),
+            global_flags_set: get!(le_u32, GlobalFlagsSet),
+            critical_section_default_timeout: get!(le_u32, CriticalSectionDefaultTimeout),
+            de_commit_free_block_threshold: get!(le_u32, DeCommitFreeBlockThreshold),
+            de_commit_total_free_threshold: get!(le_u32, DeCommitTotalFreeThreshold),
+            lock_prefix_table: get!(le_u32, LockPrefixTable),
+            maximum_allocation_size: get!(le_u32, MaximumAllocationSize),
+            virtual_memory_threshold: get!(le_u32, VirtualMemoryThreshold),
+            process_affinity_mask: get!(le_u32, ProcessAffinityMask),
+            process_heap_flags: get!(le_u32, ProcessHeapFlags),
+            csd_version: get!(le_u16, CsdVersion),
+            dependent_load_flags: get!(le_u16, DependentLoadFlags),
+            edit_list: get!(le_u32, EditList),
+            security_cookie: get!(le_u32, SecurityCookie),
+            se_handler_table: get!(le_u32, SeHandlerTable),
+            se_handler_count: get!(le_u32, SeHandlerCount),
+            guard_cf_check_function_pointer: get!(le_u32, GuardCfCheckFunctionPointer),
+            guard_cf_dispatch_function_pointer: get!(le_u32, GuardCfDispatchFunctionPointer),
+            guard_cf_function_table: get!(le_u32, GuardCfFunctionTable),
+            guard_cf_function_count: get!(le_u32, GuardCfFunctionCount),
+            guard_flags: get!(le_u32, GuardFlags),
+            code_integrity_flags: get!(le_u16, CodeIntegrityFlags),
+            code_integrity_catalog: get!(le_u16, CodeIntegrityCatalog),
+            code_integrity_catalog_offset: get!(le_u32, CodeIntegrityCatalogOffset),
+            code_integrity_reserved: get!(le_u32, CodeIntegrityReserved),
+            guard_address_taken_iat_entry_table: get!(le_u32, GuardAddressTakenIatEntryTable),
+            guard_address_taken_iat_entry_count: get!(le_u32, GuardAddressTakenIatEntryCount),
+            guard_long_jump_target_table: get!(le_u32, GuardLongJumpTargetTable),
+            guard_long_jump_target_count: get!(le_u32, GuardLongJumpTargetCount),
+            dynamic_value_reloc_table: get!(le_u32, DynamicValueRelocTable),
+            chpe_metadata_pointer: get!(le_u32, ChpeMetadataPointer),
+            guard_rf_failure_routine: get!(le_u32, GuardRfFailureRoutine),
+            guard_rf_failure_routine_function_pointer: get!(
+                le_u32,
+                GuardRfFailureRoutineFunctionPointer
+            ),
+            dynamic_value_reloc_table_offset: get!(le_u32, DynamicValueRelocTableOffset),
+            dynamic_value_reloc_table_section: get!(le_u16, DynamicValueRelocTableSection),
+            reserved2: get!(le_u16, Reserved2),
+            guard_rf_verify_stack_pointer_function_pointer: get!(
+                le_u32,
+                GuardRfVerifyStackPointerFunctionPointer
+            ),
+            hot_patch_table_offset: get!(le_u32, HotPatchTableOffset),
+            reserved3: get!(le_u32, Reserved3),
+            enclave_configuration_pointer: get!(le_u32, EnclaveConfigurationPointer),
+            volatile_metadata_pointer: get!(le_u32, VolatileMetadataPointer),
+            guard_eh_continuation_table: get!(le_u32, GuardEhContinuationTable),
+            guard_eh_continuation_count: get!(le_u32, GuardEhContinuationCount),
+            guard_xfg_check_function_pointer: get!(le_u32, GuardXfgCheckFunctionPointer),
+            guard_xfg_dispatch_function_pointer: get!(le_u32, GuardXfgDispatchFunctionPointer),
+            guard_xfg_table_dispatch_function_pointer: get!(
+                le_u32,
+                GuardXfgTableDispatchFunctionPointer
+            ),
+            cast_guard_os_determined_failure_mode: get!(le_u32, CastGuardOsDeterminedFailureMode),
+            guard_memcpy_function_pointer: get!(le_u32, GuardMemcpyFunctionPointer),
+            uma_function_pointers: get!(le_u32, UmaFunctionPointers),
             trailing_data: data.get(Self::KNOWN_SIZE..).unwrap_or_default().to_vec(),
         })
     }

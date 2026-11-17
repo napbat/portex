@@ -23,6 +23,7 @@ pub use config32::LoadConfigDirectory32;
 pub use config64::LoadConfigDirectory64;
 pub use field::LoadConfigField;
 
+use crate::parse_utils::le_u32;
 use crate::prelude::*;
 use crate::{Error, Result};
 
@@ -30,36 +31,41 @@ use crate::{Error, Result};
 ///
 /// The `Size` field limits the available versioned prefix. A `Size` of zero does not mean that
 /// the directory is absent. In this case, the legacy convention applies: use the directory size.
-fn directory_prefix(data: &[u8]) -> Result<(u32, &[u8])> {
-    const HEADER_SIZE: usize = core::mem::size_of::<u32>();
-    let Some(size_bytes) = data.first_chunk::<HEADER_SIZE>() else {
+///
+/// A version can omit a whole field, but it cannot supply only part of the value. The function
+/// returns an error if the prefix ends inside a field of the layout that `is_64bit` selects.
+fn directory_prefix(data: &[u8], is_64bit: bool) -> Result<(u32, &[u8])> {
+    const HEADER_SIZE: usize = LoadConfigField::Size.end(false);
+    let Some(header) = data.first_chunk::<HEADER_SIZE>() else {
         return Err(Error::buffer_too_small(HEADER_SIZE, data.len()));
     };
-    let size = u32::from_le_bytes(*size_bytes);
+    let size = le_u32::<HEADER_SIZE, { LoadConfigField::Size.offset(false) }>(header);
     // A Size that does not fit `usize` is also larger than `data`.
     let declared_size = if size == 0 {
         data.len()
     } else {
         usize::try_from(size).unwrap_or(usize::MAX)
     };
-    match data.get(..declared_size) {
-        Some(prefix) if declared_size >= HEADER_SIZE => Ok((size, prefix)),
-        _ => Err(Error::invalid_data_directory(format!(
-            "load-config size {declared_size} is outside the available {} bytes",
-            data.len()
-        ))),
+    let prefix = match data.get(..declared_size) {
+        Some(prefix) if declared_size >= HEADER_SIZE => prefix,
+        _ => {
+            return Err(Error::invalid_data_directory(format!(
+                "load-config size {declared_size} is outside the available {} bytes",
+                data.len()
+            )));
+        }
+    };
+    let end = prefix.len();
+    if let Some(field) = LoadConfigField::ALL
+        .into_iter()
+        .find(|field| field.offset(is_64bit) < end && end < field.end(is_64bit))
+    {
+        let offset = field.offset(is_64bit);
+        return Err(Error::invalid_data_directory(format!(
+            "load-config field at {offset:#x} is truncated"
+        )));
     }
-}
-
-/// Read the field at `offset`. A version can omit a whole field, but it cannot supply only
-/// part of the value.
-fn directory_field<const N: usize>(data: &[u8], offset: usize) -> Result<[u8; N]> {
-    match data.get(offset..) {
-        None | Some([]) => Ok([0; N]),
-        Some(rest) => rest.first_chunk::<N>().copied().ok_or_else(|| {
-            Error::invalid_data_directory(format!("load-config field at {offset:#x} is truncated"))
-        }),
-    }
+    Ok((size, prefix))
 }
 
 /// Write `bytes` at `offset` in `buf` if the complete field fits.

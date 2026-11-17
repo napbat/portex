@@ -24,8 +24,50 @@
 //! # Ok::<(), portex::Error>(())
 //! ```
 
+use core::mem::{offset_of, size_of};
+
+use crate::parse_utils::{le_u16, le_u32, put_u16, put_u32};
 use crate::prelude::*;
 use crate::{Error, Result};
+
+/// The layout of `IMAGE_DATA_DIRECTORY`.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the width
+/// of each field.
+#[repr(C)]
+struct ImageDataDirectory {
+    virtual_address: u32,
+    size: u32,
+}
+
+/// The layout of `IMAGE_COR20_HEADER`.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the width
+/// of each field.
+#[repr(C)]
+struct ImageCor20Header {
+    cb: u32,
+    major_runtime_version: u16,
+    minor_runtime_version: u16,
+    meta_data: ImageDataDirectory,
+    flags: u32,
+    entry_point_token: u32,
+    resources: ImageDataDirectory,
+    strong_name_signature: ImageDataDirectory,
+    code_manager_table: ImageDataDirectory,
+    vtable_fixups: ImageDataDirectory,
+    export_address_table_jumps: ImageDataDirectory,
+    managed_native_header: ImageDataDirectory,
+}
+
+const _: () = {
+    assert!(size_of::<ImageDataDirectory>() == 8);
+    assert!(size_of::<ImageCor20Header>() == 0x48);
+    assert!(offset_of!(ImageCor20Header, meta_data) == 0x08);
+    assert!(offset_of!(ImageCor20Header, entry_point_token) == 0x14);
+    assert!(offset_of!(ImageCor20Header, managed_native_header.size) == 0x44);
+    assert!(CliHeader::SIZE_U32 as usize == CliHeader::SIZE);
+};
 
 /// CLI header (`IMAGE_COR20_HEADER`).
 ///
@@ -76,9 +118,10 @@ pub struct CliHeader {
 
 impl CliHeader {
     /// Size of the CLI header in bytes.
-    pub const SIZE: usize = 72;
-    /// Size of the CLI header in bytes, as the `u32` stored in `cb`.
-    pub const SIZE_U32: u32 = 72;
+    pub const SIZE: usize = size_of::<ImageCor20Header>();
+    /// Size of the CLI header in bytes, as the `u32` stored in `cb`. A compile-time assertion
+    /// keeps it equal to [`Self::SIZE`].
+    pub const SIZE_U32: u32 = 0x48;
 
     /// `COMIMAGE_FLAGS_ILONLY`: the image contains only IL code.
     pub const FLAG_ILONLY: u32 = 0x0000_0001;
@@ -104,22 +147,13 @@ impl CliHeader {
     /// [`ErrorKind::InvalidDataDirectory`](crate::error::ErrorKind::InvalidDataDirectory)
     /// if the declared `cb` is smaller than 72.
     pub fn parse(data: &[u8]) -> Result<Self> {
-        if data.len() < Self::SIZE {
-            return Err(Error::buffer_too_small(Self::SIZE, data.len()));
-        }
-
-        let read_u32 = |offset: usize| -> u32 {
-            u32::from_le_bytes([
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ])
+        type H = ImageCor20Header;
+        const N: usize = CliHeader::SIZE;
+        let Some(raw) = data.first_chunk::<N>() else {
+            return Err(Error::buffer_too_small(N, data.len()));
         };
-        let read_u16 =
-            |offset: usize| -> u16 { u16::from_le_bytes([data[offset], data[offset + 1]]) };
 
-        let cb = read_u32(0);
+        let cb = le_u32::<N, { offset_of!(H, cb) }>(raw);
         if cb < Self::SIZE_U32 {
             return Err(Error::invalid_data_directory(format!(
                 "CLR header declares size {}, expected at least {}",
@@ -130,24 +164,43 @@ impl CliHeader {
 
         Ok(Self {
             cb,
-            major_runtime_version: read_u16(4),
-            minor_runtime_version: read_u16(6),
-            metadata_rva: read_u32(8),
-            metadata_size: read_u32(12),
-            flags: read_u32(16),
-            entry_point_token_or_rva: read_u32(20),
-            resources_rva: read_u32(24),
-            resources_size: read_u32(28),
-            strong_name_signature_rva: read_u32(32),
-            strong_name_signature_size: read_u32(36),
-            code_manager_table_rva: read_u32(40),
-            code_manager_table_size: read_u32(44),
-            vtable_fixups_rva: read_u32(48),
-            vtable_fixups_size: read_u32(52),
-            export_address_table_jumps_rva: read_u32(56),
-            export_address_table_jumps_size: read_u32(60),
-            managed_native_header_rva: read_u32(64),
-            managed_native_header_size: read_u32(68),
+            major_runtime_version: le_u16::<N, { offset_of!(H, major_runtime_version) }>(raw),
+            minor_runtime_version: le_u16::<N, { offset_of!(H, minor_runtime_version) }>(raw),
+            metadata_rva: le_u32::<N, { offset_of!(H, meta_data.virtual_address) }>(raw),
+            metadata_size: le_u32::<N, { offset_of!(H, meta_data.size) }>(raw),
+            flags: le_u32::<N, { offset_of!(H, flags) }>(raw),
+            entry_point_token_or_rva: le_u32::<N, { offset_of!(H, entry_point_token) }>(raw),
+            resources_rva: le_u32::<N, { offset_of!(H, resources.virtual_address) }>(raw),
+            resources_size: le_u32::<N, { offset_of!(H, resources.size) }>(raw),
+            strong_name_signature_rva: le_u32::<
+                N,
+                { offset_of!(H, strong_name_signature.virtual_address) },
+            >(raw),
+            strong_name_signature_size: le_u32::<N, { offset_of!(H, strong_name_signature.size) }>(
+                raw,
+            ),
+            code_manager_table_rva: le_u32::<
+                N,
+                { offset_of!(H, code_manager_table.virtual_address) },
+            >(raw),
+            code_manager_table_size: le_u32::<N, { offset_of!(H, code_manager_table.size) }>(raw),
+            vtable_fixups_rva: le_u32::<N, { offset_of!(H, vtable_fixups.virtual_address) }>(raw),
+            vtable_fixups_size: le_u32::<N, { offset_of!(H, vtable_fixups.size) }>(raw),
+            export_address_table_jumps_rva: le_u32::<
+                N,
+                { offset_of!(H, export_address_table_jumps.virtual_address) },
+            >(raw),
+            export_address_table_jumps_size: le_u32::<
+                N,
+                { offset_of!(H, export_address_table_jumps.size) },
+            >(raw),
+            managed_native_header_rva: le_u32::<
+                N,
+                { offset_of!(H, managed_native_header.virtual_address) },
+            >(raw),
+            managed_native_header_size: le_u32::<N, { offset_of!(H, managed_native_header.size) }>(
+                raw,
+            ),
         })
     }
 
@@ -184,27 +237,53 @@ impl CliHeader {
     /// Serialize the CLI header to a 72-byte array.
     #[must_use]
     pub fn to_bytes(self) -> [u8; Self::SIZE] {
-        let mut data = [0u8; Self::SIZE];
+        type H = ImageCor20Header;
+        const N: usize = CliHeader::SIZE;
+        let mut data = [0u8; N];
 
-        data[0..4].copy_from_slice(&self.cb.to_le_bytes());
-        data[4..6].copy_from_slice(&self.major_runtime_version.to_le_bytes());
-        data[6..8].copy_from_slice(&self.minor_runtime_version.to_le_bytes());
-        data[8..12].copy_from_slice(&self.metadata_rva.to_le_bytes());
-        data[12..16].copy_from_slice(&self.metadata_size.to_le_bytes());
-        data[16..20].copy_from_slice(&self.flags.to_le_bytes());
-        data[20..24].copy_from_slice(&self.entry_point_token_or_rva.to_le_bytes());
-        data[24..28].copy_from_slice(&self.resources_rva.to_le_bytes());
-        data[28..32].copy_from_slice(&self.resources_size.to_le_bytes());
-        data[32..36].copy_from_slice(&self.strong_name_signature_rva.to_le_bytes());
-        data[36..40].copy_from_slice(&self.strong_name_signature_size.to_le_bytes());
-        data[40..44].copy_from_slice(&self.code_manager_table_rva.to_le_bytes());
-        data[44..48].copy_from_slice(&self.code_manager_table_size.to_le_bytes());
-        data[48..52].copy_from_slice(&self.vtable_fixups_rva.to_le_bytes());
-        data[52..56].copy_from_slice(&self.vtable_fixups_size.to_le_bytes());
-        data[56..60].copy_from_slice(&self.export_address_table_jumps_rva.to_le_bytes());
-        data[60..64].copy_from_slice(&self.export_address_table_jumps_size.to_le_bytes());
-        data[64..68].copy_from_slice(&self.managed_native_header_rva.to_le_bytes());
-        data[68..72].copy_from_slice(&self.managed_native_header_size.to_le_bytes());
+        put_u32::<N, { offset_of!(H, cb) }>(&mut data, self.cb);
+        let major = self.major_runtime_version;
+        put_u16::<N, { offset_of!(H, major_runtime_version) }>(&mut data, major);
+        let minor = self.minor_runtime_version;
+        put_u16::<N, { offset_of!(H, minor_runtime_version) }>(&mut data, minor);
+        let pairs: [(u32, u32); 7] = [
+            (self.metadata_rva, self.metadata_size),
+            (self.resources_rva, self.resources_size),
+            (
+                self.strong_name_signature_rva,
+                self.strong_name_signature_size,
+            ),
+            (self.code_manager_table_rva, self.code_manager_table_size),
+            (self.vtable_fixups_rva, self.vtable_fixups_size),
+            (
+                self.export_address_table_jumps_rva,
+                self.export_address_table_jumps_size,
+            ),
+            (
+                self.managed_native_header_rva,
+                self.managed_native_header_size,
+            ),
+        ];
+        let [meta, res, sn, cm, vt, eat, mnh] = pairs;
+        put_u32::<N, { offset_of!(H, meta_data.virtual_address) }>(&mut data, meta.0);
+        put_u32::<N, { offset_of!(H, meta_data.size) }>(&mut data, meta.1);
+        put_u32::<N, { offset_of!(H, flags) }>(&mut data, self.flags);
+        let entry = self.entry_point_token_or_rva;
+        put_u32::<N, { offset_of!(H, entry_point_token) }>(&mut data, entry);
+        put_u32::<N, { offset_of!(H, resources.virtual_address) }>(&mut data, res.0);
+        put_u32::<N, { offset_of!(H, resources.size) }>(&mut data, res.1);
+        put_u32::<N, { offset_of!(H, strong_name_signature.virtual_address) }>(&mut data, sn.0);
+        put_u32::<N, { offset_of!(H, strong_name_signature.size) }>(&mut data, sn.1);
+        put_u32::<N, { offset_of!(H, code_manager_table.virtual_address) }>(&mut data, cm.0);
+        put_u32::<N, { offset_of!(H, code_manager_table.size) }>(&mut data, cm.1);
+        put_u32::<N, { offset_of!(H, vtable_fixups.virtual_address) }>(&mut data, vt.0);
+        put_u32::<N, { offset_of!(H, vtable_fixups.size) }>(&mut data, vt.1);
+        put_u32::<N, { offset_of!(H, export_address_table_jumps.virtual_address) }>(
+            &mut data, eat.0,
+        );
+        put_u32::<N, { offset_of!(H, export_address_table_jumps.size) }>(&mut data, eat.1);
+        put_u32::<N, { offset_of!(H, managed_native_header.virtual_address) }>(&mut data, mnh.0);
+        put_u32::<N, { offset_of!(H, managed_native_header.size) }>(&mut data, mnh.1);
 
         data
     }

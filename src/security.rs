@@ -21,8 +21,34 @@
 //! # Ok::<(), portex::Error>(())
 //! ```
 
+use core::mem::{offset_of, size_of};
+
+use crate::parse_utils::{le_u16, le_u32, put_u16, put_u32};
 use crate::prelude::*;
 use crate::{Error, Result};
+
+/// The size of the fixed header of `WIN_CERTIFICATE`, before `bCertificate`.
+const N: usize = offset_of!(WinCertificate, b_certificate);
+
+/// The layout of `WIN_CERTIFICATE`.
+///
+/// `bCertificate` is a variable-length array. Its offset is the size of the header.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the width
+/// of each field.
+#[repr(C)]
+struct WinCertificate {
+    dw_length: u32,
+    w_revision: u16,
+    w_certificate_type: u16,
+    b_certificate: [u8; 1],
+}
+
+const _: () = {
+    assert!(size_of::<WinCertificate>() == 12);
+    assert!(offset_of!(WinCertificate, w_certificate_type) == 6);
+    assert!(offset_of!(WinCertificate, b_certificate) == 8);
+};
 
 /// `WIN_CERTIFICATE` revision values (`wRevision`).
 ///
@@ -136,7 +162,7 @@ pub struct Certificate {
 
 impl Certificate {
     /// Size of the header in bytes (length, revision and type).
-    pub const HEADER_SIZE: usize = 8;
+    pub const HEADER_SIZE: usize = offset_of!(WinCertificate, b_certificate);
 
     /// Parse one certificate from a byte slice.
     ///
@@ -153,15 +179,20 @@ impl Certificate {
     /// Returns [`ErrorKind::InvalidDataDirectory`](crate::error::ErrorKind::InvalidDataDirectory)
     /// if `dwLength` is smaller than the header, or if it is larger than `data`.
     pub fn parse(data: &[u8]) -> Result<(Self, usize)> {
-        let Some((header, _)) = data.split_first_chunk::<{ Self::HEADER_SIZE }>() else {
+        let Some(header) = data.first_chunk::<N>() else {
             return Err(Error::buffer_too_small(Self::HEADER_SIZE, data.len()));
         };
-        let [l0, l1, l2, l3, r0, r1, t0, t1] = *header;
-        let length_u32 = u32::from_le_bytes([l0, l1, l2, l3]);
+        let length_u32 = le_u32::<N, { offset_of!(WinCertificate, dw_length) }>(header);
         let length = usize::try_from(length_u32)
             .map_err(|_| Error::invalid_data_directory("certificate length exceeds usize"))?;
-        let revision = CertificateRevision::from_u16(u16::from_le_bytes([r0, r1]));
-        let certificate_type = CertificateType::from_u16(u16::from_le_bytes([t0, t1]));
+        let revision = CertificateRevision::from_u16(le_u16::<
+            N,
+            { offset_of!(WinCertificate, w_revision) },
+        >(header));
+        let certificate_type = CertificateType::from_u16(le_u16::<
+            N,
+            { offset_of!(WinCertificate, w_certificate_type) },
+        >(header));
 
         let Some(cert_data) = data.get(Self::HEADER_SIZE..length).map(<[u8]>::to_vec) else {
             return Err(Error::invalid_data_directory(format!(
@@ -326,9 +357,16 @@ impl SecurityBuilder {
                 .checked_add(cert.data.len())
                 .and_then(|length| u32::try_from(length).ok())
                 .ok_or_else(|| Error::invalid_data_directory("certificate length exceeds u32"))?;
-            data.extend_from_slice(&cert_length_u32.to_le_bytes());
-            data.extend_from_slice(&cert.revision.as_u16().to_le_bytes());
-            data.extend_from_slice(&cert.certificate_type.as_u16().to_le_bytes());
+            let mut header = [0u8; N];
+            put_u32::<N, { offset_of!(WinCertificate, dw_length) }>(&mut header, cert_length_u32);
+            let revision = cert.revision.as_u16();
+            put_u16::<N, { offset_of!(WinCertificate, w_revision) }>(&mut header, revision);
+            let certificate_type = cert.certificate_type.as_u16();
+            put_u16::<N, { offset_of!(WinCertificate, w_certificate_type) }>(
+                &mut header,
+                certificate_type,
+            );
+            data.extend_from_slice(&header);
             data.extend_from_slice(&cert.data);
 
             // Pad to the next 8-byte boundary. Each certificate starts at an aligned

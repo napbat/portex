@@ -25,8 +25,50 @@
 //! # Ok::<(), portex::Error>(())
 //! ```
 
+use core::mem::{offset_of, size_of};
+
+use nostdio::WriteLe;
+
+use crate::parse_utils::{le_u32, le_u64, put_u32, put_u64};
 use crate::prelude::*;
 use crate::{Error, Result};
+
+/// The layout of `IMAGE_TLS_DIRECTORY32`.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the width
+/// of each field.
+#[repr(C)]
+struct ImageTlsDirectory32 {
+    start_address_of_raw_data: u32,
+    end_address_of_raw_data: u32,
+    address_of_index: u32,
+    address_of_callbacks: u32,
+    size_of_zero_fill: u32,
+    characteristics: u32,
+}
+
+/// The layout of `IMAGE_TLS_DIRECTORY64`.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the width
+/// of each field.
+#[repr(C)]
+struct ImageTlsDirectory64 {
+    start_address_of_raw_data: u64,
+    end_address_of_raw_data: u64,
+    address_of_index: u64,
+    address_of_callbacks: u64,
+    size_of_zero_fill: u32,
+    characteristics: u32,
+}
+
+const _: () = {
+    assert!(size_of::<ImageTlsDirectory32>() == 0x18);
+    assert!(offset_of!(ImageTlsDirectory32, address_of_callbacks) == 0x0c);
+    assert!(offset_of!(ImageTlsDirectory32, characteristics) == 0x14);
+    assert!(size_of::<ImageTlsDirectory64>() == 0x28);
+    assert!(offset_of!(ImageTlsDirectory64, address_of_callbacks) == 0x18);
+    assert!(offset_of!(ImageTlsDirectory64, size_of_zero_fill) == 0x20);
+};
 
 /// `IMAGE_TLS_DIRECTORY32`: the 24-byte PE32 TLS directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -47,7 +89,7 @@ pub struct TlsDirectory32 {
 
 impl TlsDirectory32 {
     /// Size of an encoded `IMAGE_TLS_DIRECTORY32`, in bytes.
-    pub const SIZE: usize = 24;
+    pub const SIZE: usize = size_of::<ImageTlsDirectory32>();
 
     /// Parse an `IMAGE_TLS_DIRECTORY32` from little-endian bytes.
     ///
@@ -55,30 +97,39 @@ impl TlsDirectory32 {
     ///
     /// Returns an error if `data` is shorter than [`Self::SIZE`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let Some(data) = data.first_chunk::<{ Self::SIZE }>() else {
-            return Err(Error::buffer_too_small(Self::SIZE, data.len()));
+        type D = ImageTlsDirectory32;
+        const N: usize = TlsDirectory32::SIZE;
+        let Some(raw) = data.first_chunk::<N>() else {
+            return Err(Error::buffer_too_small(N, data.len()));
         };
 
         Ok(Self {
-            start_address_of_raw_data: u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
-            end_address_of_raw_data: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
-            address_of_index: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
-            address_of_callbacks: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
-            size_of_zero_fill: u32::from_le_bytes([data[16], data[17], data[18], data[19]]),
-            characteristics: u32::from_le_bytes([data[20], data[21], data[22], data[23]]),
+            start_address_of_raw_data: le_u32::<N, { offset_of!(D, start_address_of_raw_data) }>(
+                raw,
+            ),
+            end_address_of_raw_data: le_u32::<N, { offset_of!(D, end_address_of_raw_data) }>(raw),
+            address_of_index: le_u32::<N, { offset_of!(D, address_of_index) }>(raw),
+            address_of_callbacks: le_u32::<N, { offset_of!(D, address_of_callbacks) }>(raw),
+            size_of_zero_fill: le_u32::<N, { offset_of!(D, size_of_zero_fill) }>(raw),
+            characteristics: le_u32::<N, { offset_of!(D, characteristics) }>(raw),
         })
     }
 
     /// Encode the directory into its 24-byte little-endian representation.
     #[must_use]
     pub fn to_bytes(self) -> [u8; Self::SIZE] {
-        let mut buf = [0u8; Self::SIZE];
-        buf[0..4].copy_from_slice(&self.start_address_of_raw_data.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.end_address_of_raw_data.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.address_of_index.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.address_of_callbacks.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.size_of_zero_fill.to_le_bytes());
-        buf[20..24].copy_from_slice(&self.characteristics.to_le_bytes());
+        type D = ImageTlsDirectory32;
+        const N: usize = TlsDirectory32::SIZE;
+        let mut buf = [0u8; N];
+        let start = self.start_address_of_raw_data;
+        put_u32::<N, { offset_of!(D, start_address_of_raw_data) }>(&mut buf, start);
+        let end = self.end_address_of_raw_data;
+        put_u32::<N, { offset_of!(D, end_address_of_raw_data) }>(&mut buf, end);
+        put_u32::<N, { offset_of!(D, address_of_index) }>(&mut buf, self.address_of_index);
+        let callbacks = self.address_of_callbacks;
+        put_u32::<N, { offset_of!(D, address_of_callbacks) }>(&mut buf, callbacks);
+        put_u32::<N, { offset_of!(D, size_of_zero_fill) }>(&mut buf, self.size_of_zero_fill);
+        put_u32::<N, { offset_of!(D, characteristics) }>(&mut buf, self.characteristics);
         buf
     }
 }
@@ -102,7 +153,7 @@ pub struct TlsDirectory64 {
 
 impl TlsDirectory64 {
     /// Size of an encoded `IMAGE_TLS_DIRECTORY64`, in bytes.
-    pub const SIZE: usize = 40;
+    pub const SIZE: usize = size_of::<ImageTlsDirectory64>();
 
     /// Parse an `IMAGE_TLS_DIRECTORY64` from little-endian bytes.
     ///
@@ -110,38 +161,39 @@ impl TlsDirectory64 {
     ///
     /// Returns an error if `data` is shorter than [`Self::SIZE`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let Some(data) = data.first_chunk::<{ Self::SIZE }>() else {
-            return Err(Error::buffer_too_small(Self::SIZE, data.len()));
+        type D = ImageTlsDirectory64;
+        const N: usize = TlsDirectory64::SIZE;
+        let Some(raw) = data.first_chunk::<N>() else {
+            return Err(Error::buffer_too_small(N, data.len()));
         };
 
         Ok(Self {
-            start_address_of_raw_data: u64::from_le_bytes([
-                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-            ]),
-            end_address_of_raw_data: u64::from_le_bytes([
-                data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
-            ]),
-            address_of_index: u64::from_le_bytes([
-                data[16], data[17], data[18], data[19], data[20], data[21], data[22], data[23],
-            ]),
-            address_of_callbacks: u64::from_le_bytes([
-                data[24], data[25], data[26], data[27], data[28], data[29], data[30], data[31],
-            ]),
-            size_of_zero_fill: u32::from_le_bytes([data[32], data[33], data[34], data[35]]),
-            characteristics: u32::from_le_bytes([data[36], data[37], data[38], data[39]]),
+            start_address_of_raw_data: le_u64::<N, { offset_of!(D, start_address_of_raw_data) }>(
+                raw,
+            ),
+            end_address_of_raw_data: le_u64::<N, { offset_of!(D, end_address_of_raw_data) }>(raw),
+            address_of_index: le_u64::<N, { offset_of!(D, address_of_index) }>(raw),
+            address_of_callbacks: le_u64::<N, { offset_of!(D, address_of_callbacks) }>(raw),
+            size_of_zero_fill: le_u32::<N, { offset_of!(D, size_of_zero_fill) }>(raw),
+            characteristics: le_u32::<N, { offset_of!(D, characteristics) }>(raw),
         })
     }
 
     /// Encode the directory into its 40-byte little-endian representation.
     #[must_use]
     pub fn to_bytes(self) -> [u8; Self::SIZE] {
-        let mut buf = [0u8; Self::SIZE];
-        buf[0..8].copy_from_slice(&self.start_address_of_raw_data.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.end_address_of_raw_data.to_le_bytes());
-        buf[16..24].copy_from_slice(&self.address_of_index.to_le_bytes());
-        buf[24..32].copy_from_slice(&self.address_of_callbacks.to_le_bytes());
-        buf[32..36].copy_from_slice(&self.size_of_zero_fill.to_le_bytes());
-        buf[36..40].copy_from_slice(&self.characteristics.to_le_bytes());
+        type D = ImageTlsDirectory64;
+        const N: usize = TlsDirectory64::SIZE;
+        let mut buf = [0u8; N];
+        let start = self.start_address_of_raw_data;
+        put_u64::<N, { offset_of!(D, start_address_of_raw_data) }>(&mut buf, start);
+        let end = self.end_address_of_raw_data;
+        put_u64::<N, { offset_of!(D, end_address_of_raw_data) }>(&mut buf, end);
+        put_u64::<N, { offset_of!(D, address_of_index) }>(&mut buf, self.address_of_index);
+        let callbacks = self.address_of_callbacks;
+        put_u64::<N, { offset_of!(D, address_of_callbacks) }>(&mut buf, callbacks);
+        put_u32::<N, { offset_of!(D, size_of_zero_fill) }>(&mut buf, self.size_of_zero_fill);
+        put_u32::<N, { offset_of!(D, characteristics) }>(&mut buf, self.characteristics);
         buf
     }
 }
@@ -330,7 +382,13 @@ where
                 "TLS callback array VA {array_va:#x} is outside image base {image_base:#x}"
             ))
         })?;
-    let (ptr_size, ptr_stride): (usize, u32) = if is_64bit { (8, 8) } else { (4, 4) };
+    let ptr_size = if is_64bit {
+        size_of::<u64>()
+    } else {
+        size_of::<u32>()
+    };
+    let ptr_stride = u32::try_from(ptr_size)
+        .map_err(|_| Error::invalid_data_directory("TLS callback pointer size exceeds u32"))?;
     let mut callback_rvas = Vec::new();
     let mut offset = 0u32;
 
@@ -341,12 +399,15 @@ where
         let ptr_data = read_at_rva(slot_rva, ptr_size).ok_or(Error::invalid_rva(slot_rva))?;
         let too_small = || Error::buffer_too_small(ptr_size, ptr_data.len());
         let callback_address = if is_64bit {
-            u64::from_le_bytes(*ptr_data.first_chunk::<8>().ok_or_else(too_small)?)
+            ptr_data
+                .first_chunk::<{ size_of::<u64>() }>()
+                .map(le_u64::<{ size_of::<u64>() }, 0>)
         } else {
-            u64::from(u32::from_le_bytes(
-                *ptr_data.first_chunk::<4>().ok_or_else(too_small)?,
-            ))
-        };
+            ptr_data
+                .first_chunk::<{ size_of::<u32>() }>()
+                .map(|raw| u64::from(le_u32::<{ size_of::<u32>() }, 0>(raw)))
+        }
+        .ok_or_else(too_small)?;
 
         // Null terminator.
         if callback_address == 0 {
@@ -559,7 +620,7 @@ impl TlsBuilder {
         )?;
 
         // Write the TLS index (initialized to 0).
-        data.extend_from_slice(&0u32.to_le_bytes());
+        data.write_u32_le(0)?;
         data.resize(layout.callbacks_offset, 0);
 
         // Write the callback array.
@@ -577,14 +638,14 @@ impl TlsBuilder {
 
     /// Calculate the serialized layout for `num_callbacks` callbacks.
     fn layout(&self, num_callbacks: usize) -> Result<TlsLayout> {
-        let ptr_size: usize = if self.is_64bit { 8 } else { 4 };
+        let ptr_size = self.pointer_size();
         let dir_size = if self.is_64bit {
             TlsDirectory64::SIZE
         } else {
             TlsDirectory32::SIZE
         };
         let callbacks_offset = dir_size
-            .checked_add(4)
+            .checked_add(size_of::<u32>())
             .and_then(|size| size.checked_next_multiple_of(ptr_size))
             .ok_or_else(|| Error::invalid_data_directory("TLS callback alignment overflow"))?;
         let callback_bytes = num_callbacks
@@ -651,13 +712,22 @@ impl TlsBuilder {
     /// Append one callback-array pointer in the target bitness.
     fn push_pointer(&self, data: &mut Vec<u8>, va: u64) -> Result<()> {
         if self.is_64bit {
-            data.extend_from_slice(&va.to_le_bytes());
+            data.write_u64_le(va)?;
         } else {
             let va = u32::try_from(va)
                 .map_err(|_| Error::invalid_data_directory("PE32 TLS callback VA exceeds u32"))?;
-            data.extend_from_slice(&va.to_le_bytes());
+            data.write_u32_le(va)?;
         }
         Ok(())
+    }
+
+    /// Return the size of one VA in the target bitness, in bytes.
+    const fn pointer_size(&self) -> usize {
+        if self.is_64bit {
+            size_of::<u64>()
+        } else {
+            size_of::<u32>()
+        }
     }
 
     /// Build the TLS block from an existing [`TlsInfo`].
@@ -739,13 +809,28 @@ impl TlsBuilder {
     /// `block` is a block that this builder made. The offsets are those of the directory VA
     /// fields and of the callback array entries that are not zero, in ascending order.
     pub(crate) fn va_offsets(&self, block: &[u8]) -> Vec<usize> {
-        let pointer_size = if self.is_64bit { 8 } else { 4 };
-        let directory_fields = (0..4).map(|index| index * pointer_size);
+        let pointer_size = self.pointer_size();
+        let directory_fields = if self.is_64bit {
+            [
+                offset_of!(ImageTlsDirectory64, start_address_of_raw_data),
+                offset_of!(ImageTlsDirectory64, end_address_of_raw_data),
+                offset_of!(ImageTlsDirectory64, address_of_index),
+                offset_of!(ImageTlsDirectory64, address_of_callbacks),
+            ]
+        } else {
+            [
+                offset_of!(ImageTlsDirectory32, start_address_of_raw_data),
+                offset_of!(ImageTlsDirectory32, end_address_of_raw_data),
+                offset_of!(ImageTlsDirectory32, address_of_index),
+                offset_of!(ImageTlsDirectory32, address_of_callbacks),
+            ]
+        };
         let callbacks = self
             .layout(0)
             .map_or(block.len(), |layout| layout.callbacks_offset);
         let callback_slots = (callbacks..block.len()).step_by(pointer_size);
         directory_fields
+            .into_iter()
             .chain(callback_slots)
             .filter(|&offset| {
                 block

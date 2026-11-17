@@ -53,8 +53,34 @@ mod codeview;
 pub use build::DebugBuilder;
 pub use codeview::{CV_SIGNATURE_NB10, CV_SIGNATURE_RSDS, CodeViewRsds};
 
+use core::mem::{offset_of, size_of};
+
+use crate::parse_utils::{le_u16, le_u32, put_u16, put_u32};
 use crate::prelude::*;
 use crate::{Error, Result};
+
+/// The layout of `IMAGE_DEBUG_DIRECTORY`.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the width
+/// of each field.
+#[repr(C)]
+struct ImageDebugDirectory {
+    characteristics: u32,
+    time_date_stamp: u32,
+    major_version: u16,
+    minor_version: u16,
+    r#type: u32,
+    size_of_data: u32,
+    address_of_raw_data: u32,
+    pointer_to_raw_data: u32,
+}
+
+const _: () = {
+    assert!(size_of::<ImageDebugDirectory>() == 0x1c);
+    assert!(offset_of!(ImageDebugDirectory, r#type) == 0x0c);
+    assert!(offset_of!(ImageDebugDirectory, pointer_to_raw_data) == 0x18);
+    assert!(DebugDirectory::SIZE_U32 as usize == DebugDirectory::SIZE);
+};
 
 /// Debug types (`IMAGE_DEBUG_TYPE_*`).
 ///
@@ -173,43 +199,47 @@ pub struct DebugDirectory {
 
 impl DebugDirectory {
     /// Size of one `IMAGE_DEBUG_DIRECTORY` entry in bytes.
-    pub const SIZE: usize = 28;
-    /// [`Self::SIZE`] as a `u32`.
-    const SIZE_U32: u32 = 28;
+    pub const SIZE: usize = size_of::<ImageDebugDirectory>();
+    /// [`Self::SIZE`] as a `u32`. A compile-time assertion keeps it equal to [`Self::SIZE`].
+    const SIZE_U32: u32 = 0x1c;
 
     /// Parse an entry from little-endian bytes.
     ///
     /// # Errors
     /// Returns an error if `data` is shorter than [`Self::SIZE`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let Some(data) = data.first_chunk::<{ Self::SIZE }>() else {
-            return Err(Error::buffer_too_small(Self::SIZE, data.len()));
+        type D = ImageDebugDirectory;
+        const N: usize = DebugDirectory::SIZE;
+        let Some(raw) = data.first_chunk::<N>() else {
+            return Err(Error::buffer_too_small(N, data.len()));
         };
 
         Ok(Self {
-            characteristics: u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
-            time_date_stamp: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
-            major_version: u16::from_le_bytes([data[8], data[9]]),
-            minor_version: u16::from_le_bytes([data[10], data[11]]),
-            debug_type: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
-            size_of_data: u32::from_le_bytes([data[16], data[17], data[18], data[19]]),
-            address_of_raw_data: u32::from_le_bytes([data[20], data[21], data[22], data[23]]),
-            pointer_to_raw_data: u32::from_le_bytes([data[24], data[25], data[26], data[27]]),
+            characteristics: le_u32::<N, { offset_of!(D, characteristics) }>(raw),
+            time_date_stamp: le_u32::<N, { offset_of!(D, time_date_stamp) }>(raw),
+            major_version: le_u16::<N, { offset_of!(D, major_version) }>(raw),
+            minor_version: le_u16::<N, { offset_of!(D, minor_version) }>(raw),
+            debug_type: le_u32::<N, { offset_of!(D, r#type) }>(raw),
+            size_of_data: le_u32::<N, { offset_of!(D, size_of_data) }>(raw),
+            address_of_raw_data: le_u32::<N, { offset_of!(D, address_of_raw_data) }>(raw),
+            pointer_to_raw_data: le_u32::<N, { offset_of!(D, pointer_to_raw_data) }>(raw),
         })
     }
 
     /// Serialize to little-endian bytes.
     #[must_use]
     pub fn to_bytes(self) -> [u8; Self::SIZE] {
-        let mut buf = [0u8; Self::SIZE];
-        buf[0..4].copy_from_slice(&self.characteristics.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.time_date_stamp.to_le_bytes());
-        buf[8..10].copy_from_slice(&self.major_version.to_le_bytes());
-        buf[10..12].copy_from_slice(&self.minor_version.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.debug_type.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.size_of_data.to_le_bytes());
-        buf[20..24].copy_from_slice(&self.address_of_raw_data.to_le_bytes());
-        buf[24..28].copy_from_slice(&self.pointer_to_raw_data.to_le_bytes());
+        type D = ImageDebugDirectory;
+        const N: usize = DebugDirectory::SIZE;
+        let mut buf = [0u8; N];
+        put_u32::<N, { offset_of!(D, characteristics) }>(&mut buf, self.characteristics);
+        put_u32::<N, { offset_of!(D, time_date_stamp) }>(&mut buf, self.time_date_stamp);
+        put_u16::<N, { offset_of!(D, major_version) }>(&mut buf, self.major_version);
+        put_u16::<N, { offset_of!(D, minor_version) }>(&mut buf, self.minor_version);
+        put_u32::<N, { offset_of!(D, r#type) }>(&mut buf, self.debug_type);
+        put_u32::<N, { offset_of!(D, size_of_data) }>(&mut buf, self.size_of_data);
+        put_u32::<N, { offset_of!(D, address_of_raw_data) }>(&mut buf, self.address_of_raw_data);
+        put_u32::<N, { offset_of!(D, pointer_to_raw_data) }>(&mut buf, self.pointer_to_raw_data);
         buf
     }
 
