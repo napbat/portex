@@ -6,20 +6,11 @@ use crate::parse_utils::{le_u32, put_u32};
 use crate::prelude::*;
 use crate::{Error, Result};
 
-/// The layout of `IMAGE_ARM_RUNTIME_FUNCTION_ENTRY`.
-///
-/// The `UnwindData` union is one `u32`. Portex does not read the structure through this type.
-/// The type gives the offset and the width of each field.
-#[repr(C)]
-struct ImageArmRuntimeFunctionEntry {
-    begin_address: u32,
-    unwind_data: u32,
-}
-
 /// The layout of `IMAGE_ARM64_RUNTIME_FUNCTION_ENTRY`.
 ///
-/// The `UnwindData` union is one `u32`. Portex does not read the structure through this type.
-/// The type gives the offset and the width of each field.
+/// `IMAGE_ARM_RUNTIME_FUNCTION_ENTRY` has the same layout, so one record type serves both
+/// architectures. The `UnwindData` union is one `u32`. Portex does not read the structure
+/// through this type. The type gives the offset and the width of each field.
 #[repr(C)]
 struct ImageArm64RuntimeFunctionEntry {
     begin_address: u32,
@@ -27,19 +18,8 @@ struct ImageArm64RuntimeFunctionEntry {
 }
 
 const _: () = {
-    assert!(size_of::<ImageArmRuntimeFunctionEntry>() == 8);
-    assert!(offset_of!(ImageArmRuntimeFunctionEntry, unwind_data) == 4);
     assert!(size_of::<ImageArm64RuntimeFunctionEntry>() == 8);
     assert!(offset_of!(ImageArm64RuntimeFunctionEntry, unwind_data) == 4);
-    // One record type serves both architectures.
-    assert!(
-        offset_of!(ImageArmRuntimeFunctionEntry, begin_address)
-            == offset_of!(ImageArm64RuntimeFunctionEntry, begin_address)
-    );
-    assert!(
-        offset_of!(ImageArmRuntimeFunctionEntry, unwind_data)
-            == offset_of!(ImageArm64RuntimeFunctionEntry, unwind_data)
-    );
 };
 
 /// An ARM or ARM64 `.pdata` record of 8 bytes.
