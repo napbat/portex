@@ -5,6 +5,97 @@ use nostdio::ReadLe;
 use crate::prelude::*;
 use crate::{Error, Result};
 
+/// Return the `W` bytes at offset `O` of the fixed-size structure `raw`.
+///
+/// A compile-time assertion proves that the field is in `raw`, so the fallback never runs.
+fn field<const N: usize, const O: usize, const W: usize>(raw: &[u8; N]) -> [u8; W] {
+    const { assert!(O + W <= N) }
+    raw.get(O..)
+        .and_then(<[u8]>::first_chunk::<W>)
+        .copied()
+        .unwrap_or([0; W])
+}
+
+/// Write `bytes` at offset `O` of the fixed-size structure `raw`.
+///
+/// A compile-time assertion proves that the field is in `raw`, so the write always occurs.
+fn put<const N: usize, const O: usize, const W: usize>(raw: &mut [u8; N], bytes: [u8; W]) {
+    const { assert!(O + W <= N) }
+    if let Some(field) = raw.get_mut(O..).and_then(<[u8]>::first_chunk_mut::<W>) {
+        *field = bytes;
+    }
+}
+
+/// Return the structure size `size` as a `u32`, for a `const` item.
+///
+/// A `const fn` cannot call `u32::try_from`, and an `as` cast can truncate. Thus the function
+/// counts up. Call it only in a `const` item: there, a size that does not fit in `u32` stops the
+/// build.
+pub(crate) const fn size_u32(size: usize) -> u32 {
+    let mut value: u32 = 0;
+    let mut rest = size;
+    while rest > 0 {
+        value += 1;
+        rest -= 1;
+    }
+    value
+}
+
+/// Copy the available prefix of a fixed-size structure into a zeroed array.
+///
+/// Return the array and the number of bytes that `data` holds, at most `N`. A field of the
+/// structure is present if it ends at or before this number. Use this function where Portex
+/// tolerates a structure that ends early. Where a short structure is an error, take
+/// `data.first_chunk::<N>()` instead.
+pub(crate) fn zero_extended<const N: usize>(data: &[u8]) -> ([u8; N], usize) {
+    let mut raw = [0; N];
+    let available = data.len().min(N);
+    for (dst, src) in raw.iter_mut().zip(data) {
+        *dst = *src;
+    }
+    (raw, available)
+}
+
+/// Return the byte at offset `O` of the fixed-size structure `raw`.
+pub(crate) fn le_u8<const N: usize, const O: usize>(raw: &[u8; N]) -> u8 {
+    u8::from_le_bytes(field::<N, O, 1>(raw))
+}
+
+/// Return the little-endian `u16` at offset `O` of the fixed-size structure `raw`.
+pub(crate) fn le_u16<const N: usize, const O: usize>(raw: &[u8; N]) -> u16 {
+    u16::from_le_bytes(field::<N, O, 2>(raw))
+}
+
+/// Return the little-endian `u32` at offset `O` of the fixed-size structure `raw`.
+pub(crate) fn le_u32<const N: usize, const O: usize>(raw: &[u8; N]) -> u32 {
+    u32::from_le_bytes(field::<N, O, 4>(raw))
+}
+
+/// Return the little-endian `u64` at offset `O` of the fixed-size structure `raw`.
+pub(crate) fn le_u64<const N: usize, const O: usize>(raw: &[u8; N]) -> u64 {
+    u64::from_le_bytes(field::<N, O, 8>(raw))
+}
+
+/// Write the byte `value` at offset `O` of the fixed-size structure `raw`.
+pub(crate) fn put_u8<const N: usize, const O: usize>(raw: &mut [u8; N], value: u8) {
+    put::<N, O, 1>(raw, value.to_le_bytes());
+}
+
+/// Write the little-endian `u16` `value` at offset `O` of the fixed-size structure `raw`.
+pub(crate) fn put_u16<const N: usize, const O: usize>(raw: &mut [u8; N], value: u16) {
+    put::<N, O, 2>(raw, value.to_le_bytes());
+}
+
+/// Write the little-endian `u32` `value` at offset `O` of the fixed-size structure `raw`.
+pub(crate) fn put_u32<const N: usize, const O: usize>(raw: &mut [u8; N], value: u32) {
+    put::<N, O, 4>(raw, value.to_le_bytes());
+}
+
+/// Write the little-endian `u64` `value` at offset `O` of the fixed-size structure `raw`.
+pub(crate) fn put_u64<const N: usize, const O: usize>(raw: &mut [u8; N], value: u64) {
+    put::<N, O, 8>(raw, value.to_le_bytes());
+}
+
 /// Read the little-endian `u16` at `offset` of `data` with `nostdio`.
 ///
 /// Return `None` if `data` does not hold the complete value.
