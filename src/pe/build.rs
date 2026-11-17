@@ -664,7 +664,8 @@ impl PeImage {
 }
 
 /// The offset of `PointerToRawData` in `IMAGE_DEBUG_DIRECTORY`.
-const DEBUG_POINTER_FIELD: usize = 24;
+const DEBUG_POINTER_FIELD: usize =
+    core::mem::offset_of!(crate::debug::ImageDebugDirectory, pointer_to_raw_data);
 
 /// A `PointerToRawData` field of an `IMAGE_DEBUG_DIRECTORY` entry, before a layout update.
 pub(super) struct DebugPointer {

@@ -117,8 +117,8 @@ pub const NUMBER_OF_DIRECTORY_ENTRIES: usize = 16;
 /// width of each field.
 #[repr(C)]
 pub(crate) struct ImageDataDirectory {
-    virtual_address: u32,
-    size: u32,
+    pub(crate) virtual_address: u32,
+    pub(crate) size: u32,
 }
 
 // Anchors from `winnt.h` that the layout must keep.

@@ -7,6 +7,7 @@
 use super::{NormalizeKept, PAGE_SIZE, loader_virtual_size};
 use crate::data_dir::{DataDirectory, DataDirectoryType};
 use crate::debug::DebugDirectory;
+use crate::debug::ImageDebugDirectory;
 use crate::delay_import::{DelayImportDirectory, DelayLoadDescriptor};
 use crate::import::{ImportDescriptor, ImportTable, ImportThunk};
 use crate::layout::{checked_align_up, loader_raw_offset};
@@ -20,10 +21,10 @@ use core::ops::Range;
 
 /// The offset of the `PointerToRawData` field in an `IMAGE_DEBUG_DIRECTORY` entry. This field
 /// is a file offset.
-const DEBUG_POINTER_OFFSET: usize = 24;
+const DEBUG_POINTER_OFFSET: usize = core::mem::offset_of!(ImageDebugDirectory, pointer_to_raw_data);
 
-/// The size of the `PointerToRawData` field in an `IMAGE_DEBUG_DIRECTORY` entry.
-const DEBUG_POINTER_SIZE: usize = 4;
+/// The size of the `PointerToRawData` field (a `DWORD`) in an `IMAGE_DEBUG_DIRECTORY` entry.
+const DEBUG_POINTER_SIZE: usize = size_of::<u32>();
 
 /// The largest number of thunks that [`followed_ranges`] follows in the name tables of the
 /// `Import` and `DelayImport` tables together. Each name table counts once.
