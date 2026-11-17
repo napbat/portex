@@ -11,6 +11,11 @@ pub use crate::debug::{CodeViewRsds, DebugBuilder, DebugDirectory, DebugInfo, De
 pub use crate::delay_import::{
     DelayImportBuilder, DelayImportDirectory, DelayLoadDescriptor, DelayLoadedDll,
 };
+pub use crate::dynamic_reloc::{
+    DynamicRelocation, DynamicRelocationBlock, DynamicRelocationBlocks, DynamicRelocationBody,
+    DynamicRelocationEntries, DynamicRelocationTable, DynamicRelocations, FunctionOverride,
+    FunctionOverrideHeader, FunctionOverrides,
+};
 pub use crate::exception::{
     ExceptionBuilder, ExceptionDirectory, ExceptionTable, PackedExceptionDirectory,
     PackedRuntimeFunction, RuntimeFunction, UnwindCode, UnwindInfo, UnwindOpCode,

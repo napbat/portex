@@ -107,6 +107,7 @@ pub mod debug;
 pub mod delay_import;
 pub mod directories;
 pub mod dos;
+pub mod dynamic_reloc;
 pub mod error;
 pub mod exception;
 pub mod export;
@@ -143,6 +144,11 @@ pub use delay_import::{
     DelayImportBuilder, DelayImportDirectory, DelayLoadDescriptor, DelayLoadedDll,
 };
 pub use dos::DosHeader;
+pub use dynamic_reloc::{
+    DynamicRelocation, DynamicRelocationBlock, DynamicRelocationBlocks, DynamicRelocationBody,
+    DynamicRelocationEntries, DynamicRelocationTable, DynamicRelocations, FunctionOverride,
+    FunctionOverrideHeader, FunctionOverrides,
+};
 pub use error::{Error, ErrorContext, ErrorKind, Result};
 pub use exception::{
     ExceptionBuilder, ExceptionDirectory, ExceptionTable, PackedExceptionDirectory,

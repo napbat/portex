@@ -55,6 +55,18 @@
 
 use crate::{Error, Result};
 
+/// The layout of `IMAGE_BASE_RELOCATION`, the header of one base relocation block.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the
+/// width of each field.
+#[repr(C)]
+pub(crate) struct ImageBaseRelocation {
+    pub(crate) virtual_address: u32,
+    pub(crate) size_of_block: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<ImageBaseRelocation>() == 8);
+
 /// Base relocation types (`IMAGE_REL_BASED_*`): the high 4 bits of a relocation entry.
 ///
 /// A later version of the crate can add a named variant for a code that is now

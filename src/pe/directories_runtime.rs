@@ -507,6 +507,66 @@ impl PeImage {
         )?))
     }
 
+    /// Read the dynamic value relocation table that `config` locates.
+    ///
+    /// The load configuration states the table by the one-based section number
+    /// `DynamicValueRelocTableSection` and the offset `DynamicValueRelocTableOffset` in that
+    /// section. `config` selects 32-bit or 64-bit symbols. See
+    /// [`DynamicRelocationTable`](crate::dynamic_reloc::DynamicRelocationTable).
+    ///
+    /// Returns `Ok(None)` if the section number and the offset are zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error in these conditions:
+    ///
+    /// - `InvalidDataDirectory`: `config` locates the table by the VA in
+    ///   `DynamicValueRelocTable`. Portex does not read this older form.
+    /// - `InvalidSection`: the section number is zero with an offset that is not zero, or it
+    ///   does not name a section.
+    /// - `InvalidRva`: the image does not hold the table header, or the records of a version-1
+    ///   table. The RVA is the RVA of the structure that the image does not hold.
+    pub fn dynamic_relocation_table(
+        &self,
+        config: &crate::load_config::LoadConfigDirectory,
+    ) -> Result<Option<crate::dynamic_reloc::DynamicRelocationTable>> {
+        use crate::load_config::LoadConfigField;
+
+        if config.va(LoadConfigField::DynamicValueRelocTable).is_some() {
+            return Err(Error::invalid_data_directory(
+                "the load configuration locates the dynamic value relocation table by VA",
+            ));
+        }
+        let section = config
+            .field(LoadConfigField::DynamicValueRelocTableSection)
+            .unwrap_or(0);
+        let offset = config
+            .field(LoadConfigField::DynamicValueRelocTableOffset)
+            .unwrap_or(0);
+        if section == 0 && offset == 0 {
+            return Ok(None);
+        }
+        let start = section
+            .checked_sub(1)
+            .and_then(|index| usize::try_from(index).ok())
+            .and_then(|index| self.sections.get(index))
+            .ok_or_else(|| {
+                Error::invalid_section(format!(
+                    "the dynamic value relocation table names section {section}"
+                ))
+            })?
+            .header
+            .virtual_address;
+        let rva = u32::try_from(offset)
+            .ok()
+            .and_then(|offset| start.checked_add(offset))
+            .ok_or_else(|| Error::invalid_rva(start))?;
+        crate::dynamic_reloc::DynamicRelocationTable::read(rva, config.is_64bit(), |rva, len| {
+            self.read_rva(rva, len)
+        })
+        .map(Some)
+    }
+
     /// Write the load config directory (`IMAGE_LOAD_CONFIG_DIRECTORY32` or
     /// `IMAGE_LOAD_CONFIG_DIRECTORY64`).
     ///

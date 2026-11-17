@@ -18,8 +18,12 @@ a different source offset.
 - Exception tables for x64, ARM and ARM64.
 - Raw views for patch tools: import, export, relocation, exception, resource and load
   configuration records with the buffer offset of each field, and strict header reads.
-- A load configuration that is limited by its declared size, also with legacy prefixes. A
-  partial field is an error. A field that is fully absent stays zero.
+- A load configuration with every field of the Windows SDK 10.0.26100 layout. Its declared
+  size limits it, also with legacy prefixes. A partial field is an error. A field that is fully
+  absent stays zero, and `LoadConfigDirectory::field` returns `None` for it.
+- The dynamic value relocation table (DVRT) that the load configuration locates: version-1
+  records, base relocation blocks, and function override records. Portex reads the structure
+  only. It does not give a meaning to the entry bits.
 - Serialization of x64 unwind data with borrowed handler data for a different language, through
   `UnwindInfo::try_to_bytes_with_handler_data`.
 - Rich headers, the CLR/CLI header of the PE image, and the raw metadata blob.
