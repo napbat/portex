@@ -1,7 +1,11 @@
 //! Optional header (`IMAGE_OPTIONAL_HEADER32` and `IMAGE_OPTIONAL_HEADER64`) structures and
 //! parsing.
 
-use crate::data_dir::{DataDirectory, NUMBER_OF_DIRECTORY_ENTRIES};
+use core::mem::{offset_of, size_of};
+
+use crate::coff::ImageFileHeader;
+use crate::data_dir::{DataDirectory, ImageDataDirectory, NUMBER_OF_DIRECTORY_ENTRIES};
+use crate::parse_utils::{le_u8, le_u16, le_u32, le_u64, put_u8, put_u16, put_u32, put_u64};
 use crate::prelude::*;
 use crate::reader::ReadAt;
 use crate::{Error, Result};
@@ -101,6 +105,148 @@ pub mod dll_characteristics {
     pub const GUARD_CF: u16 = 0x4000;
     /// `IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE`: the image is Terminal Server aware.
     pub const TERMINAL_SERVER_AWARE: u16 = 0x8000;
+}
+
+/// The layout of `IMAGE_OPTIONAL_HEADER32`.
+///
+/// The fixed part ends at `data_directory`. The file can hold fewer entries than the array.
+/// Portex does not read the structure through this type. The type gives the offset and the
+/// width of each field.
+#[repr(C)]
+pub(crate) struct ImageOptionalHeader32 {
+    pub(crate) magic: u16,
+    pub(crate) major_linker_version: u8,
+    pub(crate) minor_linker_version: u8,
+    pub(crate) size_of_code: u32,
+    pub(crate) size_of_initialized_data: u32,
+    pub(crate) size_of_uninitialized_data: u32,
+    pub(crate) address_of_entry_point: u32,
+    pub(crate) base_of_code: u32,
+    pub(crate) base_of_data: u32,
+    pub(crate) image_base: u32,
+    pub(crate) section_alignment: u32,
+    pub(crate) file_alignment: u32,
+    pub(crate) major_operating_system_version: u16,
+    pub(crate) minor_operating_system_version: u16,
+    pub(crate) major_image_version: u16,
+    pub(crate) minor_image_version: u16,
+    pub(crate) major_subsystem_version: u16,
+    pub(crate) minor_subsystem_version: u16,
+    pub(crate) win32_version_value: u32,
+    pub(crate) size_of_image: u32,
+    pub(crate) size_of_headers: u32,
+    pub(crate) check_sum: u32,
+    pub(crate) subsystem: u16,
+    pub(crate) dll_characteristics: u16,
+    pub(crate) size_of_stack_reserve: u32,
+    pub(crate) size_of_stack_commit: u32,
+    pub(crate) size_of_heap_reserve: u32,
+    pub(crate) size_of_heap_commit: u32,
+    pub(crate) loader_flags: u32,
+    pub(crate) number_of_rva_and_sizes: u32,
+    pub(crate) data_directory: [ImageDataDirectory; NUMBER_OF_DIRECTORY_ENTRIES],
+}
+
+/// The layout of `IMAGE_OPTIONAL_HEADER64`.
+///
+/// The fixed part ends at `data_directory`. The file can hold fewer entries than the array.
+/// Portex does not read the structure through this type. The type gives the offset and the
+/// width of each field.
+#[repr(C)]
+pub(crate) struct ImageOptionalHeader64 {
+    pub(crate) magic: u16,
+    pub(crate) major_linker_version: u8,
+    pub(crate) minor_linker_version: u8,
+    pub(crate) size_of_code: u32,
+    pub(crate) size_of_initialized_data: u32,
+    pub(crate) size_of_uninitialized_data: u32,
+    pub(crate) address_of_entry_point: u32,
+    pub(crate) base_of_code: u32,
+    pub(crate) image_base: u64,
+    pub(crate) section_alignment: u32,
+    pub(crate) file_alignment: u32,
+    pub(crate) major_operating_system_version: u16,
+    pub(crate) minor_operating_system_version: u16,
+    pub(crate) major_image_version: u16,
+    pub(crate) minor_image_version: u16,
+    pub(crate) major_subsystem_version: u16,
+    pub(crate) minor_subsystem_version: u16,
+    pub(crate) win32_version_value: u32,
+    pub(crate) size_of_image: u32,
+    pub(crate) size_of_headers: u32,
+    pub(crate) check_sum: u32,
+    pub(crate) subsystem: u16,
+    pub(crate) dll_characteristics: u16,
+    pub(crate) size_of_stack_reserve: u64,
+    pub(crate) size_of_stack_commit: u64,
+    pub(crate) size_of_heap_reserve: u64,
+    pub(crate) size_of_heap_commit: u64,
+    pub(crate) loader_flags: u32,
+    pub(crate) number_of_rva_and_sizes: u32,
+    pub(crate) data_directory: [ImageDataDirectory; NUMBER_OF_DIRECTORY_ENTRIES],
+}
+
+/// The layout of `IMAGE_NT_HEADERS32`: the PE signature, the COFF file header and the PE32
+/// optional header.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the
+/// width of each field.
+#[repr(C)]
+pub(crate) struct ImageNtHeaders32 {
+    pub(crate) signature: u32,
+    pub(crate) file_header: ImageFileHeader,
+    pub(crate) optional_header: ImageOptionalHeader32,
+}
+
+/// The layout of `IMAGE_NT_HEADERS64`: the PE signature, the COFF file header and the PE32+
+/// optional header.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the
+/// width of each field.
+#[repr(C)]
+pub(crate) struct ImageNtHeaders64 {
+    pub(crate) signature: u32,
+    pub(crate) file_header: ImageFileHeader,
+    pub(crate) optional_header: ImageOptionalHeader64,
+}
+
+// Anchors from `winnt.h` that the layouts must keep.
+const _: () = {
+    assert!(size_of::<ImageOptionalHeader32>() == 0xe0);
+    assert!(offset_of!(ImageOptionalHeader32, image_base) == 0x1c);
+    assert!(offset_of!(ImageOptionalHeader32, check_sum) == 0x40);
+    assert!(offset_of!(ImageOptionalHeader32, data_directory) == 0x60);
+    assert!(size_of::<ImageOptionalHeader64>() == 0xf0);
+    assert!(offset_of!(ImageOptionalHeader64, image_base) == 0x18);
+    assert!(offset_of!(ImageOptionalHeader64, check_sum) == 0x40);
+    assert!(offset_of!(ImageOptionalHeader64, data_directory) == 0x70);
+    assert!(offset_of!(ImageNtHeaders32, optional_header) == 0x18);
+    assert!(offset_of!(ImageNtHeaders64, optional_header) == 0x18);
+    assert!(size_of::<ImageNtHeaders32>() == 0xf8);
+    assert!(size_of::<ImageNtHeaders64>() == 0x108);
+};
+
+/// Decode the fixed part `$raw` (`[u8; $n]`) of an optional header with the layout `$layout`.
+///
+/// Each field `$field: $read` reads `$field` with `$read`. The data directories stay empty.
+macro_rules! decode_fields {
+    ($raw:ident, $n:expr, $layout:ty, { $($field:ident: $read:ident),+ $(,)? }) => {
+        Self {
+            $($field: $read::<{ $n }, { offset_of!($layout, $field) }>($raw),)+
+            data_directories: Vec::new(),
+        }
+    };
+}
+
+/// Encode the fixed part of the optional header `$header` into a `[u8; $n]` array.
+///
+/// Each field `$field: $put` writes `$field` at its offset in `$layout` with `$put`.
+macro_rules! encode_fields {
+    ($header:ident, $n:expr, $layout:ty, { $($field:ident: $put:ident),+ $(,)? }) => {{
+        let mut raw = [0u8; $n];
+        $($put::<{ $n }, { offset_of!($layout, $field) }>(&mut raw, $header.$field);)+
+        raw
+    }};
 }
 
 /// The PE32 optional header (`IMAGE_OPTIONAL_HEADER32`).
@@ -252,7 +398,7 @@ pub enum OptionalHeader {
 
 impl OptionalHeader32 {
     /// Size in bytes of the fixed part of the header, excluding data directories.
-    pub const BASE_SIZE: usize = 96;
+    pub const BASE_SIZE: usize = offset_of!(ImageOptionalHeader32, data_directory);
 
     /// Parse a PE32 optional header and its data directories.
     ///
@@ -277,46 +423,45 @@ impl OptionalHeader32 {
             return Err(Error::buffer_too_small(Self::BASE_SIZE, len));
         };
 
-        let magic = u16::from_le_bytes([data[0], data[1]]);
-        let number_of_rva_and_sizes = u32::from_le_bytes([data[92], data[93], data[94], data[95]]);
-        let data_directories =
-            parse_data_directories(number_of_rva_and_sizes, Self::BASE_SIZE, dir_bytes, len)?;
-
-        Ok(Self {
-            magic,
-            major_linker_version: data[2],
-            minor_linker_version: data[3],
-            size_of_code: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
-            size_of_initialized_data: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
-            size_of_uninitialized_data: u32::from_le_bytes([
-                data[12], data[13], data[14], data[15],
-            ]),
-            address_of_entry_point: u32::from_le_bytes([data[16], data[17], data[18], data[19]]),
-            base_of_code: u32::from_le_bytes([data[20], data[21], data[22], data[23]]),
-            base_of_data: u32::from_le_bytes([data[24], data[25], data[26], data[27]]),
-            image_base: u32::from_le_bytes([data[28], data[29], data[30], data[31]]),
-            section_alignment: u32::from_le_bytes([data[32], data[33], data[34], data[35]]),
-            file_alignment: u32::from_le_bytes([data[36], data[37], data[38], data[39]]),
-            major_operating_system_version: u16::from_le_bytes([data[40], data[41]]),
-            minor_operating_system_version: u16::from_le_bytes([data[42], data[43]]),
-            major_image_version: u16::from_le_bytes([data[44], data[45]]),
-            minor_image_version: u16::from_le_bytes([data[46], data[47]]),
-            major_subsystem_version: u16::from_le_bytes([data[48], data[49]]),
-            minor_subsystem_version: u16::from_le_bytes([data[50], data[51]]),
-            win32_version_value: u32::from_le_bytes([data[52], data[53], data[54], data[55]]),
-            size_of_image: u32::from_le_bytes([data[56], data[57], data[58], data[59]]),
-            size_of_headers: u32::from_le_bytes([data[60], data[61], data[62], data[63]]),
-            check_sum: u32::from_le_bytes([data[64], data[65], data[66], data[67]]),
-            subsystem: u16::from_le_bytes([data[68], data[69]]),
-            dll_characteristics: u16::from_le_bytes([data[70], data[71]]),
-            size_of_stack_reserve: u32::from_le_bytes([data[72], data[73], data[74], data[75]]),
-            size_of_stack_commit: u32::from_le_bytes([data[76], data[77], data[78], data[79]]),
-            size_of_heap_reserve: u32::from_le_bytes([data[80], data[81], data[82], data[83]]),
-            size_of_heap_commit: u32::from_le_bytes([data[84], data[85], data[86], data[87]]),
-            loader_flags: u32::from_le_bytes([data[88], data[89], data[90], data[91]]),
-            number_of_rva_and_sizes,
-            data_directories,
-        })
+        let mut header = decode_fields!(data, OptionalHeader32::BASE_SIZE, ImageOptionalHeader32, {
+            magic: le_u16,
+            major_linker_version: le_u8,
+            minor_linker_version: le_u8,
+            size_of_code: le_u32,
+            size_of_initialized_data: le_u32,
+            size_of_uninitialized_data: le_u32,
+            address_of_entry_point: le_u32,
+            base_of_code: le_u32,
+            base_of_data: le_u32,
+            image_base: le_u32,
+            section_alignment: le_u32,
+            file_alignment: le_u32,
+            major_operating_system_version: le_u16,
+            minor_operating_system_version: le_u16,
+            major_image_version: le_u16,
+            minor_image_version: le_u16,
+            major_subsystem_version: le_u16,
+            minor_subsystem_version: le_u16,
+            win32_version_value: le_u32,
+            size_of_image: le_u32,
+            size_of_headers: le_u32,
+            check_sum: le_u32,
+            subsystem: le_u16,
+            dll_characteristics: le_u16,
+            size_of_stack_reserve: le_u32,
+            size_of_stack_commit: le_u32,
+            size_of_heap_reserve: le_u32,
+            size_of_heap_commit: le_u32,
+            loader_flags: le_u32,
+            number_of_rva_and_sizes: le_u32,
+        });
+        header.data_directories = parse_data_directories(
+            header.number_of_rva_and_sizes,
+            Self::BASE_SIZE,
+            dir_bytes,
+            len,
+        )?;
+        Ok(header)
     }
 
     /// Return the serialized size in bytes, including the data directories.
@@ -346,38 +491,38 @@ impl OptionalHeader32 {
 
     /// Encode the fixed part of the header, without the data directories.
     fn encode_fixed(&self) -> [u8; Self::BASE_SIZE] {
-        let mut buf = [0u8; Self::BASE_SIZE];
-        buf[0..2].copy_from_slice(&self.magic.to_le_bytes());
-        buf[2] = self.major_linker_version;
-        buf[3] = self.minor_linker_version;
-        buf[4..8].copy_from_slice(&self.size_of_code.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.size_of_initialized_data.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.size_of_uninitialized_data.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.address_of_entry_point.to_le_bytes());
-        buf[20..24].copy_from_slice(&self.base_of_code.to_le_bytes());
-        buf[24..28].copy_from_slice(&self.base_of_data.to_le_bytes());
-        buf[28..32].copy_from_slice(&self.image_base.to_le_bytes());
-        buf[32..36].copy_from_slice(&self.section_alignment.to_le_bytes());
-        buf[36..40].copy_from_slice(&self.file_alignment.to_le_bytes());
-        buf[40..42].copy_from_slice(&self.major_operating_system_version.to_le_bytes());
-        buf[42..44].copy_from_slice(&self.minor_operating_system_version.to_le_bytes());
-        buf[44..46].copy_from_slice(&self.major_image_version.to_le_bytes());
-        buf[46..48].copy_from_slice(&self.minor_image_version.to_le_bytes());
-        buf[48..50].copy_from_slice(&self.major_subsystem_version.to_le_bytes());
-        buf[50..52].copy_from_slice(&self.minor_subsystem_version.to_le_bytes());
-        buf[52..56].copy_from_slice(&self.win32_version_value.to_le_bytes());
-        buf[56..60].copy_from_slice(&self.size_of_image.to_le_bytes());
-        buf[60..64].copy_from_slice(&self.size_of_headers.to_le_bytes());
-        buf[64..68].copy_from_slice(&self.check_sum.to_le_bytes());
-        buf[68..70].copy_from_slice(&self.subsystem.to_le_bytes());
-        buf[70..72].copy_from_slice(&self.dll_characteristics.to_le_bytes());
-        buf[72..76].copy_from_slice(&self.size_of_stack_reserve.to_le_bytes());
-        buf[76..80].copy_from_slice(&self.size_of_stack_commit.to_le_bytes());
-        buf[80..84].copy_from_slice(&self.size_of_heap_reserve.to_le_bytes());
-        buf[84..88].copy_from_slice(&self.size_of_heap_commit.to_le_bytes());
-        buf[88..92].copy_from_slice(&self.loader_flags.to_le_bytes());
-        buf[92..96].copy_from_slice(&self.number_of_rva_and_sizes.to_le_bytes());
-        buf
+        encode_fields!(self, OptionalHeader32::BASE_SIZE, ImageOptionalHeader32, {
+            magic: put_u16,
+            major_linker_version: put_u8,
+            minor_linker_version: put_u8,
+            size_of_code: put_u32,
+            size_of_initialized_data: put_u32,
+            size_of_uninitialized_data: put_u32,
+            address_of_entry_point: put_u32,
+            base_of_code: put_u32,
+            base_of_data: put_u32,
+            image_base: put_u32,
+            section_alignment: put_u32,
+            file_alignment: put_u32,
+            major_operating_system_version: put_u16,
+            minor_operating_system_version: put_u16,
+            major_image_version: put_u16,
+            minor_image_version: put_u16,
+            major_subsystem_version: put_u16,
+            minor_subsystem_version: put_u16,
+            win32_version_value: put_u32,
+            size_of_image: put_u32,
+            size_of_headers: put_u32,
+            check_sum: put_u32,
+            subsystem: put_u16,
+            dll_characteristics: put_u16,
+            size_of_stack_reserve: put_u32,
+            size_of_stack_commit: put_u32,
+            size_of_heap_reserve: put_u32,
+            size_of_heap_commit: put_u32,
+            loader_flags: put_u32,
+            number_of_rva_and_sizes: put_u32,
+        })
     }
 
     /// Serialize the header to a byte vector.
@@ -448,7 +593,7 @@ fn encode_data_directories(dirs: &[DataDirectory], buf: &mut [u8]) {
 
 impl OptionalHeader64 {
     /// Size in bytes of the fixed part of the header, excluding data directories.
-    pub const BASE_SIZE: usize = 112;
+    pub const BASE_SIZE: usize = offset_of!(ImageOptionalHeader64, data_directory);
 
     /// Parse a PE32+ optional header and its data directories.
     ///
@@ -473,56 +618,44 @@ impl OptionalHeader64 {
             return Err(Error::buffer_too_small(Self::BASE_SIZE, len));
         };
 
-        let magic = u16::from_le_bytes([data[0], data[1]]);
-        let number_of_rva_and_sizes =
-            u32::from_le_bytes([data[108], data[109], data[110], data[111]]);
-        let data_directories =
-            parse_data_directories(number_of_rva_and_sizes, Self::BASE_SIZE, dir_bytes, len)?;
-
-        Ok(Self {
-            magic,
-            major_linker_version: data[2],
-            minor_linker_version: data[3],
-            size_of_code: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
-            size_of_initialized_data: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
-            size_of_uninitialized_data: u32::from_le_bytes([
-                data[12], data[13], data[14], data[15],
-            ]),
-            address_of_entry_point: u32::from_le_bytes([data[16], data[17], data[18], data[19]]),
-            base_of_code: u32::from_le_bytes([data[20], data[21], data[22], data[23]]),
-            image_base: u64::from_le_bytes([
-                data[24], data[25], data[26], data[27], data[28], data[29], data[30], data[31],
-            ]),
-            section_alignment: u32::from_le_bytes([data[32], data[33], data[34], data[35]]),
-            file_alignment: u32::from_le_bytes([data[36], data[37], data[38], data[39]]),
-            major_operating_system_version: u16::from_le_bytes([data[40], data[41]]),
-            minor_operating_system_version: u16::from_le_bytes([data[42], data[43]]),
-            major_image_version: u16::from_le_bytes([data[44], data[45]]),
-            minor_image_version: u16::from_le_bytes([data[46], data[47]]),
-            major_subsystem_version: u16::from_le_bytes([data[48], data[49]]),
-            minor_subsystem_version: u16::from_le_bytes([data[50], data[51]]),
-            win32_version_value: u32::from_le_bytes([data[52], data[53], data[54], data[55]]),
-            size_of_image: u32::from_le_bytes([data[56], data[57], data[58], data[59]]),
-            size_of_headers: u32::from_le_bytes([data[60], data[61], data[62], data[63]]),
-            check_sum: u32::from_le_bytes([data[64], data[65], data[66], data[67]]),
-            subsystem: u16::from_le_bytes([data[68], data[69]]),
-            dll_characteristics: u16::from_le_bytes([data[70], data[71]]),
-            size_of_stack_reserve: u64::from_le_bytes([
-                data[72], data[73], data[74], data[75], data[76], data[77], data[78], data[79],
-            ]),
-            size_of_stack_commit: u64::from_le_bytes([
-                data[80], data[81], data[82], data[83], data[84], data[85], data[86], data[87],
-            ]),
-            size_of_heap_reserve: u64::from_le_bytes([
-                data[88], data[89], data[90], data[91], data[92], data[93], data[94], data[95],
-            ]),
-            size_of_heap_commit: u64::from_le_bytes([
-                data[96], data[97], data[98], data[99], data[100], data[101], data[102], data[103],
-            ]),
-            loader_flags: u32::from_le_bytes([data[104], data[105], data[106], data[107]]),
-            number_of_rva_and_sizes,
-            data_directories,
-        })
+        let mut header = decode_fields!(data, OptionalHeader64::BASE_SIZE, ImageOptionalHeader64, {
+            magic: le_u16,
+            major_linker_version: le_u8,
+            minor_linker_version: le_u8,
+            size_of_code: le_u32,
+            size_of_initialized_data: le_u32,
+            size_of_uninitialized_data: le_u32,
+            address_of_entry_point: le_u32,
+            base_of_code: le_u32,
+            image_base: le_u64,
+            section_alignment: le_u32,
+            file_alignment: le_u32,
+            major_operating_system_version: le_u16,
+            minor_operating_system_version: le_u16,
+            major_image_version: le_u16,
+            minor_image_version: le_u16,
+            major_subsystem_version: le_u16,
+            minor_subsystem_version: le_u16,
+            win32_version_value: le_u32,
+            size_of_image: le_u32,
+            size_of_headers: le_u32,
+            check_sum: le_u32,
+            subsystem: le_u16,
+            dll_characteristics: le_u16,
+            size_of_stack_reserve: le_u64,
+            size_of_stack_commit: le_u64,
+            size_of_heap_reserve: le_u64,
+            size_of_heap_commit: le_u64,
+            loader_flags: le_u32,
+            number_of_rva_and_sizes: le_u32,
+        });
+        header.data_directories = parse_data_directories(
+            header.number_of_rva_and_sizes,
+            Self::BASE_SIZE,
+            dir_bytes,
+            len,
+        )?;
+        Ok(header)
     }
 
     /// Return the serialized size in bytes, including the data directories.
@@ -552,37 +685,37 @@ impl OptionalHeader64 {
 
     /// Encode the fixed part of the header, without the data directories.
     fn encode_fixed(&self) -> [u8; Self::BASE_SIZE] {
-        let mut buf = [0u8; Self::BASE_SIZE];
-        buf[0..2].copy_from_slice(&self.magic.to_le_bytes());
-        buf[2] = self.major_linker_version;
-        buf[3] = self.minor_linker_version;
-        buf[4..8].copy_from_slice(&self.size_of_code.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.size_of_initialized_data.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.size_of_uninitialized_data.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.address_of_entry_point.to_le_bytes());
-        buf[20..24].copy_from_slice(&self.base_of_code.to_le_bytes());
-        buf[24..32].copy_from_slice(&self.image_base.to_le_bytes());
-        buf[32..36].copy_from_slice(&self.section_alignment.to_le_bytes());
-        buf[36..40].copy_from_slice(&self.file_alignment.to_le_bytes());
-        buf[40..42].copy_from_slice(&self.major_operating_system_version.to_le_bytes());
-        buf[42..44].copy_from_slice(&self.minor_operating_system_version.to_le_bytes());
-        buf[44..46].copy_from_slice(&self.major_image_version.to_le_bytes());
-        buf[46..48].copy_from_slice(&self.minor_image_version.to_le_bytes());
-        buf[48..50].copy_from_slice(&self.major_subsystem_version.to_le_bytes());
-        buf[50..52].copy_from_slice(&self.minor_subsystem_version.to_le_bytes());
-        buf[52..56].copy_from_slice(&self.win32_version_value.to_le_bytes());
-        buf[56..60].copy_from_slice(&self.size_of_image.to_le_bytes());
-        buf[60..64].copy_from_slice(&self.size_of_headers.to_le_bytes());
-        buf[64..68].copy_from_slice(&self.check_sum.to_le_bytes());
-        buf[68..70].copy_from_slice(&self.subsystem.to_le_bytes());
-        buf[70..72].copy_from_slice(&self.dll_characteristics.to_le_bytes());
-        buf[72..80].copy_from_slice(&self.size_of_stack_reserve.to_le_bytes());
-        buf[80..88].copy_from_slice(&self.size_of_stack_commit.to_le_bytes());
-        buf[88..96].copy_from_slice(&self.size_of_heap_reserve.to_le_bytes());
-        buf[96..104].copy_from_slice(&self.size_of_heap_commit.to_le_bytes());
-        buf[104..108].copy_from_slice(&self.loader_flags.to_le_bytes());
-        buf[108..112].copy_from_slice(&self.number_of_rva_and_sizes.to_le_bytes());
-        buf
+        encode_fields!(self, OptionalHeader64::BASE_SIZE, ImageOptionalHeader64, {
+            magic: put_u16,
+            major_linker_version: put_u8,
+            minor_linker_version: put_u8,
+            size_of_code: put_u32,
+            size_of_initialized_data: put_u32,
+            size_of_uninitialized_data: put_u32,
+            address_of_entry_point: put_u32,
+            base_of_code: put_u32,
+            image_base: put_u64,
+            section_alignment: put_u32,
+            file_alignment: put_u32,
+            major_operating_system_version: put_u16,
+            minor_operating_system_version: put_u16,
+            major_image_version: put_u16,
+            minor_image_version: put_u16,
+            major_subsystem_version: put_u16,
+            minor_subsystem_version: put_u16,
+            win32_version_value: put_u32,
+            size_of_image: put_u32,
+            size_of_headers: put_u32,
+            check_sum: put_u32,
+            subsystem: put_u16,
+            dll_characteristics: put_u16,
+            size_of_stack_reserve: put_u64,
+            size_of_stack_commit: put_u64,
+            size_of_heap_reserve: put_u64,
+            size_of_heap_commit: put_u64,
+            loader_flags: put_u32,
+            number_of_rva_and_sizes: put_u32,
+        })
     }
 
     /// Serialize the header to a byte vector.
@@ -601,11 +734,12 @@ impl OptionalHeader {
     /// - Returns an invalid-magic error if `Magic` is not [`PE32_MAGIC`] or [`PE32PLUS_MAGIC`].
     /// - Returns any error from [`OptionalHeader32::parse`] or [`OptionalHeader64::parse`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let Some(&magic_bytes) = data.first_chunk::<2>() else {
-            return Err(Error::buffer_too_small(2, data.len()));
+        /// The bytes up to the end of `Magic`, the same in both layouts.
+        const MAGIC_END: usize = offset_of!(ImageOptionalHeader32, magic) + size_of::<u16>();
+        let Some(raw) = data.first_chunk::<MAGIC_END>() else {
+            return Err(Error::buffer_too_small(MAGIC_END, data.len()));
         };
-
-        let magic = u16::from_le_bytes(magic_bytes);
+        let magic = le_u16::<MAGIC_END, { offset_of!(ImageOptionalHeader32, magic) }>(raw);
         match magic {
             PE32_MAGIC => Ok(Self::Pe32(OptionalHeader32::parse(data)?)),
             PE32PLUS_MAGIC => Ok(Self::Pe32Plus(OptionalHeader64::parse(data)?)),
@@ -725,10 +859,18 @@ impl OptionalHeader {
     /// Read the PE32 or the PE32+ layout, and keep any `Magic` value.
     fn read_layout<R: ReadAt>(reader: &R, offset: u64, pe32plus: bool) -> Result<Self> {
         let (base_size, count_relative) = if pe32plus {
-            (OptionalHeader64::BASE_SIZE, 108u64)
+            (
+                OptionalHeader64::BASE_SIZE,
+                offset_of!(ImageOptionalHeader64, number_of_rva_and_sizes),
+            )
         } else {
-            (OptionalHeader32::BASE_SIZE, 92u64)
+            (
+                OptionalHeader32::BASE_SIZE,
+                offset_of!(ImageOptionalHeader32, number_of_rva_and_sizes),
+            )
         };
+        let count_relative = u64::try_from(count_relative)
+            .map_err(|_| Error::invalid_data_directory("optional-header offset overflow"))?;
         let num_dirs_offset = offset
             .checked_add(count_relative)
             .ok_or_else(|| Error::invalid_data_directory("optional-header offset overflow"))?;

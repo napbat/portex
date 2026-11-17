@@ -1,5 +1,8 @@
 //! Data directory structures and parsing.
 
+use core::mem::{offset_of, size_of};
+
+use crate::parse_utils::{le_u32, put_u32};
 use crate::prelude::*;
 use crate::reader::ReadAt;
 use crate::{Error, Result};
@@ -108,6 +111,22 @@ impl DataDirectoryType {
 /// optional header can declare fewer entries in `NumberOfRvaAndSizes`.
 pub const NUMBER_OF_DIRECTORY_ENTRIES: usize = 16;
 
+/// The layout of `IMAGE_DATA_DIRECTORY`.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the
+/// width of each field.
+#[repr(C)]
+pub(crate) struct ImageDataDirectory {
+    virtual_address: u32,
+    size: u32,
+}
+
+// Anchors from `winnt.h` that the layout must keep.
+const _: () = {
+    assert!(size_of::<ImageDataDirectory>() == 8);
+    assert!(offset_of!(ImageDataDirectory, size) == 4);
+};
+
 /// Data Directory entry (`IMAGE_DATA_DIRECTORY`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(C)]
@@ -121,7 +140,7 @@ pub struct DataDirectory {
 
 impl DataDirectory {
     /// Size of a data directory entry in bytes.
-    pub const SIZE: usize = 8;
+    pub const SIZE: usize = size_of::<ImageDataDirectory>();
 
     /// Parse a data directory from a byte slice.
     ///
@@ -137,11 +156,13 @@ impl DataDirectory {
 
     /// Decode a data directory from its 8-byte on-disk layout.
     #[must_use]
-    pub const fn from_bytes(bytes: [u8; Self::SIZE]) -> Self {
-        let [a0, a1, a2, a3, s0, s1, s2, s3] = bytes;
+    pub fn from_bytes(bytes: [u8; Self::SIZE]) -> Self {
         Self {
-            virtual_address: u32::from_le_bytes([a0, a1, a2, a3]),
-            size: u32::from_le_bytes([s0, s1, s2, s3]),
+            virtual_address: le_u32::<
+                { Self::SIZE },
+                { offset_of!(ImageDataDirectory, virtual_address) },
+            >(&bytes),
+            size: le_u32::<{ Self::SIZE }, { offset_of!(ImageDataDirectory, size) }>(&bytes),
         }
     }
 
@@ -162,10 +183,13 @@ impl DataDirectory {
     /// Serialize to a byte array.
     #[must_use]
     pub fn to_bytes(self) -> [u8; Self::SIZE] {
-        let mut buf = [0u8; Self::SIZE];
-        buf[0..4].copy_from_slice(&self.virtual_address.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.size.to_le_bytes());
-        buf
+        let mut raw = [0u8; Self::SIZE];
+        put_u32::<{ Self::SIZE }, { offset_of!(ImageDataDirectory, virtual_address) }>(
+            &mut raw,
+            self.virtual_address,
+        );
+        put_u32::<{ Self::SIZE }, { offset_of!(ImageDataDirectory, size) }>(&mut raw, self.size);
+        raw
     }
 
     /// Check if this directory entry is present (the address or the size is not zero).

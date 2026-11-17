@@ -1,8 +1,38 @@
 //! Section header (`IMAGE_SECTION_HEADER`) structures and parsing.
 
+use core::mem::{offset_of, size_of};
+
+use crate::parse_utils::{le_u16, le_u32, le_u64, put_u16, put_u32, put_u64};
 use crate::prelude::*;
 use crate::reader::ReadAt;
 use crate::{Error, Result};
+
+/// The layout of `IMAGE_SECTION_HEADER`.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the
+/// width of each field.
+#[repr(C)]
+struct ImageSectionHeader {
+    name: [u8; 8],
+    /// The union `Misc` of `PhysicalAddress` and `VirtualSize`.
+    misc: u32,
+    virtual_address: u32,
+    size_of_raw_data: u32,
+    pointer_to_raw_data: u32,
+    pointer_to_relocations: u32,
+    pointer_to_linenumbers: u32,
+    number_of_relocations: u16,
+    number_of_linenumbers: u16,
+    characteristics: u32,
+}
+
+// Anchors from `winnt.h` that the layout must keep.
+const _: () = {
+    assert!(size_of::<ImageSectionHeader>() == 40);
+    assert!(offset_of!(ImageSectionHeader, misc) == 8);
+    assert!(offset_of!(ImageSectionHeader, pointer_to_raw_data) == 20);
+    assert!(offset_of!(ImageSectionHeader, characteristics) == 36);
+};
 
 /// Section characteristics flags (`IMAGE_SCN_*` values) for
 /// `IMAGE_SECTION_HEADER.Characteristics`.
@@ -105,7 +135,7 @@ pub struct SectionHeader {
 
 impl SectionHeader {
     /// The size of an encoded `IMAGE_SECTION_HEADER`, in bytes.
-    pub const SIZE: usize = 40;
+    pub const SIZE: usize = size_of::<ImageSectionHeader>();
 
     /// Return the section name as a string, without the null padding.
     ///
@@ -252,24 +282,29 @@ impl SectionHeader {
     ///
     /// Returns an error if `data` is shorter than [`Self::SIZE`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let Some(data) = data.first_chunk::<{ Self::SIZE }>() else {
+        let Some(raw) = data.first_chunk::<{ Self::SIZE }>() else {
             return Err(Error::buffer_too_small(Self::SIZE, data.len()));
         };
 
-        let mut name = [0u8; 8];
-        name.copy_from_slice(&data[0..8]);
+        /// Read `$field` of `ImageSectionHeader` from `raw` with `$read`.
+        macro_rules! field {
+            ($read:ident, $field:ident) => {
+                $read::<{ SectionHeader::SIZE }, { offset_of!(ImageSectionHeader, $field) }>(raw)
+            };
+        }
 
         Ok(Self {
-            name,
-            virtual_size: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
-            virtual_address: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
-            size_of_raw_data: u32::from_le_bytes([data[16], data[17], data[18], data[19]]),
-            pointer_to_raw_data: u32::from_le_bytes([data[20], data[21], data[22], data[23]]),
-            pointer_to_relocations: u32::from_le_bytes([data[24], data[25], data[26], data[27]]),
-            pointer_to_linenumbers: u32::from_le_bytes([data[28], data[29], data[30], data[31]]),
-            number_of_relocations: u16::from_le_bytes([data[32], data[33]]),
-            number_of_linenumbers: u16::from_le_bytes([data[34], data[35]]),
-            characteristics: u32::from_le_bytes([data[36], data[37], data[38], data[39]]),
+            // The 8 name bytes as one little-endian word give the bytes in file order.
+            name: field!(le_u64, name).to_le_bytes(),
+            virtual_size: field!(le_u32, misc),
+            virtual_address: field!(le_u32, virtual_address),
+            size_of_raw_data: field!(le_u32, size_of_raw_data),
+            pointer_to_raw_data: field!(le_u32, pointer_to_raw_data),
+            pointer_to_relocations: field!(le_u32, pointer_to_relocations),
+            pointer_to_linenumbers: field!(le_u32, pointer_to_linenumbers),
+            number_of_relocations: field!(le_u16, number_of_relocations),
+            number_of_linenumbers: field!(le_u16, number_of_linenumbers),
+            characteristics: field!(le_u32, characteristics),
         })
     }
 
@@ -286,20 +321,50 @@ impl SectionHeader {
         Ok(())
     }
 
-    /// Encode the header in its 40-byte file layout.
+    /// Encode the header in its file layout.
     fn encode(&self) -> [u8; Self::SIZE] {
-        let mut buf = [0u8; Self::SIZE];
-        buf[0..8].copy_from_slice(&self.name);
-        buf[8..12].copy_from_slice(&self.virtual_size.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.virtual_address.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.size_of_raw_data.to_le_bytes());
-        buf[20..24].copy_from_slice(&self.pointer_to_raw_data.to_le_bytes());
-        buf[24..28].copy_from_slice(&self.pointer_to_relocations.to_le_bytes());
-        buf[28..32].copy_from_slice(&self.pointer_to_linenumbers.to_le_bytes());
-        buf[32..34].copy_from_slice(&self.number_of_relocations.to_le_bytes());
-        buf[34..36].copy_from_slice(&self.number_of_linenumbers.to_le_bytes());
-        buf[36..40].copy_from_slice(&self.characteristics.to_le_bytes());
-        buf
+        /// Write `$value` at the offset of `$field` in `ImageSectionHeader` with `$put`.
+        macro_rules! put {
+            ($raw:ident, $put:ident, $field:ident, $value:expr) => {
+                $put::<{ SectionHeader::SIZE }, { offset_of!(ImageSectionHeader, $field) }>(
+                    &mut $raw, $value,
+                )
+            };
+        }
+
+        let mut raw = [0u8; Self::SIZE];
+        // The 8 name bytes as one little-endian word keep the bytes in file order.
+        put!(raw, put_u64, name, le_u64::<8, 0>(&self.name));
+        put!(raw, put_u32, misc, self.virtual_size);
+        put!(raw, put_u32, virtual_address, self.virtual_address);
+        put!(raw, put_u32, size_of_raw_data, self.size_of_raw_data);
+        put!(raw, put_u32, pointer_to_raw_data, self.pointer_to_raw_data);
+        put!(
+            raw,
+            put_u32,
+            pointer_to_relocations,
+            self.pointer_to_relocations
+        );
+        put!(
+            raw,
+            put_u32,
+            pointer_to_linenumbers,
+            self.pointer_to_linenumbers
+        );
+        put!(
+            raw,
+            put_u16,
+            number_of_relocations,
+            self.number_of_relocations
+        );
+        put!(
+            raw,
+            put_u16,
+            number_of_linenumbers,
+            self.number_of_linenumbers
+        );
+        put!(raw, put_u32, characteristics, self.characteristics);
+        raw
     }
 
     /// Read a section header from a [`ReadAt`] reader at the file offset `offset`.

@@ -5,7 +5,11 @@
 
 mod product;
 
-use crate::parse_utils::u32_at;
+use core::mem::{offset_of, size_of};
+
+use crate::dos::{DosHeader, ImageDosHeader};
+use crate::optional::ImageNtHeaders32;
+use crate::parse_utils::{le_u32, put_u32, zero_extended};
 use crate::prelude::*;
 use crate::{Error, Result};
 
@@ -15,6 +19,71 @@ const RICH_MAGIC: u32 = 0x6863_6952; // "Rich"
 
 /// The value of the `DanS` start marker before the XOR with the key.
 const DANS_MAGIC: u32 = 0x536E_6144; // "DanS"
+
+/// The layout of the `DanS` block that starts the Rich header.
+///
+/// The Rich header is not a `winnt.h` structure. Portex does not read the block through this
+/// type. The type gives the offset and the width of each field.
+#[repr(C)]
+struct RichDansBlock {
+    /// `DANS_MAGIC` XOR the key.
+    dans: u32,
+    /// Three words that each hold the key (zero XOR the key).
+    padding: [u32; 3],
+}
+
+/// The layout of one Rich header entry. The file stores each field XOR the key.
+///
+/// Portex does not read the entry through this type. The type gives the offset and the width
+/// of each field.
+#[repr(C)]
+struct RichEntryRecord {
+    comp_id: u32,
+    use_count: u32,
+}
+
+/// The layout of the end of the Rich header: the unencoded `Rich` marker and the key.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the
+/// width of each field.
+#[repr(C)]
+struct RichTrailer {
+    rich: u32,
+    key: u32,
+}
+
+/// The size of the `DanS` block.
+const DANS_BLOCK_SIZE: usize = size_of::<RichDansBlock>();
+/// The size of one entry.
+const ENTRY_SIZE: usize = size_of::<RichEntryRecord>();
+/// The size of the `Rich` marker and the key.
+const TRAILER_SIZE: usize = size_of::<RichTrailer>();
+/// The size of a Rich header without entries.
+const EMPTY_SIZE: usize = DANS_BLOCK_SIZE + TRAILER_SIZE;
+/// The size of one word of the Rich header. The markers and the entries are word aligned.
+const WORD_SIZE: usize = size_of::<u32>();
+/// The file offset of `e_lfanew` in the DOS header.
+const E_LFANEW: usize = offset_of!(ImageDosHeader, e_lfanew);
+/// The size of `e_lfanew`, a `LONG`.
+const E_LFANEW_SIZE: usize = size_of::<i32>();
+
+const _: () = {
+    assert!(DANS_BLOCK_SIZE == 16);
+    assert!(ENTRY_SIZE == 8);
+    assert!(TRAILER_SIZE == 8);
+};
+
+/// Return the size of a Rich header with `entry_count` entries.
+///
+/// # Errors
+///
+/// Returns a generic error if the size overflows `usize`.
+fn encoded_size(entry_count: usize) -> Result<usize> {
+    entry_count
+        .checked_mul(ENTRY_SIZE)
+        .and_then(|size| size.checked_add(EMPTY_SIZE))
+        .ok_or_else(|| Error::generic("Rich-header size overflow"))
+}
 
 /// One entry of the Rich header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,10 +101,11 @@ impl RichEntry {
     /// 16 bits hold the build number.
     #[must_use]
     pub fn from_comp_id(comp_id: u32, use_count: u32) -> Self {
-        let [build_lo, build_hi, product_lo, product_hi] = comp_id.to_le_bytes();
+        let [product_id, build_number] =
+            [comp_id >> 16, comp_id & 0xFFFF].map(|half| u16::try_from(half).unwrap_or_default());
         Self {
-            product_id: u16::from_le_bytes([product_lo, product_hi]),
-            build_number: u16::from_le_bytes([build_lo, build_hi]),
+            product_id,
+            build_number,
             use_count,
         }
     }
@@ -82,8 +152,13 @@ impl RichHeader {
     pub fn parse(data: &[u8]) -> Option<Self> {
         // A Rich header lives between the fixed DOS header and the PE header.
         // Get the PE offset (`e_lfanew`) from the DOS header.
-        let pe_offset = usize::try_from(u32_at(data, 0x3C)?).ok()?;
-        if pe_offset.checked_add(4)? > data.len() || pe_offset < 0x40 + 24 {
+        let (dos, available) = zero_extended::<{ DosHeader::SIZE }>(data);
+        if available < E_LFANEW + E_LFANEW_SIZE {
+            return None;
+        }
+        let pe_offset = usize::try_from(le_u32::<{ DosHeader::SIZE }, E_LFANEW>(&dos)).ok()?;
+        let signature_end = pe_offset.checked_add(offset_of!(ImageNtHeaders32, file_header))?;
+        if signature_end > data.len() || pe_offset < DosHeader::SIZE + EMPTY_SIZE {
             return None;
         }
 
@@ -93,40 +168,53 @@ impl RichHeader {
         // multiple of 8 bytes. A `Rich` marker followed by its key then needs one map look-up.
         // Older Portex versions incorrectly XORed the marker. Accept that form when you parse,
         // but never write it. The last match before the PE header wins.
-        let last_rich = pe_offset.checked_sub(8)?;
+        let last_rich = pe_offset.checked_sub(TRAILER_SIZE)?;
         let mut dans_blocks: BTreeMap<u32, [Option<usize>; 2]> = BTreeMap::new();
         let mut found = None;
-        let mut rich_offset: usize = 0x40 + 16;
+        let mut rich_offset: usize = DosHeader::SIZE + DANS_BLOCK_SIZE;
         while rich_offset <= last_rich {
-            let start = rich_offset.checked_sub(16)?;
-            let pad_key = u32_at(data, start.checked_add(4)?)?;
-            if u32_at(data, start)? ^ pad_key == DANS_MAGIC
-                && u32_at(data, start.checked_add(8)?)? == pad_key
-                && u32_at(data, start.checked_add(12)?)? == pad_key
+            let start = rich_offset.checked_sub(DANS_BLOCK_SIZE)?;
+            let block = data
+                .get(start..)
+                .and_then(<[u8]>::first_chunk::<DANS_BLOCK_SIZE>)?;
+            let pad_key = le_u32::<DANS_BLOCK_SIZE, { offset_of!(RichDansBlock, padding) }>(block);
+            if le_u32::<DANS_BLOCK_SIZE, { offset_of!(RichDansBlock, dans) }>(block) ^ pad_key
+                == DANS_MAGIC
+                && le_u32::<DANS_BLOCK_SIZE, { offset_of!(RichDansBlock, padding) + WORD_SIZE }>(
+                    block,
+                ) == pad_key
+                && le_u32::<DANS_BLOCK_SIZE, { offset_of!(RichDansBlock, padding) + 2 * WORD_SIZE }>(
+                    block,
+                ) == pad_key
             {
-                dans_blocks.entry(pad_key).or_default()[(start / 4) % 2] = Some(start);
+                dans_blocks.entry(pad_key).or_default()[(start / WORD_SIZE) % 2] = Some(start);
             }
 
-            let value = u32_at(data, rich_offset)?;
-            let key = u32_at(data, rich_offset.checked_add(4)?)?;
+            let trailer = data
+                .get(rich_offset..)
+                .and_then(<[u8]>::first_chunk::<TRAILER_SIZE>)?;
+            let value = le_u32::<TRAILER_SIZE, { offset_of!(RichTrailer, rich) }>(trailer);
+            let key = le_u32::<TRAILER_SIZE, { offset_of!(RichTrailer, key) }>(trailer);
             if (value == RICH_MAGIC || value ^ key == RICH_MAGIC)
                 && let Some(start) = dans_blocks
                     .get(&key)
-                    .and_then(|slots| slots[(rich_offset / 4) % 2])
+                    .and_then(|slots| slots[(rich_offset / WORD_SIZE) % 2])
             {
                 found = Some((start, rich_offset, key));
             }
-            rich_offset = rich_offset.checked_add(4)?;
+            rich_offset = rich_offset.checked_add(WORD_SIZE)?;
         }
 
         let (start_offset, rich_offset, key) = found?;
         let block = data.get(start_offset..rich_offset)?;
-        let entry_bytes = block.get(16..)?;
-        let chunks = entry_bytes.as_chunks::<8>().0;
-        let mut entries = Vec::with_capacity(chunks.len());
-        for &[c0, c1, c2, c3, n0, n1, n2, n3] in chunks {
-            let comp_id = u32::from_le_bytes([c0, c1, c2, c3]) ^ key;
-            let count = u32::from_le_bytes([n0, n1, n2, n3]) ^ key;
+        let entry_bytes = block.get(DANS_BLOCK_SIZE..)?;
+        let records = entry_bytes.as_chunks::<ENTRY_SIZE>().0;
+        let mut entries = Vec::with_capacity(records.len());
+        for record in records {
+            let comp_id =
+                le_u32::<ENTRY_SIZE, { offset_of!(RichEntryRecord, comp_id) }>(record) ^ key;
+            let count =
+                le_u32::<ENTRY_SIZE, { offset_of!(RichEntryRecord, use_count) }>(record) ^ key;
             if comp_id != 0 || count != 0 {
                 entries.push(RichEntry::from_comp_id(comp_id, count));
             }
@@ -135,7 +223,7 @@ impl RichHeader {
             key,
             entries,
             offset: start_offset,
-            size: block.len().checked_add(8)?,
+            size: block.len().checked_add(TRAILER_SIZE)?,
         })
     }
 
@@ -156,31 +244,44 @@ impl RichHeader {
     ///
     /// Returns a generic error if the encoded size overflows `usize`.
     pub fn try_build(&self) -> Result<Vec<u8>> {
-        // Size: DanS (4) + padding (12) + entries (8 each) + Rich (4) + key (4).
-        let size = self
-            .entries
-            .len()
-            .checked_mul(8)
-            .and_then(|size| size.checked_add(24))
-            .ok_or_else(|| Error::generic("Rich-header size overflow"))?;
+        let size = encoded_size(self.entries.len())?;
         let mut buf = Vec::with_capacity(size);
         let key = self.key;
 
         // Write the DanS marker and the padding (3 dwords). XOR all of them with the key.
-        buf.extend_from_slice(&(DANS_MAGIC ^ key).to_le_bytes());
-        for _ in 0..3 {
-            buf.extend_from_slice(&key.to_le_bytes());
-        }
+        let mut dans = [0u8; DANS_BLOCK_SIZE];
+        put_u32::<DANS_BLOCK_SIZE, { offset_of!(RichDansBlock, dans) }>(
+            &mut dans,
+            DANS_MAGIC ^ key,
+        );
+        put_u32::<DANS_BLOCK_SIZE, { offset_of!(RichDansBlock, padding) }>(&mut dans, key);
+        put_u32::<DANS_BLOCK_SIZE, { offset_of!(RichDansBlock, padding) + WORD_SIZE }>(
+            &mut dans, key,
+        );
+        put_u32::<DANS_BLOCK_SIZE, { offset_of!(RichDansBlock, padding) + 2 * WORD_SIZE }>(
+            &mut dans, key,
+        );
+        buf.extend_from_slice(&dans);
 
         // Write the entries.
         for entry in &self.entries {
-            buf.extend_from_slice(&(entry.to_comp_id() ^ key).to_le_bytes());
-            buf.extend_from_slice(&(entry.use_count ^ key).to_le_bytes());
+            let mut record = [0u8; ENTRY_SIZE];
+            put_u32::<ENTRY_SIZE, { offset_of!(RichEntryRecord, comp_id) }>(
+                &mut record,
+                entry.to_comp_id() ^ key,
+            );
+            put_u32::<ENTRY_SIZE, { offset_of!(RichEntryRecord, use_count) }>(
+                &mut record,
+                entry.use_count ^ key,
+            );
+            buf.extend_from_slice(&record);
         }
 
         // Write the Rich marker and the key.
-        buf.extend_from_slice(&RICH_MAGIC.to_le_bytes());
-        buf.extend_from_slice(&key.to_le_bytes());
+        let mut trailer = [0u8; TRAILER_SIZE];
+        put_u32::<TRAILER_SIZE, { offset_of!(RichTrailer, rich) }>(&mut trailer, RICH_MAGIC);
+        put_u32::<TRAILER_SIZE, { offset_of!(RichTrailer, key) }>(&mut trailer, key);
+        buf.extend_from_slice(&trailer);
 
         Ok(buf)
     }
@@ -195,13 +296,10 @@ impl RichHeader {
     #[must_use]
     pub fn calculate_key(entries: &[RichEntry], prefix: &[u8]) -> u32 {
         // The offset is a u32 in the linker. Keep the low 32 bits.
-        let length = prefix.len().to_le_bytes();
-        let mut checksum = length
-            .first_chunk::<4>()
-            .map_or(0, |low| u32::from_le_bytes(*low));
+        let mut checksum = u32::try_from(prefix.len() & 0xFFFF_FFFF).unwrap_or_default();
 
         for (offset, &byte) in prefix.iter().enumerate() {
-            if (0x3C..0x40).contains(&offset) {
+            if (E_LFANEW..E_LFANEW + E_LFANEW_SIZE).contains(&offset) {
                 continue;
             }
             let rotation = u32::try_from(offset & 0x1F).unwrap_or(0);
@@ -307,11 +405,7 @@ impl RichBuilder {
     ///
     /// Returns a generic error if the encoded size overflows `usize`.
     pub fn try_calculate_size(&self) -> Result<usize> {
-        self.entries
-            .len()
-            .checked_mul(8)
-            .and_then(|size| size.checked_add(24))
-            .ok_or_else(|| Error::generic("Rich-header size overflow"))
+        encoded_size(self.entries.len())
     }
 
     /// Build the Rich header with a specific XOR key. Returns `(data, size)`.

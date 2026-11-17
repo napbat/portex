@@ -239,7 +239,7 @@ impl PeImage {
         if usize::try_from(candidate.dos_header.e_lfanew)
             .is_ok_and(|offset| offset < DosHeader::SIZE)
         {
-            candidate.dos_header.e_lfanew = 0x40;
+            candidate.dos_header.e_lfanew = DosHeader::END_AS_LFANEW;
         }
         // The caller sets the debug file offsets for the new layout.
         if let Err(error) = candidate.try_update_layout_keeping_section_data() {

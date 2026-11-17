@@ -1,11 +1,19 @@
 //! COFF file header (`IMAGE_FILE_HEADER`) structures and parsing.
 
+use core::mem::{offset_of, size_of};
+
+use crate::parse_utils::{le_u16, le_u32, put_u16, put_u32};
 use crate::prelude::*;
 use crate::reader::ReadAt;
 use crate::{Error, Result};
 
 /// The PE signature `PE\0\0`, read as a little-endian `u32`.
 pub const PE_SIGNATURE: u32 = 0x0000_4550;
+
+/// The size of the PE signature in bytes: the offset of `IMAGE_FILE_HEADER` in
+/// `IMAGE_NT_HEADERS`.
+pub(crate) const PE_SIGNATURE_SIZE: usize =
+    offset_of!(crate::optional::ImageNtHeaders32, file_header);
 
 /// Machine types (`IMAGE_FILE_MACHINE_*` values) for `IMAGE_FILE_HEADER.Machine`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +187,28 @@ pub mod characteristics {
     pub const BYTES_REVERSED_HI: u16 = 0x8000;
 }
 
+/// The layout of `IMAGE_FILE_HEADER`.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the
+/// width of each field.
+#[repr(C)]
+pub(crate) struct ImageFileHeader {
+    pub(crate) machine: u16,
+    pub(crate) number_of_sections: u16,
+    pub(crate) time_date_stamp: u32,
+    pub(crate) pointer_to_symbol_table: u32,
+    pub(crate) number_of_symbols: u32,
+    pub(crate) size_of_optional_header: u16,
+    pub(crate) characteristics: u16,
+}
+
+// Anchors from `winnt.h` that the layout must keep.
+const _: () = {
+    assert!(size_of::<ImageFileHeader>() == 20);
+    assert!(offset_of!(ImageFileHeader, time_date_stamp) == 4);
+    assert!(offset_of!(ImageFileHeader, size_of_optional_header) == 16);
+};
+
 /// The COFF file header (`IMAGE_FILE_HEADER`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
@@ -202,7 +232,7 @@ pub struct CoffHeader {
 
 impl CoffHeader {
     /// The size of the COFF file header in bytes.
-    pub const SIZE: usize = 20;
+    pub const SIZE: usize = size_of::<ImageFileHeader>();
 
     /// Parse a COFF file header from a byte slice.
     ///
@@ -210,18 +240,25 @@ impl CoffHeader {
     ///
     /// Returns a buffer-too-small error if `data` is shorter than [`Self::SIZE`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let Some(data) = data.first_chunk::<{ Self::SIZE }>() else {
+        let Some(raw) = data.first_chunk::<{ Self::SIZE }>() else {
             return Err(Error::buffer_too_small(Self::SIZE, data.len()));
         };
 
+        /// Read `$field` of `ImageFileHeader` from `raw` with `$read`.
+        macro_rules! field {
+            ($read:ident, $field:ident) => {
+                $read::<{ CoffHeader::SIZE }, { offset_of!(ImageFileHeader, $field) }>(raw)
+            };
+        }
+
         Ok(Self {
-            machine: u16::from_le_bytes([data[0], data[1]]),
-            number_of_sections: u16::from_le_bytes([data[2], data[3]]),
-            time_date_stamp: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
-            pointer_to_symbol_table: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
-            number_of_symbols: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
-            size_of_optional_header: u16::from_le_bytes([data[16], data[17]]),
-            characteristics: u16::from_le_bytes([data[18], data[19]]),
+            machine: field!(le_u16, machine),
+            number_of_sections: field!(le_u16, number_of_sections),
+            time_date_stamp: field!(le_u32, time_date_stamp),
+            pointer_to_symbol_table: field!(le_u32, pointer_to_symbol_table),
+            number_of_symbols: field!(le_u32, number_of_symbols),
+            size_of_optional_header: field!(le_u16, size_of_optional_header),
+            characteristics: field!(le_u16, characteristics),
         })
     }
 
@@ -241,15 +278,25 @@ impl CoffHeader {
 
     /// Encode the header in its little-endian file layout.
     fn encode(&self) -> [u8; Self::SIZE] {
-        let mut buf = [0u8; Self::SIZE];
-        buf[0..2].copy_from_slice(&self.machine.to_le_bytes());
-        buf[2..4].copy_from_slice(&self.number_of_sections.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.time_date_stamp.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.pointer_to_symbol_table.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.number_of_symbols.to_le_bytes());
-        buf[16..18].copy_from_slice(&self.size_of_optional_header.to_le_bytes());
-        buf[18..20].copy_from_slice(&self.characteristics.to_le_bytes());
-        buf
+        /// Write `$field` of `$header` at its offset in `ImageFileHeader` with `$put`.
+        macro_rules! put {
+            ($raw:ident, $header:ident, $put:ident, $field:ident) => {
+                $put::<{ CoffHeader::SIZE }, { offset_of!(ImageFileHeader, $field) }>(
+                    &mut $raw,
+                    $header.$field,
+                )
+            };
+        }
+
+        let mut raw = [0u8; Self::SIZE];
+        put!(raw, self, put_u16, machine);
+        put!(raw, self, put_u16, number_of_sections);
+        put!(raw, self, put_u32, time_date_stamp);
+        put!(raw, self, put_u32, pointer_to_symbol_table);
+        put!(raw, self, put_u32, number_of_symbols);
+        put!(raw, self, put_u16, size_of_optional_header);
+        put!(raw, self, put_u16, characteristics);
+        raw
     }
 
     /// Return the machine type as a [`MachineType`], or `None` for an unknown value.

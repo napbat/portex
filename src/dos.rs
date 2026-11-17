@@ -1,11 +1,53 @@
 //! DOS header structure and parsing.
 
+use core::mem::{offset_of, size_of};
+
+use crate::parse_utils::{le_u16, le_u32, put_u16, put_u32};
 use crate::prelude::*;
 use crate::reader::ReadAt;
 use crate::{Error, Result};
 
 /// DOS "MZ" signature.
 pub const DOS_SIGNATURE: u16 = 0x5A4D; // "MZ"
+
+/// The layout of `IMAGE_DOS_HEADER`. `winnt.h` packs it to 2 bytes.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the
+/// width of each field.
+#[repr(C, packed(2))]
+#[expect(
+    clippy::struct_field_names,
+    reason = "field names mirror the `e_*` members of IMAGE_DOS_HEADER"
+)]
+pub(crate) struct ImageDosHeader {
+    e_magic: u16,
+    e_cblp: u16,
+    e_cp: u16,
+    e_crlc: u16,
+    e_cparhdr: u16,
+    e_minalloc: u16,
+    e_maxalloc: u16,
+    e_ss: u16,
+    e_sp: u16,
+    e_csum: u16,
+    e_ip: u16,
+    e_cs: u16,
+    e_lfarlc: u16,
+    e_ovno: u16,
+    e_res: [u16; 4],
+    e_oemid: u16,
+    e_oeminfo: u16,
+    e_res2: [u16; 10],
+    pub(crate) e_lfanew: i32,
+}
+
+// Anchors from `winnt.h` that the layout must keep.
+const _: () = {
+    assert!(size_of::<ImageDosHeader>() == 0x40);
+    assert!(offset_of!(ImageDosHeader, e_lfarlc) == 0x18);
+    assert!(offset_of!(ImageDosHeader, e_res2) == 0x28);
+    assert!(offset_of!(ImageDosHeader, e_lfanew) == 0x3c);
+};
 
 /// DOS Header (`IMAGE_DOS_HEADER`).
 ///
@@ -63,12 +105,15 @@ pub struct DosHeader {
 
 impl DosHeader {
     /// Size of the DOS header in bytes.
-    pub const SIZE: usize = 64;
+    pub const SIZE: usize = size_of::<ImageDosHeader>();
 
     /// The smallest `e_lfanew`: the PE signature cannot overlap `e_magic`.
     ///
     /// The loader of executable images needs 4 or more, but the data-file loader accepts 2.
     pub(crate) const MIN_PE_OFFSET: usize = 2;
+
+    /// The `e_lfanew` value that puts the NT headers directly after the DOS header.
+    pub(crate) const END_AS_LFANEW: i32 = 0x40;
 
     /// Parse a DOS header from a byte slice.
     ///
@@ -77,51 +122,64 @@ impl DosHeader {
     /// Returns a buffer-too-small error if `data` is shorter than [`Self::SIZE`],
     /// or an invalid-DOS-signature error if `e_magic` is not [`DOS_SIGNATURE`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let Some(data) = data.first_chunk::<{ Self::SIZE }>() else {
+        let Some(raw) = data.first_chunk::<{ Self::SIZE }>() else {
             return Err(Error::buffer_too_small(Self::SIZE, data.len()));
         };
 
-        let e_magic = u16::from_le_bytes([data[0], data[1]]);
+        /// Return the `u16` at the offset of `$field` (plus `$index` words) in `ImageDosHeader`.
+        macro_rules! word {
+            ($field:ident) => {
+                word!($field, 0)
+            };
+            ($field:ident, $index:literal) => {
+                le_u16::<
+                    { DosHeader::SIZE },
+                    { offset_of!(ImageDosHeader, $field) + $index * size_of::<u16>() },
+                >(raw)
+            };
+        }
+
+        let e_magic = word!(e_magic);
         if e_magic != DOS_SIGNATURE {
             return Err(Error::invalid_dos_signature());
         }
-
         Ok(Self {
             e_magic,
-            e_cblp: u16::from_le_bytes([data[2], data[3]]),
-            e_cp: u16::from_le_bytes([data[4], data[5]]),
-            e_crlc: u16::from_le_bytes([data[6], data[7]]),
-            e_cparhdr: u16::from_le_bytes([data[8], data[9]]),
-            e_minalloc: u16::from_le_bytes([data[10], data[11]]),
-            e_maxalloc: u16::from_le_bytes([data[12], data[13]]),
-            e_ss: u16::from_le_bytes([data[14], data[15]]),
-            e_sp: u16::from_le_bytes([data[16], data[17]]),
-            e_csum: u16::from_le_bytes([data[18], data[19]]),
-            e_ip: u16::from_le_bytes([data[20], data[21]]),
-            e_cs: u16::from_le_bytes([data[22], data[23]]),
-            e_lfarlc: u16::from_le_bytes([data[24], data[25]]),
-            e_ovno: u16::from_le_bytes([data[26], data[27]]),
+            e_cblp: word!(e_cblp),
+            e_cp: word!(e_cp),
+            e_crlc: word!(e_crlc),
+            e_cparhdr: word!(e_cparhdr),
+            e_minalloc: word!(e_minalloc),
+            e_maxalloc: word!(e_maxalloc),
+            e_ss: word!(e_ss),
+            e_sp: word!(e_sp),
+            e_csum: word!(e_csum),
+            e_ip: word!(e_ip),
+            e_cs: word!(e_cs),
+            e_lfarlc: word!(e_lfarlc),
+            e_ovno: word!(e_ovno),
             e_res: [
-                u16::from_le_bytes([data[28], data[29]]),
-                u16::from_le_bytes([data[30], data[31]]),
-                u16::from_le_bytes([data[32], data[33]]),
-                u16::from_le_bytes([data[34], data[35]]),
+                word!(e_res, 0),
+                word!(e_res, 1),
+                word!(e_res, 2),
+                word!(e_res, 3),
             ],
-            e_oemid: u16::from_le_bytes([data[36], data[37]]),
-            e_oeminfo: u16::from_le_bytes([data[38], data[39]]),
+            e_oemid: word!(e_oemid),
+            e_oeminfo: word!(e_oeminfo),
             e_res2: [
-                u16::from_le_bytes([data[40], data[41]]),
-                u16::from_le_bytes([data[42], data[43]]),
-                u16::from_le_bytes([data[44], data[45]]),
-                u16::from_le_bytes([data[46], data[47]]),
-                u16::from_le_bytes([data[48], data[49]]),
-                u16::from_le_bytes([data[50], data[51]]),
-                u16::from_le_bytes([data[52], data[53]]),
-                u16::from_le_bytes([data[54], data[55]]),
-                u16::from_le_bytes([data[56], data[57]]),
-                u16::from_le_bytes([data[58], data[59]]),
+                word!(e_res2, 0),
+                word!(e_res2, 1),
+                word!(e_res2, 2),
+                word!(e_res2, 3),
+                word!(e_res2, 4),
+                word!(e_res2, 5),
+                word!(e_res2, 6),
+                word!(e_res2, 7),
+                word!(e_res2, 8),
+                word!(e_res2, 9),
             ],
-            e_lfanew: i32::from_le_bytes([data[60], data[61], data[62], data[63]]),
+            e_lfanew: le_u32::<{ Self::SIZE }, { offset_of!(ImageDosHeader, e_lfanew) }>(raw)
+                .cast_signed(),
         })
     }
 
@@ -141,33 +199,57 @@ impl DosHeader {
 
     /// Encode the header into its on-disk little-endian layout.
     fn encode(&self) -> [u8; Self::SIZE] {
-        let mut buf = [0u8; Self::SIZE];
-        buf[0..2].copy_from_slice(&self.e_magic.to_le_bytes());
-        buf[2..4].copy_from_slice(&self.e_cblp.to_le_bytes());
-        buf[4..6].copy_from_slice(&self.e_cp.to_le_bytes());
-        buf[6..8].copy_from_slice(&self.e_crlc.to_le_bytes());
-        buf[8..10].copy_from_slice(&self.e_cparhdr.to_le_bytes());
-        buf[10..12].copy_from_slice(&self.e_minalloc.to_le_bytes());
-        buf[12..14].copy_from_slice(&self.e_maxalloc.to_le_bytes());
-        buf[14..16].copy_from_slice(&self.e_ss.to_le_bytes());
-        buf[16..18].copy_from_slice(&self.e_sp.to_le_bytes());
-        buf[18..20].copy_from_slice(&self.e_csum.to_le_bytes());
-        buf[20..22].copy_from_slice(&self.e_ip.to_le_bytes());
-        buf[22..24].copy_from_slice(&self.e_cs.to_le_bytes());
-        buf[24..26].copy_from_slice(&self.e_lfarlc.to_le_bytes());
-        buf[26..28].copy_from_slice(&self.e_ovno.to_le_bytes());
-        let (res, _) = buf[28..36].as_chunks_mut::<2>();
-        for (out, val) in res.iter_mut().zip(&self.e_res) {
-            *out = val.to_le_bytes();
+        /// Write the `u16` value at the offset of `$field` (plus `$index` words).
+        macro_rules! put_word {
+            ($raw:ident, $field:ident, $value:expr) => {
+                put_word!($raw, $field, 0, $value)
+            };
+            ($raw:ident, $field:ident, $index:literal, $value:expr) => {
+                put_u16::<
+                    { DosHeader::SIZE },
+                    { offset_of!(ImageDosHeader, $field) + $index * size_of::<u16>() },
+                >(&mut $raw, $value)
+            };
         }
-        buf[36..38].copy_from_slice(&self.e_oemid.to_le_bytes());
-        buf[38..40].copy_from_slice(&self.e_oeminfo.to_le_bytes());
-        let (res2, _) = buf[40..60].as_chunks_mut::<2>();
-        for (out, val) in res2.iter_mut().zip(&self.e_res2) {
-            *out = val.to_le_bytes();
-        }
-        buf[60..64].copy_from_slice(&self.e_lfanew.to_le_bytes());
-        buf
+
+        let mut raw = [0u8; Self::SIZE];
+        put_word!(raw, e_magic, self.e_magic);
+        put_word!(raw, e_cblp, self.e_cblp);
+        put_word!(raw, e_cp, self.e_cp);
+        put_word!(raw, e_crlc, self.e_crlc);
+        put_word!(raw, e_cparhdr, self.e_cparhdr);
+        put_word!(raw, e_minalloc, self.e_minalloc);
+        put_word!(raw, e_maxalloc, self.e_maxalloc);
+        put_word!(raw, e_ss, self.e_ss);
+        put_word!(raw, e_sp, self.e_sp);
+        put_word!(raw, e_csum, self.e_csum);
+        put_word!(raw, e_ip, self.e_ip);
+        put_word!(raw, e_cs, self.e_cs);
+        put_word!(raw, e_lfarlc, self.e_lfarlc);
+        put_word!(raw, e_ovno, self.e_ovno);
+        let [r0, r1, r2, r3] = self.e_res;
+        put_word!(raw, e_res, 0, r0);
+        put_word!(raw, e_res, 1, r1);
+        put_word!(raw, e_res, 2, r2);
+        put_word!(raw, e_res, 3, r3);
+        put_word!(raw, e_oemid, self.e_oemid);
+        put_word!(raw, e_oeminfo, self.e_oeminfo);
+        let [s0, s1, s2, s3, s4, s5, s6, s7, s8, s9] = self.e_res2;
+        put_word!(raw, e_res2, 0, s0);
+        put_word!(raw, e_res2, 1, s1);
+        put_word!(raw, e_res2, 2, s2);
+        put_word!(raw, e_res2, 3, s3);
+        put_word!(raw, e_res2, 4, s4);
+        put_word!(raw, e_res2, 5, s5);
+        put_word!(raw, e_res2, 6, s6);
+        put_word!(raw, e_res2, 7, s7);
+        put_word!(raw, e_res2, 8, s8);
+        put_word!(raw, e_res2, 9, s9);
+        put_u32::<{ Self::SIZE }, { offset_of!(ImageDosHeader, e_lfanew) }>(
+            &mut raw,
+            self.e_lfanew.cast_unsigned(),
+        );
+        raw
     }
 
     /// Parse a DOS header from a positional reader at the file offset `offset`.

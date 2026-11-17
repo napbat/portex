@@ -1,5 +1,5 @@
 use super::{PeHeaders, SourceLayout};
-use crate::coff::{CoffHeader, verify_pe_signature};
+use crate::coff::{CoffHeader, PE_SIGNATURE_SIZE, verify_pe_signature};
 use crate::dos::DosHeader;
 use crate::optional::OptionalHeader;
 use crate::prelude::*;
@@ -85,9 +85,9 @@ impl PeHeaders {
         verify_pe_signature(reader, pe_offset)
             .map_err(|error| error.in_structure("PE signature").at_offset(pe_offset))?;
 
-        // Parse the COFF header. It starts 4 bytes after the PE signature.
+        // Parse the COFF header. It starts after the PE signature.
         let coff_offset = pe_offset
-            .checked_add(4)
+            .checked_add(PE_SIGNATURE_SIZE as u64)
             .ok_or_else(|| Error::invalid_section("COFF header offset overflow"))?;
         let coff_header = CoffHeader::read_from(reader, coff_offset).map_err(|error| {
             error

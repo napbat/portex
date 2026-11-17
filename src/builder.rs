@@ -444,11 +444,11 @@ impl PeBuilder {
 
     fn default_dos_stub() -> Vec<u8> {
         // Minimal DOS stub: "This program cannot be run in DOS mode.\r\n$".
-        // Pad the stub with zeros to 64 bytes (0x40 to 0x80). The PE header then starts at file
-        // offset 0x80.
+        // Pad the stub with zeros up to file offset 0x80, the `e_lfanew` of
+        // `create_dos_header`. The PE header then starts at file offset 0x80.
         let msg = b"\x0e\x1f\xba\x0e\x00\xb4\x09\xcd\x21\xb8\x01\x4c\xcd\x21This program cannot be run in DOS mode.\r\r\n$";
         let mut stub = msg.to_vec();
-        stub.resize(64, 0);
+        stub.resize(0x80 - DosHeader::SIZE, 0);
         stub
     }
 }

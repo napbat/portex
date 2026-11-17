@@ -3,6 +3,23 @@
 //! The PE checksum lets a tool verify the integrity of a PE file. Drivers and system files
 //! usually have a checksum.
 
+use core::mem::{offset_of, size_of};
+
+use nostdio::ReadLe;
+
+use crate::dos::{DosHeader, ImageDosHeader};
+use crate::optional::{ImageNtHeaders32, ImageNtHeaders64};
+use crate::parse_utils::{le_u32, zero_extended};
+
+/// The offset of `CheckSum` from the start of the NT headers (the PE signature).
+const CHECK_SUM_OFFSET: usize = offset_of!(ImageNtHeaders32, optional_header.check_sum);
+
+/// The size of the `CheckSum` field (a `DWORD`), in bytes.
+const CHECK_SUM_SIZE: usize = size_of::<u32>();
+
+// PE32 and PE32+ put `CheckSum` at the same offset.
+const _: () = assert!(CHECK_SUM_OFFSET == offset_of!(ImageNtHeaders64, optional_header.check_sum));
+
 /// Calculate the PE checksum for a file.
 ///
 /// `checksum_offset` is the file offset `o` of the `CheckSum` field. The algorithm gives the same
@@ -30,7 +47,7 @@
 #[must_use]
 pub fn calculate_checksum(data: &[u8], checksum_offset: usize) -> u32 {
     let start = checksum_offset & !1;
-    let sum = if let Some(after) = data.get(checksum_offset.saturating_add(4)..) {
+    let sum = if let Some(after) = data.get(checksum_offset.saturating_add(CHECK_SUM_SIZE)..) {
         // The field is in `data`, so `data[..start]` exists and has an even length.
         let before = data.get(..start).unwrap_or_default();
         add_odd_byte(add_words(add_words(0, before), after), data)
@@ -40,8 +57,7 @@ pub fn calculate_checksum(data: &[u8], checksum_offset: usize) -> u32 {
     };
 
     // Add the file size. The algorithm uses only the low 32 bits.
-    let [b0, b1, b2, b3, ..] = data.len().to_le_bytes();
-    let size_low = u32::from_le_bytes([b0, b1, b2, b3]);
+    let size_low = u32::try_from(data.len() & 0xFFFF_FFFF).unwrap_or_default();
     sum.wrapping_add(size_low)
 }
 
@@ -51,8 +67,9 @@ pub fn calculate_checksum(data: &[u8], checksum_offset: usize) -> u32 {
 fn add_words(mut sum: u32, bytes: &[u8]) -> u32 {
     // Folding after every addition keeps `sum` within 16 bits, so adding a
     // 16-bit word never overflows a `u32`.
-    for word in bytes.as_chunks::<2>().0 {
-        sum = fold_carry(sum + u32::from(u16::from_le_bytes(*word)));
+    let mut words = bytes;
+    while let Ok(word) = words.read_u16_le() {
+        sum = fold_carry(sum + u32::from(word));
     }
     sum
 }
@@ -79,15 +96,15 @@ const fn fold_carry(mut sum: u32) -> u32 {
 /// Returns `None` if the PE is malformed or does not have an optional header.
 #[must_use]
 pub fn checksum_field_offset(data: &[u8]) -> Option<usize> {
-    // The DOS header field e_lfanew is at file offset 0x3C.
-    let e_lfanew = data.get(0x3C..)?.first_chunk::<4>()?;
-    let pe_offset = usize::try_from(u32::from_le_bytes(*e_lfanew)).ok()?;
+    const E_LFANEW: usize = offset_of!(ImageDosHeader, e_lfanew);
+    let (dos, available) = zero_extended::<{ DosHeader::SIZE }>(data);
+    if available < E_LFANEW + size_of::<i32>() {
+        return None;
+    }
+    let pe_offset = usize::try_from(le_u32::<{ DosHeader::SIZE }, E_LFANEW>(&dos)).ok()?;
+    let checksum_offset = pe_offset.checked_add(CHECK_SUM_OFFSET)?;
 
-    // Skip the PE signature (4) and the COFF header (20). The checksum is at offset 64 in the
-    // optional header.
-    let checksum_offset = pe_offset.checked_add(4 + 20 + 64)?;
-
-    if checksum_offset.checked_add(4)? > data.len() {
+    if checksum_offset.checked_add(CHECK_SUM_SIZE)? > data.len() {
         return None;
     }
 

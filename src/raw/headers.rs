@@ -1,25 +1,32 @@
 //! The offsets of the header fields that a tool rewrites in place.
 
-use crate::coff::CoffHeader;
+use core::mem::offset_of;
+
 use crate::data_dir::DataDirectory;
+use crate::optional::{ImageNtHeaders32, ImageNtHeaders64};
 use crate::section::SectionHeader;
 
-/// The offset of `ImageBase` in `IMAGE_OPTIONAL_HEADER32`.
-const IMAGE_BASE_32: usize = 28;
-/// The offset of `ImageBase` in `IMAGE_OPTIONAL_HEADER64`.
-const IMAGE_BASE_64: usize = 24;
-/// The offset of `SizeOfImage` in both optional header layouts.
-const SIZE_OF_IMAGE: usize = 56;
-/// The offset of `SizeOfHeaders` in both optional header layouts.
-const SIZE_OF_HEADERS: usize = 60;
-/// The offset of `CheckSum` in both optional header layouts.
-const CHECK_SUM: usize = 64;
-/// The offset of the data directory array in `IMAGE_OPTIONAL_HEADER32`.
-const DATA_DIRECTORIES_32: usize = 96;
-/// The offset of the data directory array in `IMAGE_OPTIONAL_HEADER64`.
-const DATA_DIRECTORIES_64: usize = 112;
-/// The offset of `TimeDateStamp` in `IMAGE_FILE_HEADER`.
-const TIME_DATE_STAMP: usize = 4;
+// PE32 and PE32+ share the offsets of the file header, the optional header and the fields
+// below in the NT headers.
+const _: () = {
+    assert!(offset_of!(ImageNtHeaders32, file_header) == offset_of!(ImageNtHeaders64, file_header));
+    assert!(
+        offset_of!(ImageNtHeaders32, optional_header)
+            == offset_of!(ImageNtHeaders64, optional_header)
+    );
+    assert!(
+        offset_of!(ImageNtHeaders32, optional_header.size_of_image)
+            == offset_of!(ImageNtHeaders64, optional_header.size_of_image)
+    );
+    assert!(
+        offset_of!(ImageNtHeaders32, optional_header.size_of_headers)
+            == offset_of!(ImageNtHeaders64, optional_header.size_of_headers)
+    );
+    assert!(
+        offset_of!(ImageNtHeaders32, optional_header.check_sum)
+            == offset_of!(ImageNtHeaders64, optional_header.check_sum)
+    );
+};
 
 /// The source offsets of the header fields that a tool rewrites in place.
 ///
@@ -59,25 +66,33 @@ impl HeaderOffsets {
         size_of_optional_header: u16,
         is_64bit: bool,
     ) -> Option<Self> {
-        let coff_header = nt_headers.checked_add(4)?;
-        let optional_header = coff_header.checked_add(CoffHeader::SIZE)?;
+        let at = |delta: usize| nt_headers.checked_add(delta);
         let (image_base, data_directories) = if is_64bit {
-            (IMAGE_BASE_64, DATA_DIRECTORIES_64)
+            (
+                offset_of!(ImageNtHeaders64, optional_header.image_base),
+                offset_of!(ImageNtHeaders64, optional_header.data_directory),
+            )
         } else {
-            (IMAGE_BASE_32, DATA_DIRECTORIES_32)
+            (
+                offset_of!(ImageNtHeaders32, optional_header.image_base),
+                offset_of!(ImageNtHeaders32, optional_header.data_directory),
+            )
         };
-        let field = |delta: usize| optional_header.checked_add(delta);
+        let optional_header = at(offset_of!(ImageNtHeaders32, optional_header))?;
         Some(Self {
             nt_headers,
-            coff_header,
-            time_date_stamp: coff_header.checked_add(TIME_DATE_STAMP)?,
+            coff_header: at(offset_of!(ImageNtHeaders32, file_header))?,
+            time_date_stamp: at(offset_of!(ImageNtHeaders32, file_header.time_date_stamp))?,
             optional_header,
-            image_base: field(image_base)?,
-            size_of_image: field(SIZE_OF_IMAGE)?,
-            size_of_headers: field(SIZE_OF_HEADERS)?,
-            check_sum: field(CHECK_SUM)?,
-            data_directories: field(data_directories)?,
-            section_table: field(usize::from(size_of_optional_header))?,
+            image_base: at(image_base)?,
+            size_of_image: at(offset_of!(ImageNtHeaders32, optional_header.size_of_image))?,
+            size_of_headers: at(offset_of!(
+                ImageNtHeaders32,
+                optional_header.size_of_headers
+            ))?,
+            check_sum: at(offset_of!(ImageNtHeaders32, optional_header.check_sum))?,
+            data_directories: at(data_directories)?,
+            section_table: optional_header.checked_add(usize::from(size_of_optional_header))?,
         })
     }
 

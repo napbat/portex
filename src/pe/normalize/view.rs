@@ -11,6 +11,7 @@ use crate::delay_import::{DelayImportDirectory, DelayLoadDescriptor};
 use crate::import::{ImportDescriptor, ImportTable, ImportThunk};
 use crate::layout::{checked_align_up, loader_raw_offset};
 use crate::optional::OptionalHeader;
+use crate::parse_utils::le_u32;
 use crate::pe::PeImage;
 use crate::prelude::*;
 use crate::section::SectionHeader;
@@ -707,7 +708,7 @@ fn push_thunk_ranges(
         };
         // The thunk of an import by name holds the RVA of the entry. The parser checks that
         // the value fits 31 bits (PE32) or 32 bits (PE32+), so the low 4 bytes hold it.
-        let hint_rva = u32::from_le_bytes(*value.first_chunk::<4>()?);
+        let hint_rva = le_u32::<{ size_of::<u32>() }, 0>(value.first_chunk()?);
         ranges.push(range_at(hint_rva, name_len.checked_add(3)?));
     }
     Some(())

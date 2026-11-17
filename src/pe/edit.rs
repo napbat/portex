@@ -132,7 +132,7 @@ impl PeImage {
             updated.update_layout_fields()?;
             if !updated.nt_headers_keep_e_lfanew() {
                 updated.clone_from(self);
-                updated.dos_header.e_lfanew = DOS_HEADER_END;
+                updated.dos_header.e_lfanew = DosHeader::END_AS_LFANEW;
                 updated.update_layout_fields()?;
             }
             *self = updated;
@@ -553,6 +553,3 @@ fn minimum_nonzero(current: u32, candidate: u32) -> u32 {
         current.min(candidate)
     }
 }
-
-/// The value of `e_lfanew` for NT headers directly after the DOS header.
-const DOS_HEADER_END: i32 = 0x40;

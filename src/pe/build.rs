@@ -1,7 +1,9 @@
 use super::{HeaderBytes, PeImage};
-use crate::coff::{CoffHeader, PE_SIGNATURE};
+use crate::coff::{CoffHeader, PE_SIGNATURE, PE_SIGNATURE_SIZE};
 use crate::dos::DosHeader;
 use crate::layout;
+use crate::optional::ImageNtHeaders32;
+use crate::parse_utils::put_u32;
 use crate::prelude::*;
 use crate::section::SectionHeader;
 use crate::{Error, Result};
@@ -446,7 +448,7 @@ impl PeImage {
         }
 
         let coff_offset = pe_offset
-            .checked_add(4)
+            .checked_add(PE_SIGNATURE_SIZE)
             .ok_or_else(|| Error::invalid_section("COFF header offset overflow"))?;
         let optional_offset = coff_offset
             .checked_add(CoffHeader::SIZE)
@@ -508,7 +510,12 @@ impl PeImage {
         self.dos_header.write(&mut dos)?;
         window.put(0, &dos);
         window.put(DosHeader::SIZE, &self.dos_stub);
-        window.put(plan.pe_offset, &PE_SIGNATURE.to_le_bytes());
+        let mut signature = [0u8; PE_SIGNATURE_SIZE];
+        put_u32::<PE_SIGNATURE_SIZE, { core::mem::offset_of!(ImageNtHeaders32, signature) }>(
+            &mut signature,
+            PE_SIGNATURE,
+        );
+        window.put(plan.pe_offset, &signature);
         let mut coff = [0u8; CoffHeader::SIZE];
         self.coff_header.write(&mut coff)?;
         window.put(plan.coff_offset, &coff);
