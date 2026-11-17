@@ -2,12 +2,13 @@
 
 use core::mem::offset_of;
 
-use super::{RawField, at, check_range, read_u16, read_u32};
-use crate::Result;
+use super::RawField;
 use crate::export::{
     ADDRESS_ENTRY_SIZE_U32, ExportDirectory, ImageExportDirectory as M, NAME_POINTER_SIZE_U32,
     ORDINAL_SIZE_U32,
 };
+use crate::parse_utils::{le_u16, le_u32};
+use crate::{Error, Result};
 
 /// The export directory (`IMAGE_EXPORT_DIRECTORY`) and the offsets of its fields.
 ///
@@ -52,22 +53,56 @@ impl RawExportDirectory {
     ///
     /// Returns an error if the directory is not in `data`.
     pub fn parse(data: &[u8], offset: usize) -> Result<Self> {
-        check_range(data, offset, Self::SIZE)?;
-        let word = |delta| read_u32(data, at(offset, delta)?);
-        let half = |delta| read_u16(data, at(offset, delta)?);
+        const N: usize = RawExportDirectory::SIZE;
+        let Some(raw) = data.get(offset..).and_then(<[u8]>::first_chunk::<N>) else {
+            return Err(Error::offset_out_of_bounds(offset, data.len()));
+        };
         Ok(Self {
             offset,
-            characteristics: word(offset_of!(M, characteristics))?,
-            time_date_stamp: word(offset_of!(M, time_date_stamp))?,
-            major_version: half(offset_of!(M, major_version))?,
-            minor_version: half(offset_of!(M, minor_version))?,
-            name_rva: word(offset_of!(M, name))?,
-            base: word(offset_of!(M, base))?,
-            number_of_functions: word(offset_of!(M, number_of_functions))?,
-            number_of_names: word(offset_of!(M, number_of_names))?,
-            address_of_functions: word(offset_of!(M, address_of_functions))?,
-            address_of_names: word(offset_of!(M, address_of_names))?,
-            address_of_name_ordinals: word(offset_of!(M, address_of_name_ordinals))?,
+            characteristics: RawField {
+                offset: offset + offset_of!(M, characteristics),
+                value: le_u32::<N, { offset_of!(M, characteristics) }>(raw),
+            },
+            time_date_stamp: RawField {
+                offset: offset + offset_of!(M, time_date_stamp),
+                value: le_u32::<N, { offset_of!(M, time_date_stamp) }>(raw),
+            },
+            major_version: RawField {
+                offset: offset + offset_of!(M, major_version),
+                value: le_u16::<N, { offset_of!(M, major_version) }>(raw),
+            },
+            minor_version: RawField {
+                offset: offset + offset_of!(M, minor_version),
+                value: le_u16::<N, { offset_of!(M, minor_version) }>(raw),
+            },
+            name_rva: RawField {
+                offset: offset + offset_of!(M, name),
+                value: le_u32::<N, { offset_of!(M, name) }>(raw),
+            },
+            base: RawField {
+                offset: offset + offset_of!(M, base),
+                value: le_u32::<N, { offset_of!(M, base) }>(raw),
+            },
+            number_of_functions: RawField {
+                offset: offset + offset_of!(M, number_of_functions),
+                value: le_u32::<N, { offset_of!(M, number_of_functions) }>(raw),
+            },
+            number_of_names: RawField {
+                offset: offset + offset_of!(M, number_of_names),
+                value: le_u32::<N, { offset_of!(M, number_of_names) }>(raw),
+            },
+            address_of_functions: RawField {
+                offset: offset + offset_of!(M, address_of_functions),
+                value: le_u32::<N, { offset_of!(M, address_of_functions) }>(raw),
+            },
+            address_of_names: RawField {
+                offset: offset + offset_of!(M, address_of_names),
+                value: le_u32::<N, { offset_of!(M, address_of_names) }>(raw),
+            },
+            address_of_name_ordinals: RawField {
+                offset: offset + offset_of!(M, address_of_name_ordinals),
+                value: le_u32::<N, { offset_of!(M, address_of_name_ordinals) }>(raw),
+            },
         })
     }
 

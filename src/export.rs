@@ -53,7 +53,7 @@
 
 use core::mem::{offset_of, size_of};
 
-use nostdio::ReadLe;
+use crate::parse_utils::{le_u16, le_u32, put_u16, put_u32};
 
 use crate::prelude::*;
 use crate::{Error, Result};
@@ -117,17 +117,6 @@ const _: () = {
     assert!(ORDINAL_SIZE == 2 && ORDINAL_SIZE_U32 == 2);
 };
 
-/// Copy `bytes` into `buf` at `offset`. The caller gives an offset and a width from a mirror
-/// struct that fit in `buf`.
-fn put(buf: &mut [u8], offset: usize, bytes: &[u8]) {
-    if let Some(dst) = buf
-        .get_mut(offset..)
-        .and_then(|rest| rest.get_mut(..bytes.len()))
-    {
-        dst.copy_from_slice(bytes);
-    }
-}
-
 /// `IMAGE_EXPORT_DIRECTORY`: the 40-byte header of the export data directory.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ExportDirectory {
@@ -166,23 +155,24 @@ impl ExportDirectory {
     /// Returns [`Error::buffer_too_small`] if `data` is shorter than
     /// [`Self::SIZE`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let Some(mut d) = data.get(..Self::SIZE) else {
+        type M = ImageExportDirectory;
+        const N: usize = ExportDirectory::SIZE;
+        let Some(raw) = data.first_chunk::<N>() else {
             return Err(Error::buffer_too_small(Self::SIZE, data.len()));
         };
 
-        // The fields are in the order of `ImageExportDirectory`, without padding.
         Ok(Self {
-            characteristics: d.read_u32_le()?,
-            time_date_stamp: d.read_u32_le()?,
-            major_version: d.read_u16_le()?,
-            minor_version: d.read_u16_le()?,
-            name_rva: d.read_u32_le()?,
-            base: d.read_u32_le()?,
-            number_of_functions: d.read_u32_le()?,
-            number_of_names: d.read_u32_le()?,
-            address_of_functions: d.read_u32_le()?,
-            address_of_names: d.read_u32_le()?,
-            address_of_name_ordinals: d.read_u32_le()?,
+            characteristics: le_u32::<N, { offset_of!(M, characteristics) }>(raw),
+            time_date_stamp: le_u32::<N, { offset_of!(M, time_date_stamp) }>(raw),
+            major_version: le_u16::<N, { offset_of!(M, major_version) }>(raw),
+            minor_version: le_u16::<N, { offset_of!(M, minor_version) }>(raw),
+            name_rva: le_u32::<N, { offset_of!(M, name) }>(raw),
+            base: le_u32::<N, { offset_of!(M, base) }>(raw),
+            number_of_functions: le_u32::<N, { offset_of!(M, number_of_functions) }>(raw),
+            number_of_names: le_u32::<N, { offset_of!(M, number_of_names) }>(raw),
+            address_of_functions: le_u32::<N, { offset_of!(M, address_of_functions) }>(raw),
+            address_of_names: le_u32::<N, { offset_of!(M, address_of_names) }>(raw),
+            address_of_name_ordinals: le_u32::<N, { offset_of!(M, address_of_name_ordinals) }>(raw),
         })
     }
 
@@ -197,67 +187,35 @@ impl ExportDirectory {
         let Some(out) = buf.first_chunk_mut::<{ ExportDirectory::SIZE }>() else {
             return Err(Error::buffer_too_small(Self::SIZE, buf_len));
         };
-        self.encode(out);
+        *out = self.encode();
         Ok(())
     }
 
     /// Serialize the export directory to bytes.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = [0u8; ExportDirectory::SIZE];
-        self.encode(&mut buf);
-        buf.to_vec()
+        self.encode().to_vec()
     }
 
-    fn encode(&self, buf: &mut [u8; ExportDirectory::SIZE]) {
+    fn encode(&self) -> [u8; ExportDirectory::SIZE] {
         type M = ImageExportDirectory;
-        put(
-            buf,
-            offset_of!(M, characteristics),
-            &self.characteristics.to_le_bytes(),
+        const N: usize = ExportDirectory::SIZE;
+        let mut raw = [0u8; N];
+        put_u32::<N, { offset_of!(M, characteristics) }>(&mut raw, self.characteristics);
+        put_u32::<N, { offset_of!(M, time_date_stamp) }>(&mut raw, self.time_date_stamp);
+        put_u16::<N, { offset_of!(M, major_version) }>(&mut raw, self.major_version);
+        put_u16::<N, { offset_of!(M, minor_version) }>(&mut raw, self.minor_version);
+        put_u32::<N, { offset_of!(M, name) }>(&mut raw, self.name_rva);
+        put_u32::<N, { offset_of!(M, base) }>(&mut raw, self.base);
+        put_u32::<N, { offset_of!(M, number_of_functions) }>(&mut raw, self.number_of_functions);
+        put_u32::<N, { offset_of!(M, number_of_names) }>(&mut raw, self.number_of_names);
+        put_u32::<N, { offset_of!(M, address_of_functions) }>(&mut raw, self.address_of_functions);
+        put_u32::<N, { offset_of!(M, address_of_names) }>(&mut raw, self.address_of_names);
+        put_u32::<N, { offset_of!(M, address_of_name_ordinals) }>(
+            &mut raw,
+            self.address_of_name_ordinals,
         );
-        put(
-            buf,
-            offset_of!(M, time_date_stamp),
-            &self.time_date_stamp.to_le_bytes(),
-        );
-        put(
-            buf,
-            offset_of!(M, major_version),
-            &self.major_version.to_le_bytes(),
-        );
-        put(
-            buf,
-            offset_of!(M, minor_version),
-            &self.minor_version.to_le_bytes(),
-        );
-        put(buf, offset_of!(M, name), &self.name_rva.to_le_bytes());
-        put(buf, offset_of!(M, base), &self.base.to_le_bytes());
-        put(
-            buf,
-            offset_of!(M, number_of_functions),
-            &self.number_of_functions.to_le_bytes(),
-        );
-        put(
-            buf,
-            offset_of!(M, number_of_names),
-            &self.number_of_names.to_le_bytes(),
-        );
-        put(
-            buf,
-            offset_of!(M, address_of_functions),
-            &self.address_of_functions.to_le_bytes(),
-        );
-        put(
-            buf,
-            offset_of!(M, address_of_names),
-            &self.address_of_names.to_le_bytes(),
-        );
-        put(
-            buf,
-            offset_of!(M, address_of_name_ordinals),
-            &self.address_of_name_ordinals.to_le_bytes(),
-        );
+        raw
     }
 }
 

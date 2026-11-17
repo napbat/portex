@@ -1,8 +1,11 @@
+use core::mem::offset_of;
+
 use super::{
-    Error, NAME_LENGTH_SIZE, NAME_LENGTH_SIZE_U32, NAME_UNIT_SIZE, Resource, ResourceDataEntry,
-    ResourceDirectory, ResourceDirectoryEntry, ResourceDirectoryHeader, ResourceId, ResourceType,
-    Result, checked_resource_rva,
+    Error, ImageResourceDirStringU, NAME_LENGTH_SIZE, NAME_LENGTH_SIZE_U32, NAME_UNIT_SIZE,
+    Resource, ResourceDataEntry, ResourceDirectory, ResourceDirectoryEntry,
+    ResourceDirectoryHeader, ResourceId, ResourceType, Result, checked_resource_rva,
 };
+use crate::parse_utils::le_u16;
 use crate::prelude::*;
 use nostdio::ReadLe;
 
@@ -529,10 +532,13 @@ where
             NAME_LENGTH_SIZE,
             "resource name length",
         )?;
-        let len = usize::from(
-            crate::parse_utils::u16_at(&len_data, 0)
-                .ok_or_else(|| Error::buffer_too_small(NAME_LENGTH_SIZE, len_data.len()))?,
-        );
+        let Some(len_raw) = len_data.first_chunk::<NAME_LENGTH_SIZE>() else {
+            return Err(Error::buffer_too_small(NAME_LENGTH_SIZE, len_data.len()));
+        };
+        let len = usize::from(le_u16::<
+            NAME_LENGTH_SIZE,
+            { offset_of!(ImageResourceDirStringU, length) },
+        >(len_raw));
         let byte_len = len
             .checked_mul(NAME_UNIT_SIZE)
             .ok_or_else(|| Error::invalid_data_directory("resource name length overflow"))?;

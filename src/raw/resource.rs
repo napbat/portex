@@ -2,12 +2,13 @@
 
 use core::mem::offset_of;
 
-use super::{RawField, at, check_range, read_u16, read_u32};
-use crate::Result;
+use super::RawField;
+use crate::parse_utils::{le_u16, le_u32};
 use crate::resource::{
     ImageResourceDataEntry, ImageResourceDirectory as M, ImageResourceDirectoryEntry,
     ResourceDataEntry, ResourceDirectoryEntry, ResourceDirectoryHeader,
 };
+use crate::{Error, Result};
 
 /// The high bit of a resource directory entry field.
 const HIGH_BIT: u32 = 0x8000_0000;
@@ -41,17 +42,36 @@ impl RawResourceDirectory {
     ///
     /// Returns an error if the directory is not in `data`.
     pub fn parse(data: &[u8], offset: usize) -> Result<Self> {
-        check_range(data, offset, Self::SIZE)?;
-        let word = |delta| read_u32(data, at(offset, delta)?);
-        let half = |delta| read_u16(data, at(offset, delta)?);
+        const N: usize = RawResourceDirectory::SIZE;
+        let Some(raw) = data.get(offset..).and_then(<[u8]>::first_chunk::<N>) else {
+            return Err(Error::offset_out_of_bounds(offset, data.len()));
+        };
         Ok(Self {
             offset,
-            characteristics: word(offset_of!(M, characteristics))?,
-            time_date_stamp: word(offset_of!(M, time_date_stamp))?,
-            major_version: half(offset_of!(M, major_version))?,
-            minor_version: half(offset_of!(M, minor_version))?,
-            number_of_named_entries: half(offset_of!(M, number_of_named_entries))?,
-            number_of_id_entries: half(offset_of!(M, number_of_id_entries))?,
+            characteristics: RawField {
+                offset: offset + offset_of!(M, characteristics),
+                value: le_u32::<N, { offset_of!(M, characteristics) }>(raw),
+            },
+            time_date_stamp: RawField {
+                offset: offset + offset_of!(M, time_date_stamp),
+                value: le_u32::<N, { offset_of!(M, time_date_stamp) }>(raw),
+            },
+            major_version: RawField {
+                offset: offset + offset_of!(M, major_version),
+                value: le_u16::<N, { offset_of!(M, major_version) }>(raw),
+            },
+            minor_version: RawField {
+                offset: offset + offset_of!(M, minor_version),
+                value: le_u16::<N, { offset_of!(M, minor_version) }>(raw),
+            },
+            number_of_named_entries: RawField {
+                offset: offset + offset_of!(M, number_of_named_entries),
+                value: le_u16::<N, { offset_of!(M, number_of_named_entries) }>(raw),
+            },
+            number_of_id_entries: RawField {
+                offset: offset + offset_of!(M, number_of_id_entries),
+                value: le_u16::<N, { offset_of!(M, number_of_id_entries) }>(raw),
+            },
         })
     }
 
@@ -93,20 +113,21 @@ impl RawResourceEntry {
     ///
     /// Returns an error if the entry is not in `data`.
     pub fn parse(data: &[u8], offset: usize) -> Result<Self> {
-        check_range(data, offset, Self::SIZE)?;
+        type E = ImageResourceDirectoryEntry;
+        const N: usize = RawResourceEntry::SIZE;
+        let Some(raw) = data.get(offset..).and_then(<[u8]>::first_chunk::<N>) else {
+            return Err(Error::offset_out_of_bounds(offset, data.len()));
+        };
         Ok(Self {
             offset,
-            name_or_id: read_u32(
-                data,
-                at(offset, offset_of!(ImageResourceDirectoryEntry, name))?,
-            )?,
-            offset_to_data: read_u32(
-                data,
-                at(
-                    offset,
-                    offset_of!(ImageResourceDirectoryEntry, offset_to_data),
-                )?,
-            )?,
+            name_or_id: RawField {
+                offset: offset + offset_of!(E, name),
+                value: le_u32::<N, { offset_of!(E, name) }>(raw),
+            },
+            offset_to_data: RawField {
+                offset: offset + offset_of!(E, offset_to_data),
+                value: le_u32::<N, { offset_of!(E, offset_to_data) }>(raw),
+            },
         })
     }
 
@@ -162,14 +183,29 @@ impl RawResourceDataEntry {
     ///
     /// Returns an error if the data entry is not in `data`.
     pub fn parse(data: &[u8], offset: usize) -> Result<Self> {
-        check_range(data, offset, Self::SIZE)?;
-        let word = |delta| read_u32(data, at(offset, delta)?);
+        type D = ImageResourceDataEntry;
+        const N: usize = RawResourceDataEntry::SIZE;
+        let Some(raw) = data.get(offset..).and_then(<[u8]>::first_chunk::<N>) else {
+            return Err(Error::offset_out_of_bounds(offset, data.len()));
+        };
         Ok(Self {
             offset,
-            offset_to_data: word(offset_of!(ImageResourceDataEntry, offset_to_data))?,
-            size: word(offset_of!(ImageResourceDataEntry, size))?,
-            code_page: word(offset_of!(ImageResourceDataEntry, code_page))?,
-            reserved: word(offset_of!(ImageResourceDataEntry, reserved))?,
+            offset_to_data: RawField {
+                offset: offset + offset_of!(D, offset_to_data),
+                value: le_u32::<N, { offset_of!(D, offset_to_data) }>(raw),
+            },
+            size: RawField {
+                offset: offset + offset_of!(D, size),
+                value: le_u32::<N, { offset_of!(D, size) }>(raw),
+            },
+            code_page: RawField {
+                offset: offset + offset_of!(D, code_page),
+                value: le_u32::<N, { offset_of!(D, code_page) }>(raw),
+            },
+            reserved: RawField {
+                offset: offset + offset_of!(D, reserved),
+                value: le_u32::<N, { offset_of!(D, reserved) }>(raw),
+            },
         })
     }
 }

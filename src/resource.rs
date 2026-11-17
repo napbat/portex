@@ -52,7 +52,7 @@
 
 use core::mem::{offset_of, size_of};
 
-use nostdio::ReadLe;
+use crate::parse_utils::{le_u16, le_u32, put_u16, put_u32};
 
 use crate::prelude::*;
 use crate::{Error, Result};
@@ -125,17 +125,6 @@ const _: () = {
     assert!(offset_of!(ImageResourceDirStringU, length) == 0);
     assert!(NAME_LENGTH_SIZE == 2 && NAME_LENGTH_SIZE_U32 == 2);
 };
-
-/// Copy `bytes` into `buf` at `offset`. The caller gives an offset and a width from a mirror
-/// struct that fit in `buf`.
-fn put(buf: &mut [u8], offset: usize, bytes: &[u8]) {
-    if let Some(dst) = buf
-        .get_mut(offset..)
-        .and_then(|rest| rest.get_mut(..bytes.len()))
-    {
-        dst.copy_from_slice(bytes);
-    }
-}
 
 /// Standard resource types (`RT_*` values used as level-1 IDs of the resource tree).
 ///
@@ -322,56 +311,38 @@ impl ResourceDirectoryHeader {
     ///
     /// Returns a buffer-too-small error if `data` is shorter than [`Self::SIZE`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let Some(mut data) = data.get(..Self::SIZE) else {
+        type M = ImageResourceDirectory;
+        const N: usize = ResourceDirectoryHeader::SIZE;
+        let Some(raw) = data.first_chunk::<N>() else {
             return Err(Error::buffer_too_small(Self::SIZE, data.len()));
         };
 
-        // The fields are in the order of `ImageResourceDirectory`, without padding.
         Ok(Self {
-            characteristics: data.read_u32_le()?,
-            time_date_stamp: data.read_u32_le()?,
-            major_version: data.read_u16_le()?,
-            minor_version: data.read_u16_le()?,
-            number_of_named_entries: data.read_u16_le()?,
-            number_of_id_entries: data.read_u16_le()?,
+            characteristics: le_u32::<N, { offset_of!(M, characteristics) }>(raw),
+            time_date_stamp: le_u32::<N, { offset_of!(M, time_date_stamp) }>(raw),
+            major_version: le_u16::<N, { offset_of!(M, major_version) }>(raw),
+            minor_version: le_u16::<N, { offset_of!(M, minor_version) }>(raw),
+            number_of_named_entries: le_u16::<N, { offset_of!(M, number_of_named_entries) }>(raw),
+            number_of_id_entries: le_u16::<N, { offset_of!(M, number_of_id_entries) }>(raw),
         })
     }
 
     /// Serialize to the little-endian on-disk layout.
     #[must_use]
     pub fn to_bytes(self) -> [u8; Self::SIZE] {
-        let mut buf = [0u8; Self::SIZE];
-        put(
-            &mut buf,
-            offset_of!(ImageResourceDirectory, characteristics),
-            &self.characteristics.to_le_bytes(),
+        type M = ImageResourceDirectory;
+        const N: usize = ResourceDirectoryHeader::SIZE;
+        let mut raw = [0u8; N];
+        put_u32::<N, { offset_of!(M, characteristics) }>(&mut raw, self.characteristics);
+        put_u32::<N, { offset_of!(M, time_date_stamp) }>(&mut raw, self.time_date_stamp);
+        put_u16::<N, { offset_of!(M, major_version) }>(&mut raw, self.major_version);
+        put_u16::<N, { offset_of!(M, minor_version) }>(&mut raw, self.minor_version);
+        put_u16::<N, { offset_of!(M, number_of_named_entries) }>(
+            &mut raw,
+            self.number_of_named_entries,
         );
-        put(
-            &mut buf,
-            offset_of!(ImageResourceDirectory, time_date_stamp),
-            &self.time_date_stamp.to_le_bytes(),
-        );
-        put(
-            &mut buf,
-            offset_of!(ImageResourceDirectory, major_version),
-            &self.major_version.to_le_bytes(),
-        );
-        put(
-            &mut buf,
-            offset_of!(ImageResourceDirectory, minor_version),
-            &self.minor_version.to_le_bytes(),
-        );
-        put(
-            &mut buf,
-            offset_of!(ImageResourceDirectory, number_of_named_entries),
-            &self.number_of_named_entries.to_le_bytes(),
-        );
-        put(
-            &mut buf,
-            offset_of!(ImageResourceDirectory, number_of_id_entries),
-            &self.number_of_id_entries.to_le_bytes(),
-        );
-        buf
+        put_u16::<N, { offset_of!(M, number_of_id_entries) }>(&mut raw, self.number_of_id_entries);
+        raw
     }
 
     /// Total number of directory entries (named entries plus ID entries) after the header.
@@ -404,32 +375,27 @@ impl ResourceDirectoryEntry {
     ///
     /// Returns a buffer-too-small error if `data` is shorter than [`Self::SIZE`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let Some(mut data) = data.get(..Self::SIZE) else {
+        type M = ImageResourceDirectoryEntry;
+        const N: usize = ResourceDirectoryEntry::SIZE;
+        let Some(raw) = data.first_chunk::<N>() else {
             return Err(Error::buffer_too_small(Self::SIZE, data.len()));
         };
 
-        // The fields are in the order of `ImageResourceDirectoryEntry`, without padding.
         Ok(Self {
-            name_or_id: data.read_u32_le()?,
-            offset_to_data: data.read_u32_le()?,
+            name_or_id: le_u32::<N, { offset_of!(M, name) }>(raw),
+            offset_to_data: le_u32::<N, { offset_of!(M, offset_to_data) }>(raw),
         })
     }
 
     /// Serialize to the little-endian on-disk layout.
     #[must_use]
     pub fn to_bytes(self) -> [u8; Self::SIZE] {
-        let mut buf = [0u8; Self::SIZE];
-        put(
-            &mut buf,
-            offset_of!(ImageResourceDirectoryEntry, name),
-            &self.name_or_id.to_le_bytes(),
-        );
-        put(
-            &mut buf,
-            offset_of!(ImageResourceDirectoryEntry, offset_to_data),
-            &self.offset_to_data.to_le_bytes(),
-        );
-        buf
+        type M = ImageResourceDirectoryEntry;
+        const N: usize = ResourceDirectoryEntry::SIZE;
+        let mut raw = [0u8; N];
+        put_u32::<N, { offset_of!(M, name) }>(&mut raw, self.name_or_id);
+        put_u32::<N, { offset_of!(M, offset_to_data) }>(&mut raw, self.offset_to_data);
+        raw
     }
 
     /// Check if this entry has a string name instead of a numeric ID.
@@ -494,44 +460,31 @@ impl ResourceDataEntry {
     ///
     /// Returns a buffer-too-small error if `data` is shorter than [`Self::SIZE`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let Some(mut data) = data.get(..Self::SIZE) else {
+        type M = ImageResourceDataEntry;
+        const N: usize = ResourceDataEntry::SIZE;
+        let Some(raw) = data.first_chunk::<N>() else {
             return Err(Error::buffer_too_small(Self::SIZE, data.len()));
         };
 
-        // The fields are in the order of `ImageResourceDataEntry`, without padding.
         Ok(Self {
-            offset_to_data: data.read_u32_le()?,
-            size: data.read_u32_le()?,
-            code_page: data.read_u32_le()?,
-            reserved: data.read_u32_le()?,
+            offset_to_data: le_u32::<N, { offset_of!(M, offset_to_data) }>(raw),
+            size: le_u32::<N, { offset_of!(M, size) }>(raw),
+            code_page: le_u32::<N, { offset_of!(M, code_page) }>(raw),
+            reserved: le_u32::<N, { offset_of!(M, reserved) }>(raw),
         })
     }
 
     /// Serialize to the little-endian on-disk layout.
     #[must_use]
     pub fn to_bytes(self) -> [u8; Self::SIZE] {
-        let mut buf = [0u8; Self::SIZE];
-        put(
-            &mut buf,
-            offset_of!(ImageResourceDataEntry, offset_to_data),
-            &self.offset_to_data.to_le_bytes(),
-        );
-        put(
-            &mut buf,
-            offset_of!(ImageResourceDataEntry, size),
-            &self.size.to_le_bytes(),
-        );
-        put(
-            &mut buf,
-            offset_of!(ImageResourceDataEntry, code_page),
-            &self.code_page.to_le_bytes(),
-        );
-        put(
-            &mut buf,
-            offset_of!(ImageResourceDataEntry, reserved),
-            &self.reserved.to_le_bytes(),
-        );
-        buf
+        type M = ImageResourceDataEntry;
+        const N: usize = ResourceDataEntry::SIZE;
+        let mut raw = [0u8; N];
+        put_u32::<N, { offset_of!(M, offset_to_data) }>(&mut raw, self.offset_to_data);
+        put_u32::<N, { offset_of!(M, size) }>(&mut raw, self.size);
+        put_u32::<N, { offset_of!(M, code_page) }>(&mut raw, self.code_page);
+        put_u32::<N, { offset_of!(M, reserved) }>(&mut raw, self.reserved);
+        raw
     }
 }
 
