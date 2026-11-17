@@ -1,8 +1,60 @@
 //! x64 `UNWIND_INFO` records and their unwind codes.
 
+use core::mem::{offset_of, size_of};
+
+use nostdio::{ReadLe, WriteLe};
+
 use super::RuntimeFunction;
 use crate::prelude::*;
 use crate::{Error, Result};
+
+/// The layout of the 4-byte header of the x64 `UNWIND_INFO`.
+///
+/// `winnt.h` does not define the structure. The Microsoft x64 exception-handling
+/// documentation does. The version (3 bits) and the flags (5 bits) share the first byte. The
+/// frame register (4 bits) and the scaled frame offset (4 bits) share the last byte.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the
+/// width of each field.
+#[repr(C)]
+pub(crate) struct UnwindInfoHeader {
+    pub(crate) version_and_flags: u8,
+    pub(crate) size_of_prolog: u8,
+    pub(crate) count_of_codes: u8,
+    pub(crate) frame_register_and_offset: u8,
+}
+
+/// The layout of the x64 `UNWIND_CODE` slot.
+///
+/// `winnt.h` does not define the structure. The Microsoft x64 exception-handling
+/// documentation does. The operation code (4 bits) and the operation info (4 bits) share the
+/// second byte.
+///
+/// Portex does not read the structure through this type. The type gives the offset and the
+/// width of each field.
+#[repr(C)]
+pub(crate) struct UnwindCodeSlot {
+    pub(crate) code_offset: u8,
+    pub(crate) unwind_op_and_info: u8,
+}
+
+const _: () = {
+    assert!(size_of::<UnwindInfoHeader>() == 4);
+    assert!(offset_of!(UnwindInfoHeader, count_of_codes) == 2);
+    assert!(offset_of!(UnwindInfoHeader, frame_register_and_offset) == 3);
+    assert!(size_of::<UnwindCodeSlot>() == 2);
+    assert!(offset_of!(UnwindCodeSlot, unwind_op_and_info) == 1);
+};
+
+/// Return the size of the `UNWIND_INFO` header and of `count_of_codes` unwind code slots.
+///
+/// The slot array is padded to a multiple of 4 bytes. Thus this is the offset of the handler
+/// RVA or of the chained `RUNTIME_FUNCTION`. A `u8` count gives at most 512 bytes, so the
+/// calculation cannot overflow.
+pub(crate) const fn unwind_codes_end(count_of_codes: u8) -> usize {
+    let codes_size = count_of_codes as usize * size_of::<UnwindCodeSlot>();
+    size_of::<UnwindInfoHeader>() + codes_size.next_multiple_of(size_of::<u32>())
+}
 
 /// An x64 unwind operation code (`UWOP_*`).
 ///
@@ -101,7 +153,7 @@ pub const UNW_FLAG_UHANDLER: u8 = 2;
 pub const UNW_FLAG_CHAININFO: u8 = 4;
 
 /// Size of the exception-handler RVA that follows the unwind codes.
-const HANDLER_RVA_SIZE: usize = 4;
+const HANDLER_RVA_SIZE: usize = size_of::<u32>();
 
 /// An x64 unwind information record (`UNWIND_INFO`).
 ///
@@ -137,7 +189,7 @@ impl UnwindInfo {
     ///
     /// The header has `version_flags`, `size_of_prolog`, `CountOfCodes` and
     /// `frame_reg_and_offset`.
-    pub const MIN_SIZE: usize = 4;
+    pub const MIN_SIZE: usize = size_of::<UnwindInfoHeader>();
 
     /// Return the version (bits 0-2).
     #[must_use]
@@ -190,36 +242,31 @@ impl UnwindInfo {
         let Some((header, after_header)) = data.split_first_chunk::<{ Self::MIN_SIZE }>() else {
             return Err(Error::buffer_too_small(Self::MIN_SIZE, data.len()));
         };
-        let [
-            version_flags,
-            size_of_prolog,
-            count_of_codes,
-            frame_reg_and_offset,
-        ] = *header;
+        let version_flags = header[offset_of!(UnwindInfoHeader, version_and_flags)];
+        let size_of_prolog = header[offset_of!(UnwindInfoHeader, size_of_prolog)];
+        let count_of_codes = header[offset_of!(UnwindInfoHeader, count_of_codes)];
+        let frame_reg_and_offset = header[offset_of!(UnwindInfoHeader, frame_register_and_offset)];
 
         Self::validate_header(version_flags)?;
 
-        // Each unwind code has 2 bytes. A `u8` count gives at most 510 bytes, and the slot
-        // array is padded to a multiple of 4 bytes.
-        let codes_size = usize::from(count_of_codes) * 2;
-        let aligned_codes_size = (codes_size + 3) & !3;
+        let codes_size = usize::from(count_of_codes) * size_of::<UnwindCodeSlot>();
         let Some(codes) = after_header.get(..codes_size) else {
             return Err(Error::buffer_too_small(
                 Self::MIN_SIZE + codes_size,
                 data.len(),
             ));
         };
-        let (code_pairs, _) = codes.as_chunks::<2>();
-        let unwind_codes = code_pairs
+        let (slots, _) = codes.as_chunks::<{ size_of::<UnwindCodeSlot>() }>();
+        let unwind_codes = slots
             .iter()
-            .map(|&[code_offset, op_and_info]| UnwindCode {
-                code_offset,
-                op_and_info,
+            .map(|slot| UnwindCode {
+                code_offset: slot[offset_of!(UnwindCodeSlot, code_offset)],
+                op_and_info: slot[offset_of!(UnwindCodeSlot, unwind_op_and_info)],
             })
             .collect();
 
         // The handler or chain data starts after the padded unwind codes.
-        let trailer_offset = Self::MIN_SIZE + aligned_codes_size;
+        let trailer_offset = unwind_codes_end(count_of_codes);
         let trailer = data.get(trailer_offset..).unwrap_or_default();
         let flags = version_flags >> 3;
 
@@ -236,14 +283,11 @@ impl UnwindInfo {
             }
             chained_function = Some(RuntimeFunction::parse(trailer)?);
         } else if (flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER)) != 0 {
-            let Some((handler, language_data)) = trailer.split_first_chunk::<HANDLER_RVA_SIZE>()
-            else {
-                return Err(Error::buffer_too_small(
-                    trailer_offset + HANDLER_RVA_SIZE,
-                    data.len(),
-                ));
-            };
-            exception_handler = Some(u32::from_le_bytes(*handler));
+            let mut language_data = trailer;
+            let handler = language_data.read_u32_le().map_err(|_| {
+                Error::buffer_too_small(trailer_offset + HANDLER_RVA_SIZE, data.len())
+            })?;
+            exception_handler = Some(handler);
             handler_data.extend_from_slice(language_data);
         }
 
@@ -300,8 +344,7 @@ impl UnwindInfo {
         }
         let count_of_codes = u8::try_from(self.unwind_codes.len())
             .map_err(|_| Error::invalid_data_directory("more than 255 unwind-code slots"))?;
-        // A `u8` count gives at most 510 bytes of unwind codes. This sum cannot overflow.
-        let codes_end = Self::MIN_SIZE + ((usize::from(count_of_codes) * 2 + 3) & !3);
+        let codes_end = unwind_codes_end(count_of_codes);
         let chained_size = self.chained_function.map_or(0, |_| RuntimeFunction::SIZE);
         let handler_size = self
             .exception_handler
@@ -317,14 +360,17 @@ impl UnwindInfo {
             .ok_or_else(|| Error::invalid_data_directory("unwind-info size overflow"))?;
 
         let mut buf = Vec::with_capacity(total_size);
-        buf.extend_from_slice(&[
-            self.version_flags,
-            self.size_of_prolog,
-            count_of_codes,
-            self.frame_reg_and_offset,
-        ]);
+        let mut header = [0; Self::MIN_SIZE];
+        header[offset_of!(UnwindInfoHeader, version_and_flags)] = self.version_flags;
+        header[offset_of!(UnwindInfoHeader, size_of_prolog)] = self.size_of_prolog;
+        header[offset_of!(UnwindInfoHeader, count_of_codes)] = count_of_codes;
+        header[offset_of!(UnwindInfoHeader, frame_register_and_offset)] = self.frame_reg_and_offset;
+        buf.extend_from_slice(&header);
         for code in &self.unwind_codes {
-            buf.extend_from_slice(&[code.code_offset, code.op_and_info]);
+            let mut slot = [0; size_of::<UnwindCodeSlot>()];
+            slot[offset_of!(UnwindCodeSlot, code_offset)] = code.code_offset;
+            slot[offset_of!(UnwindCodeSlot, unwind_op_and_info)] = code.op_and_info;
+            buf.extend_from_slice(&slot);
         }
         // Pad the unwind-code array to a multiple of 4 bytes.
         buf.resize(codes_end, 0);
@@ -332,7 +378,7 @@ impl UnwindInfo {
         if let Some(chained) = self.chained_function {
             buf.extend_from_slice(&chained.to_bytes());
         } else if let Some(handler) = self.exception_handler {
-            buf.extend_from_slice(&handler.to_le_bytes());
+            buf.write_u32_le(handler)?;
             buf.extend_from_slice(handler_data);
         }
 

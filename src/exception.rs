@@ -16,4 +16,6 @@ pub use unwind::{
     UNW_FLAG_CHAININFO, UNW_FLAG_EHANDLER, UNW_FLAG_NHANDLER, UNW_FLAG_UHANDLER, UnwindCode,
     UnwindInfo, UnwindOpCode,
 };
+pub(crate) use unwind::{UnwindInfoHeader, unwind_codes_end};
+pub(crate) use x64::ImageRuntimeFunctionEntry;
 pub use x64::{ExceptionDirectory, RuntimeFunction};

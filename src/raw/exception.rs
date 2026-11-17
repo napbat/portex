@@ -1,8 +1,13 @@
 //! Raw views of the x64 exception directory: `RUNTIME_FUNCTION` records and `UNWIND_INFO`.
 
+use core::mem::{offset_of, size_of};
+
 use super::{RawCursor, RawField, at, check_range, read_u8, read_u32};
 use crate::Result;
-use crate::exception::{RuntimeFunction, UNW_FLAG_CHAININFO, UNW_FLAG_EHANDLER, UNW_FLAG_UHANDLER};
+use crate::exception::{
+    ImageRuntimeFunctionEntry, RuntimeFunction, UNW_FLAG_CHAININFO, UNW_FLAG_EHANDLER,
+    UNW_FLAG_UHANDLER, UnwindInfoHeader, unwind_codes_end,
+};
 
 /// An x64 `RUNTIME_FUNCTION` record and the offsets of its fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,9 +35,21 @@ impl RawRuntimeFunction {
         check_range(data, offset, Self::SIZE)?;
         Ok(Self {
             offset,
-            begin_address: read_u32(data, offset)?,
-            end_address: read_u32(data, at(offset, 4)?)?,
-            unwind_info_address: read_u32(data, at(offset, 8)?)?,
+            begin_address: read_u32(
+                data,
+                at(offset, offset_of!(ImageRuntimeFunctionEntry, begin_address))?,
+            )?,
+            end_address: read_u32(
+                data,
+                at(offset, offset_of!(ImageRuntimeFunctionEntry, end_address))?,
+            )?,
+            unwind_info_address: read_u32(
+                data,
+                at(
+                    offset,
+                    offset_of!(ImageRuntimeFunctionEntry, unwind_info_address),
+                )?,
+            )?,
         })
     }
 
@@ -114,7 +131,7 @@ pub struct RawUnwindInfo {
 
 impl RawUnwindInfo {
     /// The size of the `UNWIND_INFO` header in bytes.
-    pub const HEADER_SIZE: usize = 4;
+    pub const HEADER_SIZE: usize = size_of::<UnwindInfoHeader>();
 
     /// Read the `UNWIND_INFO` header at `offset`. The method does not check the values.
     ///
@@ -125,10 +142,25 @@ impl RawUnwindInfo {
         check_range(data, offset, Self::HEADER_SIZE)?;
         Ok(Self {
             offset,
-            version_and_flags: read_u8(data, offset)?,
-            size_of_prolog: read_u8(data, at(offset, 1)?)?,
-            count_of_codes: read_u8(data, at(offset, 2)?)?,
-            frame_register_and_offset: read_u8(data, at(offset, 3)?)?,
+            version_and_flags: read_u8(
+                data,
+                at(offset, offset_of!(UnwindInfoHeader, version_and_flags))?,
+            )?,
+            size_of_prolog: read_u8(
+                data,
+                at(offset, offset_of!(UnwindInfoHeader, size_of_prolog))?,
+            )?,
+            count_of_codes: read_u8(
+                data,
+                at(offset, offset_of!(UnwindInfoHeader, count_of_codes))?,
+            )?,
+            frame_register_and_offset: read_u8(
+                data,
+                at(
+                    offset,
+                    offset_of!(UnwindInfoHeader, frame_register_and_offset),
+                )?,
+            )?,
         })
     }
 
@@ -158,8 +190,7 @@ impl RawUnwindInfo {
     /// distance from the start of the `UNWIND_INFO` to the trailer.
     #[must_use]
     pub const fn size_without_trailer(&self) -> usize {
-        let slots = self.count_of_codes.value as usize;
-        Self::HEADER_SIZE + 4 * slots.div_ceil(2)
+        unwind_codes_end(self.count_of_codes.value)
     }
 
     /// Return the offset of the trailer after the unwind codes, or `None` on overflow.

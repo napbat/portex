@@ -1,4 +1,9 @@
-use super::{Error, RelocationEntry, Result};
+use core::mem::{offset_of, size_of};
+
+use nostdio::{ReadLe, WriteLe};
+
+use super::{Error, ImageBaseRelocation, RelocationEntry, Result};
+use crate::parse_utils::u32_at;
 use crate::prelude::*;
 
 /// A block of relocations for a single 4-KiB page.
@@ -17,9 +22,7 @@ pub struct RelocationBlock {
 impl RelocationBlock {
     /// Size of the `IMAGE_BASE_RELOCATION` header (`VirtualAddress` and
     /// `SizeOfBlock`) in bytes.
-    pub const HEADER_SIZE: usize = Self::HEADER_SIZE_U32 as usize;
-    /// [`Self::HEADER_SIZE`] as a `u32`, for arithmetic on directory sizes.
-    pub(super) const HEADER_SIZE_U32: u32 = 8;
+    pub const HEADER_SIZE: usize = size_of::<ImageBaseRelocation>();
 
     /// Parse a relocation block from bytes.
     ///
@@ -33,12 +36,15 @@ impl RelocationBlock {
     /// - The block size is smaller than the header or is not a multiple of 4.
     /// - The page RVA is not aligned to 4 KiB.
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let Some((&[p0, p1, p2, p3, s0, s1, s2, s3], body)) = data.split_first_chunk::<8>() else {
+        let Some((header, body)) = data.split_first_chunk::<{ Self::HEADER_SIZE }>() else {
             return Err(Error::buffer_too_small(Self::HEADER_SIZE, data.len()));
         };
-
-        let page_rva = u32::from_le_bytes([p0, p1, p2, p3]);
-        let block_size_raw = u32::from_le_bytes([s0, s1, s2, s3]);
+        let field = |offset| {
+            u32_at(header, offset)
+                .ok_or_else(|| Error::buffer_too_small(Self::HEADER_SIZE, data.len()))
+        };
+        let page_rva = field(offset_of!(ImageBaseRelocation, virtual_address))?;
+        let block_size_raw = field(offset_of!(ImageBaseRelocation, size_of_block))?;
 
         let block_size = block_size_raw as usize;
         let Some(entries_size) = block_size
@@ -58,12 +64,12 @@ impl RelocationBlock {
         let entry_bytes = body
             .get(..entries_size)
             .ok_or_else(|| Error::buffer_too_small(block_size, data.len()))?;
-        // `entries_size` is even, so no bytes remain after the pairs.
-        let (pairs, _) = entry_bytes.as_chunks::<2>();
-        let entries = pairs
-            .iter()
-            .map(|pair| RelocationEntry::from_u16(u16::from_le_bytes(*pair)))
-            .collect();
+        // `entries_size` is a multiple of 4, so each read gets a complete entry.
+        let mut reader = entry_bytes;
+        let mut entries = Vec::with_capacity(entries_size / RelocationEntry::SIZE);
+        while !reader.is_empty() {
+            entries.push(RelocationEntry::from_u16(reader.read_u16_le()?));
+        }
 
         Ok(Self {
             page_rva,
@@ -140,20 +146,21 @@ impl RelocationBlock {
             .entries
             .len()
             .checked_add(usize::from(needs_padding))
-            .and_then(|count| count.checked_mul(2))
+            .and_then(|count| count.checked_mul(RelocationEntry::SIZE))
             .and_then(|size| Self::HEADER_SIZE.checked_add(size))
             .ok_or_else(|| Error::invalid_data_directory("relocation block size overflow"))?;
         let size_u32 = u32::try_from(size)
             .map_err(|_| Error::invalid_data_directory("relocation block exceeds u32"))?;
         let mut buf = Vec::with_capacity(size);
 
-        buf.extend_from_slice(&self.page_rva.to_le_bytes());
-        buf.extend_from_slice(&size_u32.to_le_bytes());
+        // Write the header fields in the order of `ImageBaseRelocation`.
+        buf.write_u32_le(self.page_rva)?;
+        buf.write_u32_le(size_u32)?;
         for entry in &self.entries {
-            buf.extend_from_slice(&entry.to_u16().to_le_bytes());
+            buf.write_u16_le(entry.to_u16())?;
         }
         if needs_padding {
-            buf.extend_from_slice(&[0, 0]);
+            buf.write_u16_le(0)?;
         }
 
         Ok(buf)

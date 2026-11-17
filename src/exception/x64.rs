@@ -1,7 +1,32 @@
 //! x64 `RUNTIME_FUNCTION` records and the x64 exception directory.
 
+use core::mem::{offset_of, size_of};
+
+use nostdio::ReadLe;
+
 use crate::prelude::*;
 use crate::{Error, Result};
+
+/// The layout of `IMAGE_RUNTIME_FUNCTION_ENTRY` (x64 `RUNTIME_FUNCTION`).
+///
+/// Portex does not read the structure through this type. The type gives the offset and the
+/// width of each field.
+#[repr(C)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "field names mirror the BeginAddress/EndAddress/UnwindInfoAddress fields of winnt.h"
+)]
+pub(crate) struct ImageRuntimeFunctionEntry {
+    pub(crate) begin_address: u32,
+    pub(crate) end_address: u32,
+    pub(crate) unwind_info_address: u32,
+}
+
+const _: () = {
+    assert!(size_of::<ImageRuntimeFunctionEntry>() == 12);
+    assert!(offset_of!(ImageRuntimeFunctionEntry, end_address) == 4);
+    assert!(offset_of!(ImageRuntimeFunctionEntry, unwind_info_address) == 8);
+};
 
 /// An x64 `RUNTIME_FUNCTION` entry of 12 bytes.
 ///
@@ -22,21 +47,22 @@ pub struct RuntimeFunction {
 
 impl RuntimeFunction {
     /// Size of one x64 `RUNTIME_FUNCTION` record in bytes.
-    pub const SIZE: usize = 12;
+    pub const SIZE: usize = size_of::<ImageRuntimeFunctionEntry>();
 
     /// Parse an entry from little-endian bytes.
     ///
     /// # Errors
     /// Returns an error if `data` is shorter than [`Self::SIZE`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let Some(data) = data.first_chunk::<{ Self::SIZE }>() else {
+        if data.len() < Self::SIZE {
             return Err(Error::buffer_too_small(Self::SIZE, data.len()));
-        };
-
+        }
+        // Read the fields in the order of `ImageRuntimeFunctionEntry`.
+        let mut reader = data;
         Ok(Self {
-            begin_address: u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
-            end_address: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
-            unwind_info_address: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
+            begin_address: reader.read_u32_le()?,
+            end_address: reader.read_u32_le()?,
+            unwind_info_address: reader.read_u32_le()?,
         })
     }
 
@@ -44,9 +70,22 @@ impl RuntimeFunction {
     #[must_use]
     pub fn to_bytes(self) -> [u8; Self::SIZE] {
         let mut buf = [0u8; Self::SIZE];
-        buf[0..4].copy_from_slice(&self.begin_address.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.end_address.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.unwind_info_address.to_le_bytes());
+        for (offset, value) in [
+            (
+                offset_of!(ImageRuntimeFunctionEntry, begin_address),
+                self.begin_address,
+            ),
+            (
+                offset_of!(ImageRuntimeFunctionEntry, end_address),
+                self.end_address,
+            ),
+            (
+                offset_of!(ImageRuntimeFunctionEntry, unwind_info_address),
+                self.unwind_info_address,
+            ),
+        ] {
+            buf[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
+        }
         buf
     }
 

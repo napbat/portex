@@ -1,3 +1,7 @@
+use core::mem::size_of;
+
+use nostdio::ReadLe;
+
 use super::{Error, RelocationTable, RelocationType, Result};
 use crate::prelude::*;
 
@@ -42,27 +46,27 @@ impl RelocationTable {
 
                 match entry.reloc_type {
                     RelocationType::HighLow => {
-                        let field = target_field::<4>(buffer, target_rva)?;
-                        let value = u32::from_le_bytes(*field);
+                        let field = target_field::<{ size_of::<u32>() }>(buffer, target_rva)?;
+                        let value = (&mut field.as_slice()).read_u32_le()?;
                         write_wrapped(field, i128::from(value).wrapping_add(delta));
                     }
                     RelocationType::Dir64 if is_64bit => {
-                        let field = target_field::<8>(buffer, target_rva)?;
-                        let value = u64::from_le_bytes(*field);
+                        let field = target_field::<{ size_of::<u64>() }>(buffer, target_rva)?;
+                        let value = (&mut field.as_slice()).read_u64_le()?;
                         write_wrapped(field, i128::from(value).wrapping_add(delta));
                     }
                     RelocationType::High => {
-                        let field = target_field::<2>(buffer, target_rva)?;
-                        let full = i128::from(u16::from_le_bytes(*field)) << 16;
+                        let field = target_field::<{ size_of::<u16>() }>(buffer, target_rva)?;
+                        let full = i128::from((&mut field.as_slice()).read_u16_le()?) << 16;
                         write_wrapped(field, full.wrapping_add(delta) >> 16);
                     }
                     RelocationType::Low => {
-                        let field = target_field::<2>(buffer, target_rva)?;
-                        let value = u16::from_le_bytes(*field);
+                        let field = target_field::<{ size_of::<u16>() }>(buffer, target_rva)?;
+                        let value = (&mut field.as_slice()).read_u16_le()?;
                         write_wrapped(field, i128::from(value).wrapping_add(delta));
                     }
                     RelocationType::HighAdj => {
-                        let field = target_field::<2>(buffer, target_rva)?;
+                        let field = target_field::<{ size_of::<u16>() }>(buffer, target_rva)?;
                         // The next entry holds the low half of the target, not a relocation.
                         let adjustment = entries.next().ok_or_else(|| {
                             Error::invalid_data_directory(
@@ -70,7 +74,7 @@ impl RelocationTable {
                             )
                         })?;
                         let low = i128::from(adjustment.to_u16().cast_signed());
-                        let high = i128::from(u16::from_le_bytes(*field)) << 16;
+                        let high = i128::from((&mut field.as_slice()).read_u16_le()?) << 16;
                         let relocated = high
                             .wrapping_add(low)
                             .wrapping_add(delta)

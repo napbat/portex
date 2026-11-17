@@ -1,8 +1,10 @@
 //! Raw views of the base relocation table: blocks and entries.
 
+use core::mem::{offset_of, size_of};
+
 use super::{RawCursor, RawField, at, check_range, read_u16, read_u32};
 use crate::Result;
-use crate::reloc::{RelocationEntry, RelocationType};
+use crate::reloc::{ImageBaseRelocation, RelocationEntry, RelocationType};
 
 /// A base relocation block header (`IMAGE_BASE_RELOCATION`) and the offsets of its fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,7 +19,7 @@ pub struct RawRelocationBlock {
 
 impl RawRelocationBlock {
     /// The size of `IMAGE_BASE_RELOCATION` in bytes.
-    pub const HEADER_SIZE: usize = 8;
+    pub const HEADER_SIZE: usize = size_of::<ImageBaseRelocation>();
 
     /// Read the block header at `offset`. The method does not check the values.
     ///
@@ -28,8 +30,14 @@ impl RawRelocationBlock {
         check_range(data, offset, Self::HEADER_SIZE)?;
         Ok(Self {
             offset,
-            virtual_address: read_u32(data, offset)?,
-            size_of_block: read_u32(data, at(offset, 4)?)?,
+            virtual_address: read_u32(
+                data,
+                at(offset, offset_of!(ImageBaseRelocation, virtual_address))?,
+            )?,
+            size_of_block: read_u32(
+                data,
+                at(offset, offset_of!(ImageBaseRelocation, size_of_block))?,
+            )?,
         })
     }
 
@@ -40,7 +48,7 @@ impl RawRelocationBlock {
     #[must_use]
     pub fn entries(&self) -> RawRelocations {
         let words = usize::try_from(self.size_of_block.value).map_or(usize::MAX, |size| {
-            size.saturating_sub(Self::HEADER_SIZE) / 2
+            size.saturating_sub(Self::HEADER_SIZE) / RelocationEntry::SIZE
         });
         RawRelocations {
             // An offset that overflows gives no entries, because the read fails.
@@ -128,10 +136,10 @@ impl RawCursor for RawRelocations {
         let mut words = 1;
         let mut parameter = None;
         if entry.reloc_type == RelocationType::HighAdj && self.remaining > 1 {
-            parameter = Some(read_u16(data, at(self.offset, 2)?)?);
+            parameter = Some(read_u16(data, at(self.offset, RelocationEntry::SIZE)?)?);
             words = 2;
         }
-        self.offset = at(self.offset, 2 * words)?;
+        self.offset = at(self.offset, RelocationEntry::SIZE * words)?;
         self.remaining -= words;
         Ok(Some(RawRelocation {
             offset: word.offset,

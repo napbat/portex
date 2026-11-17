@@ -65,7 +65,10 @@ pub(crate) struct ImageBaseRelocation {
     pub(crate) size_of_block: u32,
 }
 
-const _: () = assert!(core::mem::size_of::<ImageBaseRelocation>() == 8);
+const _: () = {
+    assert!(core::mem::size_of::<ImageBaseRelocation>() == 8);
+    assert!(core::mem::offset_of!(ImageBaseRelocation, size_of_block) == 4);
+};
 
 /// Base relocation types (`IMAGE_REL_BASED_*`): the high 4 bits of a relocation entry.
 ///
@@ -163,6 +166,9 @@ pub struct RelocationEntry {
 }
 
 impl RelocationEntry {
+    /// The size of one entry (a `WORD` after `IMAGE_BASE_RELOCATION`) in bytes.
+    pub(crate) const SIZE: usize = core::mem::size_of::<u16>();
+
     /// Parse an entry from its 16-bit value.
     #[must_use]
     pub fn from_u16(value: u16) -> Self {

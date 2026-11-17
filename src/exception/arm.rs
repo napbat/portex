@@ -1,7 +1,47 @@
 //! ARM and ARM64 `.pdata` records and their exception directory.
 
+use core::mem::{offset_of, size_of};
+
+use nostdio::ReadLe;
+
 use crate::prelude::*;
 use crate::{Error, Result};
+
+/// The layout of `IMAGE_ARM_RUNTIME_FUNCTION_ENTRY`.
+///
+/// The `UnwindData` union is one `u32`. Portex does not read the structure through this type.
+/// The type gives the offset and the width of each field.
+#[repr(C)]
+struct ImageArmRuntimeFunctionEntry {
+    begin_address: u32,
+    unwind_data: u32,
+}
+
+/// The layout of `IMAGE_ARM64_RUNTIME_FUNCTION_ENTRY`.
+///
+/// The `UnwindData` union is one `u32`. Portex does not read the structure through this type.
+/// The type gives the offset and the width of each field.
+#[repr(C)]
+struct ImageArm64RuntimeFunctionEntry {
+    begin_address: u32,
+    unwind_data: u32,
+}
+
+const _: () = {
+    assert!(size_of::<ImageArmRuntimeFunctionEntry>() == 8);
+    assert!(offset_of!(ImageArmRuntimeFunctionEntry, unwind_data) == 4);
+    assert!(size_of::<ImageArm64RuntimeFunctionEntry>() == 8);
+    assert!(offset_of!(ImageArm64RuntimeFunctionEntry, unwind_data) == 4);
+    // One record type serves both architectures.
+    assert!(
+        offset_of!(ImageArmRuntimeFunctionEntry, begin_address)
+            == offset_of!(ImageArm64RuntimeFunctionEntry, begin_address)
+    );
+    assert!(
+        offset_of!(ImageArmRuntimeFunctionEntry, unwind_data)
+            == offset_of!(ImageArm64RuntimeFunctionEntry, unwind_data)
+    );
+};
 
 /// An ARM or ARM64 `.pdata` record of 8 bytes.
 ///
@@ -22,19 +62,21 @@ pub struct PackedRuntimeFunction {
 
 impl PackedRuntimeFunction {
     /// Size of one ARM/ARM64 `.pdata` record in bytes.
-    pub const SIZE: usize = 8;
+    pub const SIZE: usize = size_of::<ImageArm64RuntimeFunctionEntry>();
 
     /// Parse a record from little-endian bytes.
     ///
     /// # Errors
     /// Returns an error if `data` is shorter than [`Self::SIZE`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let Some(data) = data.first_chunk::<{ Self::SIZE }>() else {
+        if data.len() < Self::SIZE {
             return Err(Error::buffer_too_small(Self::SIZE, data.len()));
-        };
+        }
+        // Read the fields in the order of `ImageArm64RuntimeFunctionEntry`.
+        let mut reader = data;
         Ok(Self {
-            begin_address: u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
-            unwind_data: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
+            begin_address: reader.read_u32_le()?,
+            unwind_data: reader.read_u32_le()?,
         })
     }
 
@@ -42,8 +84,18 @@ impl PackedRuntimeFunction {
     #[must_use]
     pub fn to_bytes(self) -> [u8; Self::SIZE] {
         let mut bytes = [0; Self::SIZE];
-        bytes[..4].copy_from_slice(&self.begin_address.to_le_bytes());
-        bytes[4..].copy_from_slice(&self.unwind_data.to_le_bytes());
+        for (offset, value) in [
+            (
+                offset_of!(ImageArm64RuntimeFunctionEntry, begin_address),
+                self.begin_address,
+            ),
+            (
+                offset_of!(ImageArm64RuntimeFunctionEntry, unwind_data),
+                self.unwind_data,
+            ),
+        ] {
+            bytes[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
+        }
         bytes
     }
 
@@ -55,6 +107,7 @@ impl PackedRuntimeFunction {
     /// - 3: ARM64 `.pdata` record link (reserved for ARM NT).
     #[must_use]
     pub const fn flag(self) -> u8 {
+        // The low byte holds the two flag bits. A `const fn` cannot use `u8::try_from`.
         self.unwind_data.to_le_bytes()[0] & 0b11
     }
 

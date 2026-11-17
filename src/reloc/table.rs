@@ -1,4 +1,7 @@
-use super::{Error, RelocationBlock, RelocationEntry, RelocationType, Result};
+use core::mem::offset_of;
+
+use super::{Error, ImageBaseRelocation, RelocationBlock, RelocationEntry, RelocationType, Result};
+use crate::parse_utils::u32_at;
 use crate::prelude::*;
 
 /// The complete relocation table.
@@ -38,7 +41,7 @@ impl RelocationTable {
             let remaining = reloc_size.checked_sub(offset).ok_or_else(|| {
                 Error::invalid_data_directory("base-relocation table size underflow")
             })?;
-            if remaining < RelocationBlock::HEADER_SIZE_U32 {
+            if (remaining as usize) < RelocationBlock::HEADER_SIZE {
                 let tail = crate::parse_utils::read_exact_rva(
                     &read_at_rva,
                     entry_rva,
@@ -59,13 +62,13 @@ impl RelocationTable {
                 RelocationBlock::HEADER_SIZE,
                 "base-relocation block header",
             )?;
-            let [p0, p1, p2, p3, s0, s1, s2, s3] =
-                <[u8; 8]>::try_from(header).map_err(|header| {
+            let field = |offset| {
+                u32_at(&header, offset).ok_or_else(|| {
                     Error::buffer_too_small(RelocationBlock::HEADER_SIZE, header.len())
-                })?;
-
-            let page_rva = u32::from_le_bytes([p0, p1, p2, p3]);
-            let block_size = u32::from_le_bytes([s0, s1, s2, s3]);
+                })
+            };
+            let page_rva = field(offset_of!(ImageBaseRelocation, virtual_address))?;
+            let block_size = field(offset_of!(ImageBaseRelocation, size_of_block))?;
 
             // Some linkers fill the end of the declared directory with zeros.
             if page_rva == 0 && block_size == 0 {
@@ -170,8 +173,8 @@ impl RelocationTable {
             // Pad to a 4-byte boundary.
             let padded_count =
                 entry_count.saturating_add(usize::from(!entry_count.is_multiple_of(2)));
-            let block_size =
-                RelocationBlock::HEADER_SIZE.saturating_add(padded_count.saturating_mul(2));
+            let block_size = RelocationBlock::HEADER_SIZE
+                .saturating_add(padded_count.saturating_mul(RelocationEntry::SIZE));
             total.saturating_add(block_size)
         })
     }
@@ -226,7 +229,7 @@ impl RelocationTable {
             block.block_size = block
                 .entries
                 .len()
-                .checked_mul(2)
+                .checked_mul(RelocationEntry::SIZE)
                 .and_then(|size| size.checked_add(RelocationBlock::HEADER_SIZE))
                 .and_then(|size| u32::try_from(size).ok())
                 .unwrap_or(u32::MAX);
@@ -266,8 +269,8 @@ impl RelocationTable {
 /// Split `rva` into its 4-KiB page RVA and an entry with the low 12 bits as the offset.
 pub(super) fn split_rva(rva: u32, reloc_type: RelocationType) -> (u32, RelocationEntry) {
     let page_rva = rva & !0xFFF;
-    let [low, high, ..] = rva.to_le_bytes();
-    let offset = u16::from_le_bytes([low, high]) & 0x0FFF;
+    // The mask keeps 12 bits, so the value always fits in `u16`.
+    let offset = u16::try_from(rva & 0x0FFF).unwrap_or_default();
     (page_rva, RelocationEntry { reloc_type, offset })
 }
 
