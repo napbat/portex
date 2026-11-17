@@ -3,7 +3,7 @@ use core::mem::{offset_of, size_of};
 use nostdio::{ReadLe, WriteLe};
 
 use super::{Error, ImageBaseRelocation, RelocationEntry, Result};
-use crate::parse_utils::u32_at;
+use crate::parse_utils::{le_u32, put_u32};
 use crate::prelude::*;
 
 /// A block of relocations for a single 4-KiB page.
@@ -36,15 +36,13 @@ impl RelocationBlock {
     /// - The block size is smaller than the header or is not a multiple of 4.
     /// - The page RVA is not aligned to 4 KiB.
     pub fn parse(data: &[u8]) -> Result<Self> {
+        const N: usize = RelocationBlock::HEADER_SIZE;
         let Some((header, body)) = data.split_first_chunk::<{ Self::HEADER_SIZE }>() else {
             return Err(Error::buffer_too_small(Self::HEADER_SIZE, data.len()));
         };
-        let field = |offset| {
-            u32_at(header, offset)
-                .ok_or_else(|| Error::buffer_too_small(Self::HEADER_SIZE, data.len()))
-        };
-        let page_rva = field(offset_of!(ImageBaseRelocation, virtual_address))?;
-        let block_size_raw = field(offset_of!(ImageBaseRelocation, size_of_block))?;
+        let page_rva = le_u32::<N, { offset_of!(ImageBaseRelocation, virtual_address) }>(header);
+        let block_size_raw =
+            le_u32::<N, { offset_of!(ImageBaseRelocation, size_of_block) }>(header);
 
         let block_size = block_size_raw as usize;
         let Some(entries_size) = block_size
@@ -115,6 +113,7 @@ impl RelocationBlock {
     /// - The target RVA of an entry overflows.
     /// - The block size is more than `u32::MAX`.
     pub fn try_to_bytes(&self) -> Result<Vec<u8>> {
+        const N: usize = RelocationBlock::HEADER_SIZE;
         if !self.page_rva.is_multiple_of(0x1000) {
             return Err(Error::invalid_data_directory(format!(
                 "base-relocation page RVA {:#x} is not 4-KiB aligned",
@@ -153,9 +152,13 @@ impl RelocationBlock {
             .map_err(|_| Error::invalid_data_directory("relocation block exceeds u32"))?;
         let mut buf = Vec::with_capacity(size);
 
-        // Write the header fields in the order of `ImageBaseRelocation`.
-        buf.write_u32_le(self.page_rva)?;
-        buf.write_u32_le(size_u32)?;
+        let mut header = [0u8; N];
+        put_u32::<N, { offset_of!(ImageBaseRelocation, virtual_address) }>(
+            &mut header,
+            self.page_rva,
+        );
+        put_u32::<N, { offset_of!(ImageBaseRelocation, size_of_block) }>(&mut header, size_u32);
+        buf.extend_from_slice(&header);
         for entry in &self.entries {
             buf.write_u16_le(entry.to_u16())?;
         }

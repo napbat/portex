@@ -5,6 +5,7 @@ use core::mem::{offset_of, size_of};
 use nostdio::{ReadLe, WriteLe};
 
 use super::RuntimeFunction;
+use crate::parse_utils::{le_u8, put_u8};
 use crate::prelude::*;
 use crate::{Error, Result};
 
@@ -239,13 +240,16 @@ impl UnwindInfo {
     ///   trailing handler or chain data.
     /// - The version or the flags are unsupported or inconsistent.
     pub fn parse(data: &[u8]) -> Result<Self> {
+        const N: usize = UnwindInfo::MIN_SIZE;
+        const SLOT: usize = size_of::<UnwindCodeSlot>();
         let Some((header, after_header)) = data.split_first_chunk::<{ Self::MIN_SIZE }>() else {
             return Err(Error::buffer_too_small(Self::MIN_SIZE, data.len()));
         };
-        let version_flags = header[offset_of!(UnwindInfoHeader, version_and_flags)];
-        let size_of_prolog = header[offset_of!(UnwindInfoHeader, size_of_prolog)];
-        let count_of_codes = header[offset_of!(UnwindInfoHeader, count_of_codes)];
-        let frame_reg_and_offset = header[offset_of!(UnwindInfoHeader, frame_register_and_offset)];
+        let version_flags = le_u8::<N, { offset_of!(UnwindInfoHeader, version_and_flags) }>(header);
+        let size_of_prolog = le_u8::<N, { offset_of!(UnwindInfoHeader, size_of_prolog) }>(header);
+        let count_of_codes = le_u8::<N, { offset_of!(UnwindInfoHeader, count_of_codes) }>(header);
+        let frame_reg_and_offset =
+            le_u8::<N, { offset_of!(UnwindInfoHeader, frame_register_and_offset) }>(header);
 
         Self::validate_header(version_flags)?;
 
@@ -256,12 +260,14 @@ impl UnwindInfo {
                 data.len(),
             ));
         };
-        let (slots, _) = codes.as_chunks::<{ size_of::<UnwindCodeSlot>() }>();
+        let (slots, _) = codes.as_chunks::<SLOT>();
         let unwind_codes = slots
             .iter()
             .map(|slot| UnwindCode {
-                code_offset: slot[offset_of!(UnwindCodeSlot, code_offset)],
-                op_and_info: slot[offset_of!(UnwindCodeSlot, unwind_op_and_info)],
+                code_offset: le_u8::<SLOT, { offset_of!(UnwindCodeSlot, code_offset) }>(slot),
+                op_and_info: le_u8::<SLOT, { offset_of!(UnwindCodeSlot, unwind_op_and_info) }>(
+                    slot,
+                ),
             })
             .collect();
 
@@ -336,6 +342,8 @@ impl UnwindInfo {
     /// - `handler_data` is nonempty and the record has no handler.
     /// - A size calculation overflows.
     pub fn try_to_bytes_with_handler_data(&self, handler_data: &[u8]) -> Result<Vec<u8>> {
+        const N: usize = UnwindInfo::MIN_SIZE;
+        const SLOT: usize = size_of::<UnwindCodeSlot>();
         self.validate()?;
         if !handler_data.is_empty() && self.exception_handler.is_none() {
             return Err(Error::invalid_data_directory(
@@ -360,16 +368,31 @@ impl UnwindInfo {
             .ok_or_else(|| Error::invalid_data_directory("unwind-info size overflow"))?;
 
         let mut buf = Vec::with_capacity(total_size);
-        let mut header = [0; Self::MIN_SIZE];
-        header[offset_of!(UnwindInfoHeader, version_and_flags)] = self.version_flags;
-        header[offset_of!(UnwindInfoHeader, size_of_prolog)] = self.size_of_prolog;
-        header[offset_of!(UnwindInfoHeader, count_of_codes)] = count_of_codes;
-        header[offset_of!(UnwindInfoHeader, frame_register_and_offset)] = self.frame_reg_and_offset;
+        let mut header = [0; N];
+        put_u8::<N, { offset_of!(UnwindInfoHeader, version_and_flags) }>(
+            &mut header,
+            self.version_flags,
+        );
+        put_u8::<N, { offset_of!(UnwindInfoHeader, size_of_prolog) }>(
+            &mut header,
+            self.size_of_prolog,
+        );
+        put_u8::<N, { offset_of!(UnwindInfoHeader, count_of_codes) }>(&mut header, count_of_codes);
+        put_u8::<N, { offset_of!(UnwindInfoHeader, frame_register_and_offset) }>(
+            &mut header,
+            self.frame_reg_and_offset,
+        );
         buf.extend_from_slice(&header);
         for code in &self.unwind_codes {
-            let mut slot = [0; size_of::<UnwindCodeSlot>()];
-            slot[offset_of!(UnwindCodeSlot, code_offset)] = code.code_offset;
-            slot[offset_of!(UnwindCodeSlot, unwind_op_and_info)] = code.op_and_info;
+            let mut slot = [0; SLOT];
+            put_u8::<SLOT, { offset_of!(UnwindCodeSlot, code_offset) }>(
+                &mut slot,
+                code.code_offset,
+            );
+            put_u8::<SLOT, { offset_of!(UnwindCodeSlot, unwind_op_and_info) }>(
+                &mut slot,
+                code.op_and_info,
+            );
             buf.extend_from_slice(&slot);
         }
         // Pad the unwind-code array to a multiple of 4 bytes.

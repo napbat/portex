@@ -29,7 +29,7 @@ pub use function_override::{FunctionOverride, FunctionOverrideHeader, FunctionOv
 
 use core::mem::{offset_of, size_of};
 
-use crate::parse_utils::{u32_at, u64_at};
+use crate::parse_utils::{le_u32, le_u64};
 use crate::prelude::*;
 use crate::{Error, Result};
 
@@ -137,14 +137,14 @@ impl DynamicRelocationTable {
         is_64bit: bool,
         read: impl Fn(u32, usize) -> Option<Vec<u8>>,
     ) -> Result<Self> {
+        const N: usize = DynamicRelocationTable::HEADER_SIZE;
         let name = "IMAGE_DYNAMIC_RELOCATION_TABLE";
         let header = read(rva, Self::HEADER_SIZE).ok_or_else(|| invalid(rva, name))?;
-        let (Some(version), Some(size)) = (
-            u32_at(&header, offset_of!(ImageDynamicRelocationTable, version)),
-            u32_at(&header, offset_of!(ImageDynamicRelocationTable, size)),
-        ) else {
+        let Some(header) = header.first_chunk::<N>() else {
             return Err(invalid(rva, name));
         };
+        let version = le_u32::<N, { offset_of!(ImageDynamicRelocationTable, version) }>(header);
+        let size = le_u32::<N, { offset_of!(ImageDynamicRelocationTable, size) }>(header);
         let mut table = Self {
             rva,
             version,
@@ -239,24 +239,19 @@ impl<'a> DynamicRelocations<'a> {
         let header_end = self.position.checked_add(header_size).ok_or_else(fail)?;
         let header = self.data.get(self.position..header_end).ok_or_else(fail)?;
         let (symbol, size) = if self.is_64bit {
+            const N: usize = size_of::<ImageDynamicRelocation64>();
+            let header = header.first_chunk::<N>().ok_or_else(fail)?;
             (
-                u64_at(header, offset_of!(ImageDynamicRelocation64, symbol)),
-                u32_at(
-                    header,
-                    offset_of!(ImageDynamicRelocation64, base_reloc_size),
-                ),
+                le_u64::<N, { offset_of!(ImageDynamicRelocation64, symbol) }>(header),
+                le_u32::<N, { offset_of!(ImageDynamicRelocation64, base_reloc_size) }>(header),
             )
         } else {
+            const N: usize = size_of::<ImageDynamicRelocation32>();
+            let header = header.first_chunk::<N>().ok_or_else(fail)?;
             (
-                u32_at(header, offset_of!(ImageDynamicRelocation32, symbol)).map(u64::from),
-                u32_at(
-                    header,
-                    offset_of!(ImageDynamicRelocation32, base_reloc_size),
-                ),
+                u64::from(le_u32::<N, { offset_of!(ImageDynamicRelocation32, symbol) }>(header)),
+                le_u32::<N, { offset_of!(ImageDynamicRelocation32, base_reloc_size) }>(header),
             )
-        };
-        let (Some(symbol), Some(size)) = (symbol, size) else {
-            return Err(fail());
         };
         let body_end = usize::try_from(size)
             .ok()

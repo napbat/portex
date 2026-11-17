@@ -6,7 +6,7 @@ use nostdio::ReadLe;
 
 use super::{invalid, rva_at};
 use crate::Result;
-use crate::parse_utils::u32_at;
+use crate::parse_utils::le_u32;
 use crate::reloc::ImageBaseRelocation;
 
 /// The name of the block header in errors.
@@ -60,13 +60,13 @@ impl<'a> DynamicRelocationBlocks<'a> {
 
     /// Read the block at the current position.
     fn read_block(&mut self) -> Result<DynamicRelocationBlock<'a>> {
+        const N: usize = size_of::<ImageBaseRelocation>();
         let rva = rva_at(self.rva, self.position);
         let fail = || invalid(rva, BLOCK);
         let rest = self.data.get(self.position..).ok_or_else(fail)?;
-        let page_rva =
-            u32_at(rest, offset_of!(ImageBaseRelocation, virtual_address)).ok_or_else(fail)?;
-        let block_size =
-            u32_at(rest, offset_of!(ImageBaseRelocation, size_of_block)).ok_or_else(fail)?;
+        let header = rest.first_chunk::<N>().ok_or_else(fail)?;
+        let page_rva = le_u32::<N, { offset_of!(ImageBaseRelocation, virtual_address) }>(header);
+        let block_size = le_u32::<N, { offset_of!(ImageBaseRelocation, size_of_block) }>(header);
         let size = usize::try_from(block_size)
             .ok()
             .filter(|&size| size >= Self::HEADER_SIZE)

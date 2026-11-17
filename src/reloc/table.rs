@@ -1,7 +1,7 @@
 use core::mem::offset_of;
 
 use super::{Error, ImageBaseRelocation, RelocationBlock, RelocationEntry, RelocationType, Result};
-use crate::parse_utils::u32_at;
+use crate::parse_utils::le_u32;
 use crate::prelude::*;
 
 /// The complete relocation table.
@@ -31,6 +31,7 @@ impl RelocationTable {
     where
         F: Fn(u32, usize) -> Option<Vec<u8>>,
     {
+        const N: usize = RelocationBlock::HEADER_SIZE;
         let mut blocks = Vec::new();
         let mut offset = 0u32;
 
@@ -62,13 +63,13 @@ impl RelocationTable {
                 RelocationBlock::HEADER_SIZE,
                 "base-relocation block header",
             )?;
-            let field = |offset| {
-                u32_at(&header, offset).ok_or_else(|| {
-                    Error::buffer_too_small(RelocationBlock::HEADER_SIZE, header.len())
-                })
+            let Some(header) = header.first_chunk::<N>() else {
+                return Err(Error::buffer_too_small(N, header.len()));
             };
-            let page_rva = field(offset_of!(ImageBaseRelocation, virtual_address))?;
-            let block_size = field(offset_of!(ImageBaseRelocation, size_of_block))?;
+            let page_rva =
+                le_u32::<N, { offset_of!(ImageBaseRelocation, virtual_address) }>(header);
+            let block_size =
+                le_u32::<N, { offset_of!(ImageBaseRelocation, size_of_block) }>(header);
 
             // Some linkers fill the end of the declared directory with zeros.
             if page_rva == 0 && block_size == 0 {

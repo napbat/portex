@@ -2,12 +2,13 @@
 
 use core::mem::{offset_of, size_of};
 
-use super::{RawCursor, RawField, at, check_range, read_u8, read_u32};
-use crate::Result;
+use super::{RawCursor, RawField, at};
 use crate::exception::{
     ImageRuntimeFunctionEntry, RuntimeFunction, UNW_FLAG_CHAININFO, UNW_FLAG_EHANDLER,
     UNW_FLAG_UHANDLER, UnwindInfoHeader, unwind_codes_end,
 };
+use crate::parse_utils::{le_u8, le_u32};
+use crate::{Error, Result};
 
 /// An x64 `RUNTIME_FUNCTION` record and the offsets of its fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,24 +33,28 @@ impl RawRuntimeFunction {
     ///
     /// Returns an error if the record is not in `data`.
     pub fn parse(data: &[u8], offset: usize) -> Result<Self> {
-        check_range(data, offset, Self::SIZE)?;
+        const N: usize = RawRuntimeFunction::SIZE;
+        const BEGIN: usize = offset_of!(ImageRuntimeFunctionEntry, begin_address);
+        const END: usize = offset_of!(ImageRuntimeFunctionEntry, end_address);
+        const UNWIND: usize = offset_of!(ImageRuntimeFunctionEntry, unwind_info_address);
+        let Some(raw) = data.get(offset..).and_then(<[u8]>::first_chunk::<N>) else {
+            return Err(Error::offset_out_of_bounds(offset, data.len()));
+        };
+        // The record is in `data`, so `offset + N` does not overflow.
         Ok(Self {
             offset,
-            begin_address: read_u32(
-                data,
-                at(offset, offset_of!(ImageRuntimeFunctionEntry, begin_address))?,
-            )?,
-            end_address: read_u32(
-                data,
-                at(offset, offset_of!(ImageRuntimeFunctionEntry, end_address))?,
-            )?,
-            unwind_info_address: read_u32(
-                data,
-                at(
-                    offset,
-                    offset_of!(ImageRuntimeFunctionEntry, unwind_info_address),
-                )?,
-            )?,
+            begin_address: RawField {
+                offset: offset + BEGIN,
+                value: le_u32::<N, BEGIN>(raw),
+            },
+            end_address: RawField {
+                offset: offset + END,
+                value: le_u32::<N, END>(raw),
+            },
+            unwind_info_address: RawField {
+                offset: offset + UNWIND,
+                value: le_u32::<N, UNWIND>(raw),
+            },
         })
     }
 
@@ -139,28 +144,25 @@ impl RawUnwindInfo {
     ///
     /// Returns an error if the header is not in `data`.
     pub fn parse(data: &[u8], offset: usize) -> Result<Self> {
-        check_range(data, offset, Self::HEADER_SIZE)?;
+        const N: usize = RawUnwindInfo::HEADER_SIZE;
+        const VERSION: usize = offset_of!(UnwindInfoHeader, version_and_flags);
+        const PROLOG: usize = offset_of!(UnwindInfoHeader, size_of_prolog);
+        const CODES: usize = offset_of!(UnwindInfoHeader, count_of_codes);
+        const FRAME: usize = offset_of!(UnwindInfoHeader, frame_register_and_offset);
+        let Some(raw) = data.get(offset..).and_then(<[u8]>::first_chunk::<N>) else {
+            return Err(Error::offset_out_of_bounds(offset, data.len()));
+        };
+        // The header is in `data`, so `offset + N` does not overflow.
+        let field = |at: usize, value: u8| RawField {
+            offset: offset + at,
+            value,
+        };
         Ok(Self {
             offset,
-            version_and_flags: read_u8(
-                data,
-                at(offset, offset_of!(UnwindInfoHeader, version_and_flags))?,
-            )?,
-            size_of_prolog: read_u8(
-                data,
-                at(offset, offset_of!(UnwindInfoHeader, size_of_prolog))?,
-            )?,
-            count_of_codes: read_u8(
-                data,
-                at(offset, offset_of!(UnwindInfoHeader, count_of_codes))?,
-            )?,
-            frame_register_and_offset: read_u8(
-                data,
-                at(
-                    offset,
-                    offset_of!(UnwindInfoHeader, frame_register_and_offset),
-                )?,
-            )?,
+            version_and_flags: field(VERSION, le_u8::<N, VERSION>(raw)),
+            size_of_prolog: field(PROLOG, le_u8::<N, PROLOG>(raw)),
+            count_of_codes: field(CODES, le_u8::<N, CODES>(raw)),
+            frame_register_and_offset: field(FRAME, le_u8::<N, FRAME>(raw)),
         })
     }
 

@@ -2,8 +2,7 @@
 
 use core::mem::{offset_of, size_of};
 
-use nostdio::ReadLe;
-
+use crate::parse_utils::{le_u32, put_u32};
 use crate::prelude::*;
 use crate::{Error, Result};
 
@@ -69,33 +68,33 @@ impl PackedRuntimeFunction {
     /// # Errors
     /// Returns an error if `data` is shorter than [`Self::SIZE`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        if data.len() < Self::SIZE {
+        const N: usize = PackedRuntimeFunction::SIZE;
+        let Some(raw) = data.first_chunk::<N>() else {
             return Err(Error::buffer_too_small(Self::SIZE, data.len()));
-        }
-        // Read the fields in the order of `ImageArm64RuntimeFunctionEntry`.
-        let mut reader = data;
+        };
         Ok(Self {
-            begin_address: reader.read_u32_le()?,
-            unwind_data: reader.read_u32_le()?,
+            begin_address: le_u32::<N, { offset_of!(ImageArm64RuntimeFunctionEntry, begin_address) }>(
+                raw,
+            ),
+            unwind_data: le_u32::<N, { offset_of!(ImageArm64RuntimeFunctionEntry, unwind_data) }>(
+                raw,
+            ),
         })
     }
 
     /// Serialize to little-endian bytes.
     #[must_use]
     pub fn to_bytes(self) -> [u8; Self::SIZE] {
-        let mut bytes = [0; Self::SIZE];
-        for (offset, value) in [
-            (
-                offset_of!(ImageArm64RuntimeFunctionEntry, begin_address),
-                self.begin_address,
-            ),
-            (
-                offset_of!(ImageArm64RuntimeFunctionEntry, unwind_data),
-                self.unwind_data,
-            ),
-        ] {
-            bytes[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
-        }
+        const N: usize = PackedRuntimeFunction::SIZE;
+        let mut bytes = [0; N];
+        put_u32::<N, { offset_of!(ImageArm64RuntimeFunctionEntry, begin_address) }>(
+            &mut bytes,
+            self.begin_address,
+        );
+        put_u32::<N, { offset_of!(ImageArm64RuntimeFunctionEntry, unwind_data) }>(
+            &mut bytes,
+            self.unwind_data,
+        );
         bytes
     }
 

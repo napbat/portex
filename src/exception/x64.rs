@@ -2,8 +2,7 @@
 
 use core::mem::{offset_of, size_of};
 
-use nostdio::ReadLe;
-
+use crate::parse_utils::{le_u32, put_u32};
 use crate::prelude::*;
 use crate::{Error, Result};
 
@@ -54,38 +53,39 @@ impl RuntimeFunction {
     /// # Errors
     /// Returns an error if `data` is shorter than [`Self::SIZE`].
     pub fn parse(data: &[u8]) -> Result<Self> {
-        if data.len() < Self::SIZE {
+        const N: usize = RuntimeFunction::SIZE;
+        let Some(raw) = data.first_chunk::<N>() else {
             return Err(Error::buffer_too_small(Self::SIZE, data.len()));
-        }
-        // Read the fields in the order of `ImageRuntimeFunctionEntry`.
-        let mut reader = data;
+        };
         Ok(Self {
-            begin_address: reader.read_u32_le()?,
-            end_address: reader.read_u32_le()?,
-            unwind_info_address: reader.read_u32_le()?,
+            begin_address: le_u32::<N, { offset_of!(ImageRuntimeFunctionEntry, begin_address) }>(
+                raw,
+            ),
+            end_address: le_u32::<N, { offset_of!(ImageRuntimeFunctionEntry, end_address) }>(raw),
+            unwind_info_address: le_u32::<
+                N,
+                { offset_of!(ImageRuntimeFunctionEntry, unwind_info_address) },
+            >(raw),
         })
     }
 
     /// Serialize the entry to little-endian bytes.
     #[must_use]
     pub fn to_bytes(self) -> [u8; Self::SIZE] {
-        let mut buf = [0u8; Self::SIZE];
-        for (offset, value) in [
-            (
-                offset_of!(ImageRuntimeFunctionEntry, begin_address),
-                self.begin_address,
-            ),
-            (
-                offset_of!(ImageRuntimeFunctionEntry, end_address),
-                self.end_address,
-            ),
-            (
-                offset_of!(ImageRuntimeFunctionEntry, unwind_info_address),
-                self.unwind_info_address,
-            ),
-        ] {
-            buf[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
-        }
+        const N: usize = RuntimeFunction::SIZE;
+        let mut buf = [0u8; N];
+        put_u32::<N, { offset_of!(ImageRuntimeFunctionEntry, begin_address) }>(
+            &mut buf,
+            self.begin_address,
+        );
+        put_u32::<N, { offset_of!(ImageRuntimeFunctionEntry, end_address) }>(
+            &mut buf,
+            self.end_address,
+        );
+        put_u32::<N, { offset_of!(ImageRuntimeFunctionEntry, unwind_info_address) }>(
+            &mut buf,
+            self.unwind_info_address,
+        );
         buf
     }
 

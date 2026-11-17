@@ -2,9 +2,10 @@
 
 use core::mem::{offset_of, size_of};
 
-use super::{RawCursor, RawField, at, check_range, read_u16, read_u32};
-use crate::Result;
+use super::{RawCursor, RawField, at, read_u16};
+use crate::parse_utils::le_u32;
 use crate::reloc::{ImageBaseRelocation, RelocationEntry, RelocationType};
+use crate::{Error, Result};
 
 /// A base relocation block header (`IMAGE_BASE_RELOCATION`) and the offsets of its fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,17 +28,23 @@ impl RawRelocationBlock {
     ///
     /// Returns an error if the header is not in `data`.
     pub fn parse(data: &[u8], offset: usize) -> Result<Self> {
-        check_range(data, offset, Self::HEADER_SIZE)?;
+        const N: usize = RawRelocationBlock::HEADER_SIZE;
+        const VIRTUAL_ADDRESS: usize = offset_of!(ImageBaseRelocation, virtual_address);
+        const SIZE_OF_BLOCK: usize = offset_of!(ImageBaseRelocation, size_of_block);
+        let Some(raw) = data.get(offset..).and_then(<[u8]>::first_chunk::<N>) else {
+            return Err(Error::offset_out_of_bounds(offset, data.len()));
+        };
+        // The header is in `data`, so `offset + N` does not overflow.
         Ok(Self {
             offset,
-            virtual_address: read_u32(
-                data,
-                at(offset, offset_of!(ImageBaseRelocation, virtual_address))?,
-            )?,
-            size_of_block: read_u32(
-                data,
-                at(offset, offset_of!(ImageBaseRelocation, size_of_block))?,
-            )?,
+            virtual_address: RawField {
+                offset: offset + VIRTUAL_ADDRESS,
+                value: le_u32::<N, VIRTUAL_ADDRESS>(raw),
+            },
+            size_of_block: RawField {
+                offset: offset + SIZE_OF_BLOCK,
+                value: le_u32::<N, SIZE_OF_BLOCK>(raw),
+            },
         })
     }
 
@@ -129,6 +136,8 @@ impl RawCursor for RawRelocations {
         if self.remaining == 0 {
             return Ok(None);
         }
+        // Entries are a variable-length stream (a `HIGHADJ` entry takes a second word), so
+        // each word is read at its run-time offset.
         let word = read_u16(data, self.offset)?;
         let entry = RelocationEntry::from_u16(word.value);
         // Read the parameter word before the cursor moves. A failed read then keeps the

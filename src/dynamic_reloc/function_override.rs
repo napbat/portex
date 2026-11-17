@@ -6,7 +6,7 @@ use nostdio::ReadLe;
 
 use super::{DynamicRelocationBlocks, invalid, rva_at};
 use crate::Result;
-use crate::parse_utils::u32_at;
+use crate::parse_utils::le_u32;
 
 /// The layout of `IMAGE_FUNCTION_OVERRIDE_HEADER`.
 #[repr(C)]
@@ -46,12 +46,11 @@ impl<'a> FunctionOverrideHeader<'a> {
 
     /// Parse the body `data` of a record. The body starts at `rva`.
     pub(super) fn parse(data: &'a [u8], rva: u32) -> Result<Self> {
+        const N: usize = size_of::<ImageFunctionOverrideHeader>();
         let fail = || invalid(rva, "IMAGE_FUNCTION_OVERRIDE_HEADER");
-        let size = u32_at(
-            data,
-            offset_of!(ImageFunctionOverrideHeader, func_override_size),
-        )
-        .ok_or_else(fail)?;
+        let header = data.first_chunk::<N>().ok_or_else(fail)?;
+        let size =
+            le_u32::<N, { offset_of!(ImageFunctionOverrideHeader, func_override_size) }>(header);
         let end = usize::try_from(size)
             .ok()
             .and_then(|size| Self::HEADER_SIZE.checked_add(size))
@@ -118,27 +117,26 @@ pub struct FunctionOverrides<'a> {
 impl<'a> FunctionOverrides<'a> {
     /// Read the override record at the current position.
     fn read_override(&mut self) -> Result<FunctionOverride<'a>> {
+        const N: usize = size_of::<ImageFunctionOverrideDynamicRelocation>();
         let rva = rva_at(self.rva, self.position);
         let fail = || invalid(rva, "IMAGE_FUNCTION_OVERRIDE_DYNAMIC_RELOCATION");
         let rest = self.data.get(self.position..).ok_or_else(fail)?;
-        let field = |offset| u32_at(rest, offset).ok_or_else(fail);
-        let original_rva = field(offset_of!(
-            ImageFunctionOverrideDynamicRelocation,
-            original_rva
-        ))?;
-        let bdd_offset = field(offset_of!(
-            ImageFunctionOverrideDynamicRelocation,
-            bdd_offset
-        ))?;
-        let rva_size = usize::try_from(field(offset_of!(
-            ImageFunctionOverrideDynamicRelocation,
-            rva_size
-        ))?)
+        let header = rest.first_chunk::<N>().ok_or_else(fail)?;
+        let original_rva = le_u32::<
+            N,
+            { offset_of!(ImageFunctionOverrideDynamicRelocation, original_rva) },
+        >(header);
+        let bdd_offset =
+            le_u32::<N, { offset_of!(ImageFunctionOverrideDynamicRelocation, bdd_offset) }>(header);
+        let rva_size = usize::try_from(le_u32::<
+            N,
+            { offset_of!(ImageFunctionOverrideDynamicRelocation, rva_size) },
+        >(header))
         .map_err(|_| fail())?;
-        let reloc_size = usize::try_from(field(offset_of!(
-            ImageFunctionOverrideDynamicRelocation,
-            base_reloc_size
-        ))?)
+        let reloc_size = usize::try_from(le_u32::<
+            N,
+            { offset_of!(ImageFunctionOverrideDynamicRelocation, base_reloc_size) },
+        >(header))
         .map_err(|_| fail())?;
         if !rva_size.is_multiple_of(4) {
             return Err(fail());
