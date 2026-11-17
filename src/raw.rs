@@ -20,7 +20,7 @@ mod exception;
 mod export;
 mod headers;
 mod import;
-mod loadconfig;
+mod load_config;
 mod reloc;
 mod resource;
 
@@ -30,7 +30,7 @@ pub use headers::HeaderOffsets;
 pub use import::{
     ImportTableEnd, RawAddressTable, RawImportByName, RawImportDescriptor, RawImportDescriptors,
 };
-pub use loadconfig::RawLoadConfigDirectory;
+pub use load_config::RawLoadConfigDirectory;
 pub use reloc::{RawRelocation, RawRelocationBlock, RawRelocationBlocks, RawRelocations};
 pub use resource::{RawResourceDataEntry, RawResourceDirectory, RawResourceEntry};
 

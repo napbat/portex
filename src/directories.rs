@@ -21,9 +21,9 @@ pub use crate::export::{
 pub use crate::import::{
     ImportDescriptor, ImportTable, ImportTableBuilder, ImportThunk, ImportedDll,
 };
-pub use crate::loadconfig::{
+pub use crate::load_config::{
     CfgSettings, LoadConfigBuilder, LoadConfigDirectory, LoadConfigDirectory32,
-    LoadConfigDirectory64,
+    LoadConfigDirectory64, LoadConfigField,
 };
 pub use crate::raw::{
     ImportTableEnd, RawAddressTable, RawCursor, RawExportDirectory, RawField, RawImportByName,

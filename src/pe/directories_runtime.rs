@@ -482,7 +482,7 @@ impl PeImage {
     ///
     /// Returns an error if the `Size` field or the structure it describes
     /// cannot be read at the directory RVA, or if the structure is malformed.
-    pub fn load_config(&self) -> Result<Option<crate::loadconfig::LoadConfigDirectory>> {
+    pub fn load_config(&self) -> Result<Option<crate::load_config::LoadConfigDirectory>> {
         use crate::data_dir::DataDirectoryType;
 
         let Some(directory) = self
@@ -501,7 +501,7 @@ impl PeImage {
         let data = self
             .read_rva(directory.virtual_address, length as usize)
             .ok_or_else(invalid)?;
-        Ok(Some(crate::loadconfig::LoadConfigDirectory::parse(
+        Ok(Some(crate::load_config::LoadConfigDirectory::parse(
             &data,
             self.is_64bit(),
         )?))
@@ -538,7 +538,7 @@ impl PeImage {
     /// change.
     pub fn update_load_config(
         &mut self,
-        config: &crate::loadconfig::LoadConfigDirectory,
+        config: &crate::load_config::LoadConfigDirectory,
         target_section: Option<usize>,
     ) -> Result<u32> {
         self.transact(|image| image.update_load_config_in(config, target_section))
@@ -548,11 +548,11 @@ impl PeImage {
     /// half updated.
     fn update_load_config_in(
         &mut self,
-        config: &crate::loadconfig::LoadConfigDirectory,
+        config: &crate::load_config::LoadConfigDirectory,
         target_section: Option<usize>,
     ) -> Result<u32> {
         use crate::data_dir::DataDirectoryType;
-        use crate::loadconfig::LoadConfigBuilder;
+        use crate::load_config::LoadConfigBuilder;
         self.ensure_data_directory_slot(DataDirectoryType::LoadConfig)?;
 
         // Build the LoadConfig data.

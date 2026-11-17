@@ -2,14 +2,26 @@
 //!
 //! The load configuration directory contains security features, for example SafeSEH and CFG
 //! (Control Flow Guard). It also contains other runtime configuration.
+//!
+//! `IMAGE_LOAD_CONFIG_DIRECTORY` grew one field group at a time, so an image declares only the
+//! prefix that its linker knew. The `Size` field states that prefix:
+//!
+//! - A field that the prefix omits is absent. [`LoadConfigDirectory::field`] returns `None` for
+//!   it, and the typed field is zero.
+//! - A field that the prefix cuts is an error.
+//! - Bytes after the last field that Portex knows stay in `trailing_data`.
+//!
+//! The field offsets follow `winnt.h` of the Windows SDK 10.0.26100.
 
 mod builder;
 mod config32;
 mod config64;
+mod field;
 
 pub use builder::{CfgSettings, LoadConfigBuilder};
 pub use config32::LoadConfigDirectory32;
 pub use config64::LoadConfigDirectory64;
+pub use field::LoadConfigField;
 
 use crate::prelude::*;
 use crate::{Error, Result};
@@ -62,38 +74,64 @@ fn write_field(buf: &mut [u8], offset: usize, bytes: &[u8]) {
     }
 }
 
-/// Make the zeroed output buffer for a serialized load configuration.
+/// Return `true` if the structure with the `Size` field `size` holds `field` completely.
 ///
-/// The buffer length is the largest of these values:
+/// A `size` of zero is the legacy convention. Then each field is present.
+fn is_present(size: u32, field: LoadConfigField, is_64bit: bool) -> bool {
+    size == 0 || usize::try_from(size).is_ok_and(|size| field.end(is_64bit) <= size)
+}
+
+/// Serialize the structure of one layout.
+///
+/// `value` returns the value of each field. The buffer length is the largest of these values:
 ///
 /// - `size`, the `Size` field that the caller set.
-/// - `known_size`, the end of the last field that is not zero.
-/// - The end of `trailing`, which starts at the last value of `field_ends`.
+/// - The minimum size of the layout, or the end of the last field that is not zero. A `SafeSEH`
+///   table always gets its count.
+/// - The end of `trailing`, which starts after the last known field.
 ///
-/// If the length is in a typed field, the function extends it to the end of that field.
-/// `field_ends` holds the end offsets of the typed fields in ascending order.
-///
-/// The function copies `trailing` into the buffer. It returns the buffer and the value of the
-/// `Size` field to write: zero if `size` is zero, otherwise the buffer length.
-fn output_buffer(
+/// If the length is in a field, the function extends it to the end of that field. The written
+/// `Size` field is zero if `size` is zero, otherwise the buffer length.
+fn serialize(
     size: u32,
-    known_size: usize,
-    field_ends: &[usize],
     trailing: &[u8],
-) -> Result<(Vec<u8>, u32)> {
-    let trailing_start = field_ends.last().copied().unwrap_or_default();
+    is_64bit: bool,
+    value: impl Fn(LoadConfigField) -> u64,
+) -> Result<Vec<u8>> {
+    let (min_size, known_end) = if is_64bit {
+        (
+            LoadConfigDirectory64::MIN_SIZE,
+            LoadConfigDirectory64::KNOWN_SIZE,
+        )
+    } else {
+        (
+            LoadConfigDirectory32::MIN_SIZE,
+            LoadConfigDirectory32::KNOWN_SIZE,
+        )
+    };
+    let used_end = LoadConfigField::ALL
+        .into_iter()
+        .filter(|&field| field != LoadConfigField::Size && value(field) != 0)
+        .map(|field| match field {
+            LoadConfigField::SeHandlerTable => LoadConfigField::SeHandlerCount.end(is_64bit),
+            _ => field.end(is_64bit),
+        })
+        .fold(min_size, usize::max);
     let trailing_end = if trailing.is_empty() {
         0
     } else {
-        trailing_start
+        known_end
             .checked_add(trailing.len())
             .ok_or_else(|| Error::invalid_data_directory("load-config size overflow"))?
     };
     let declared_size = usize::try_from(size)
         .map_err(|_| Error::invalid_data_directory("load-config size exceeds usize"))?;
-    let mut output_size = declared_size.max(known_size).max(trailing_end);
-    if let Some(&field_end) = field_ends.iter().find(|&&end| end >= output_size) {
-        output_size = field_end;
+    let mut output_size = declared_size.max(used_end).max(trailing_end);
+    if let Some(field) = LoadConfigField::ALL
+        .into_iter()
+        .find(|field| field.offset(is_64bit) < output_size && output_size < field.end(is_64bit))
+    {
+        output_size = field.end(is_64bit);
     }
     let encoded_size = u32::try_from(output_size)
         .map_err(|_| Error::invalid_data_directory("load-config size exceeds u32"))?;
@@ -101,31 +139,23 @@ fn output_buffer(
     buf.try_reserve_exact(output_size)
         .map_err(|_| Error::invalid_data_directory("load-config is too large to allocate"))?;
     buf.resize(output_size, 0);
-    if let Some(tail) = buf.get_mut(trailing_start..) {
+    if let Some(tail) = buf.get_mut(known_end..) {
         for (dst, src) in tail.iter_mut().zip(trailing) {
             *dst = *src;
         }
     }
     let size_field = if size == 0 { 0 } else { encoded_size };
-    Ok((buf, size_field))
-}
-
-/// Return the offsets of the pointer-sized values in `trailing` that are not zero.
-///
-/// `trailing` starts at `trailing_start` in the structure. The function checks only the
-/// offsets in `offsets` that `trailing` holds completely.
-fn trailing_va_offsets<'a, const N: usize>(
-    trailing: &'a [u8],
-    trailing_start: usize,
-    offsets: &'a [usize],
-) -> impl Iterator<Item = usize> + 'a {
-    offsets.iter().copied().filter(move |&offset| {
-        offset
-            .checked_sub(trailing_start)
-            .and_then(|start| trailing.get(start..))
-            .and_then(<[u8]>::first_chunk::<N>)
-            .is_some_and(|value| value.iter().any(|&byte| byte != 0))
-    })
+    for field in LoadConfigField::ALL {
+        let value = match field {
+            LoadConfigField::Size => u64::from(size_field),
+            _ => value(field),
+        };
+        // The value fits the field, so its low bytes are the field bytes.
+        let bytes = value.to_le_bytes();
+        let width = field.size(is_64bit);
+        write_field(&mut buf, field.offset(is_64bit), &bytes[..width]);
+    }
+    Ok(buf)
 }
 
 /// Load configuration directory, in the 32-bit or the 64-bit layout.
@@ -178,6 +208,44 @@ impl LoadConfigDirectory {
         }
     }
 
+    /// Return `true` for the PE32+ layout.
+    #[must_use]
+    pub fn is_64bit(&self) -> bool {
+        matches!(self, Self::Config64(_))
+    }
+
+    /// Return the value of a field, or `None` if the `Size` field omits it.
+    ///
+    /// A present field can be zero. For a VA field, zero means that the image declares no such
+    /// object.
+    #[must_use]
+    pub fn field(&self, field: LoadConfigField) -> Option<u64> {
+        match self {
+            Self::Config32(c) => c.field(field),
+            Self::Config64(c) => c.field(field),
+        }
+    }
+
+    /// Return the value of a field, or `None` if the `Size` field omits it or the value is zero.
+    ///
+    /// Use this function for a VA field: a zero VA declares no object.
+    #[must_use]
+    pub fn va(&self, field: LoadConfigField) -> Option<u64> {
+        self.field(field).filter(|&value| value != 0)
+    }
+
+    /// Return `true` if `trailing_data` holds a byte that is not zero.
+    ///
+    /// These bytes are fields of a later version of the structure, which Portex does not know.
+    #[must_use]
+    pub fn has_unknown_fields(&self) -> bool {
+        let trailing = match self {
+            Self::Config32(c) => &c.trailing_data,
+            Self::Config64(c) => &c.trailing_data,
+        };
+        trailing.iter().any(|&byte| byte != 0)
+    }
+
     /// VA of the security cookie, widened to `u64`.
     #[must_use]
     pub fn security_cookie_va(&self) -> u64 {
@@ -198,26 +266,23 @@ impl LoadConfigDirectory {
 
     /// Return the offsets in the serialized structure of the VA fields that are not zero.
     ///
-    /// The list includes the VA fields in `trailing_data`, up to `GuardMemcpyFunctionPointer`.
     /// The offsets are in ascending order.
     pub(crate) fn va_field_offsets(&self) -> Vec<usize> {
+        let is_64bit = self.is_64bit();
+        let mut offsets: Vec<usize> = LoadConfigField::ALL
+            .into_iter()
+            .filter(|&field| field.is_va() && self.value(field) != 0)
+            .map(|field| field.offset(is_64bit))
+            .collect();
+        offsets.sort_unstable();
+        offsets
+    }
+
+    /// Return the value of a field, widened to `u64`, also if `Size` omits the field.
+    fn value(&self, field: LoadConfigField) -> u64 {
         match self {
-            Self::Config32(c) => c
-                .typed_va_offsets()
-                .chain(trailing_va_offsets::<4>(
-                    &c.trailing_data,
-                    LoadConfigDirectory32::SIZE_WITH_CFG,
-                    &LoadConfigDirectory32::TRAILING_VA_OFFSETS,
-                ))
-                .collect(),
-            Self::Config64(c) => c
-                .typed_va_offsets()
-                .chain(trailing_va_offsets::<8>(
-                    &c.trailing_data,
-                    LoadConfigDirectory64::SIZE_WITH_CFG,
-                    &LoadConfigDirectory64::TRAILING_VA_OFFSETS,
-                ))
-                .collect(),
+            Self::Config32(c) => c.value(field),
+            Self::Config64(c) => c.value(field),
         }
     }
 }
@@ -269,129 +334,4 @@ pub mod guard_flags {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn legacy_prefixes_preserve_present_fields_and_omit_only_whole_fields() {
-        let mut early32 = vec![0; 60];
-        early32[..4].copy_from_slice(&60_u32.to_le_bytes());
-        early32[32..36].copy_from_slice(&0x0040_1000_u32.to_le_bytes());
-        let parsed32 = LoadConfigDirectory32::parse(&early32).expect("a whole pre-cookie prefix");
-        assert_eq!(parsed32.lock_prefix_table, 0x0040_1000);
-        assert_eq!(parsed32.security_cookie, 0);
-        assert_eq!(parsed32.se_handler_table, 0);
-        let mut cookie64 = vec![0; 96];
-        cookie64[..4].copy_from_slice(&96_u32.to_le_bytes());
-        cookie64[88..96].copy_from_slice(&0x1_4000_1000_u64.to_le_bytes());
-        let parsed64 = LoadConfigDirectory64::parse(&cookie64)
-            .expect("the cookie predates reserved SEH fields");
-        assert_eq!(parsed64.security_cookie, 0x1_4000_1000);
-        assert_eq!(parsed64.se_handler_table, 0);
-        assert_eq!(parsed64.guard_flags, 0);
-        cookie64[..4].fill(0);
-        assert_eq!(
-            LoadConfigDirectory64::parse(&cookie64)
-                .expect("legacy Size zero uses available bytes")
-                .security_cookie,
-            parsed64.security_cookie
-        );
-        let mut bounded = vec![0xff; 148];
-        bounded[..4].copy_from_slice(&4_u32.to_le_bytes());
-        let absent = LoadConfigDirectory64::parse(&bounded)
-            .expect("bytes beyond declared Size are not fields");
-        assert_eq!(absent.security_cookie, 0);
-        assert_eq!(absent.trailing_data, Vec::<u8>::new());
-    }
-
-    #[test]
-    fn versioned_prefixes_reject_partial_fields_and_unreadable_declared_sizes() {
-        for size in [5_usize, 9, 53, 61, 65, 73, 89] {
-            let mut bytes = vec![0; size];
-            bytes[..4].copy_from_slice(
-                &u32::try_from(size)
-                    .expect("test size fits u32")
-                    .to_le_bytes(),
-            );
-            assert!(
-                LoadConfigDirectory32::parse(&bytes).is_err(),
-                "partial PE32 field at Size {size}"
-            );
-        }
-        for size in [5_usize, 9, 25, 41, 77, 89, 97, 105, 113, 145] {
-            let mut bytes = vec![0; size];
-            bytes[..4].copy_from_slice(
-                &u32::try_from(size)
-                    .expect("test size fits u32")
-                    .to_le_bytes(),
-            );
-            assert!(
-                LoadConfigDirectory64::parse(&bytes).is_err(),
-                "partial PE32+ field at Size {size}"
-            );
-        }
-        for declared in [1_u32, 3, 97] {
-            let mut bytes = vec![0; 96];
-            bytes[..4].copy_from_slice(&declared.to_le_bytes());
-            assert!(LoadConfigDirectory64::parse(&bytes).is_err());
-        }
-        assert!(LoadConfigDirectory32::parse(&[]).is_err());
-        assert!(LoadConfigDirectory64::parse(&[0; 3]).is_err());
-    }
-
-    #[test]
-    fn serialization_keeps_trailing_data_and_declared_size() {
-        let config32 = LoadConfigDirectory32 {
-            size: 70,
-            security_cookie: 0x0040_1000,
-            trailing_data: vec![0xAA, 0xBB],
-            ..Default::default()
-        };
-        let bytes32 = config32.try_to_bytes().expect("a small PE32 record");
-        assert_eq!(bytes32.len(), LoadConfigDirectory32::SIZE_WITH_CFG + 2);
-        assert_eq!(bytes32[92..], [0xAA, 0xBB]);
-        let parsed32 = LoadConfigDirectory32::parse(&bytes32).expect("serialized PE32 record");
-        assert_eq!(parsed32.trailing_data, config32.trailing_data);
-        assert_eq!(parsed32.security_cookie, config32.security_cookie);
-
-        let config64 = LoadConfigDirectory64 {
-            size: 200,
-            guard_flags: guard_flags::CF_INSTRUMENTED,
-            trailing_data: vec![0xCC],
-            ..Default::default()
-        };
-        let bytes64 = config64.try_to_bytes().expect("a small PE32+ record");
-        assert_eq!(bytes64.len(), 200);
-        assert_eq!(bytes64[148], 0xCC);
-        assert!(bytes64[149..].iter().all(|&byte| byte == 0));
-        let parsed64 = LoadConfigDirectory64::parse(&bytes64).expect("serialized PE32+ record");
-        assert_eq!(parsed64.guard_flags, config64.guard_flags);
-        assert_eq!(parsed64.size, 200);
-    }
-
-    #[test]
-    fn va_field_offsets_cover_typed_and_trailing_fields() {
-        let mut trailing = vec![0; 0xC0 - LoadConfigDirectory32::SIZE_WITH_CFG];
-        // `GuardEHContinuationTable` at 0xA4, and a partial `GuardMemcpyFunctionPointer`.
-        trailing[0xA4 - 92..0xA8 - 92].copy_from_slice(&0x0040_5000_u32.to_le_bytes());
-        trailing.truncate(0xBE - 92);
-        trailing[0xBC - 92] = 1;
-        let config32 = LoadConfigDirectory::Config32(LoadConfigDirectory32 {
-            security_cookie: 0x0040_1000,
-            guard_cf_function_table: 0x0040_2000,
-            trailing_data: trailing,
-            ..Default::default()
-        });
-        assert_eq!(config32.va_field_offsets(), [60, 80, 0xA4]);
-
-        let mut trailing = vec![0; 0xC8 - LoadConfigDirectory64::SIZE_WITH_CFG];
-        trailing[0xC0 - 148..].copy_from_slice(&0x1_4000_6000_u64.to_le_bytes());
-        let config64 = LoadConfigDirectory::Config64(LoadConfigDirectory64 {
-            lock_prefix_table: 0x1_4000_1000,
-            security_cookie: 0x1_4000_2000,
-            trailing_data: trailing,
-            ..Default::default()
-        });
-        assert_eq!(config64.va_field_offsets(), [40, 88, 0xC0]);
-    }
-}
+mod tests;

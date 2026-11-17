@@ -9,7 +9,7 @@ use portex::{
     TlsDirectory64,
     data_dir::DataDirectoryType,
     debug::CodeViewRsds,
-    loadconfig::{LoadConfigDirectory, LoadConfigDirectory32, LoadConfigDirectory64},
+    load_config::{LoadConfigDirectory, LoadConfigDirectory32, LoadConfigDirectory64},
     section::characteristics,
     tls::TlsInfo,
 };
@@ -363,16 +363,16 @@ fn test_loadconfig_roundtrip() {
     config64.guard_cf_function_table = 0x0001_4000_2100;
     config64.guard_cf_function_count = 3;
     config64.guard_flags = 0x0001_0500;
-    let loadconfig = LoadConfigDirectory::Config64(config64);
+    let load_config = LoadConfigDirectory::Config64(config64);
 
-    pe.update_load_config(&loadconfig, None)
+    pe.update_load_config(&load_config, None)
         .expect("Failed to update LoadConfig");
 
     let bytes = pe.build();
     let parsed = PeImage::parse(&bytes).expect("Failed to parse PE with LoadConfig");
 
     let config = parsed.load_config().expect("Failed to get LoadConfig");
-    assert_eq!(config, Some(loadconfig));
+    assert_eq!(config, Some(load_config));
 }
 
 /// A 32-bit linker writes a directory size of 0x40 and a larger structure `Size`. The reader
@@ -392,7 +392,11 @@ fn test_loadconfig_reads_the_structure_size_of_a_short_32bit_directory() {
     config.security_cookie = 0x0040_2000;
     config.guard_cf_function_count = 3;
     config.guard_flags = 0x0001_0500;
-    config.trailing_data = vec![0x5a; 0xc0 - LoadConfigDirectory32::SIZE_WITH_CFG];
+    config.code_integrity_catalog_offset = 0x5a5a;
+    config.dynamic_value_reloc_table_offset = 0x40;
+    config.dynamic_value_reloc_table_section = 2;
+    config.hot_patch_table_offset = 0x5a5a;
+    config.guard_eh_continuation_count = 5;
     let rva = pe
         .update_load_config(&LoadConfigDirectory::Config32(config.clone()), None)
         .expect("the load configuration is written");

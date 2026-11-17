@@ -115,7 +115,7 @@ pub mod image;
 pub mod import;
 pub mod io;
 pub mod layout;
-pub mod loadconfig;
+pub mod load_config;
 pub mod optional;
 mod parse_utils;
 pub mod pe;
@@ -153,9 +153,9 @@ pub use export::{
 };
 pub use import::{ImportDescriptor, ImportTable, ImportTableBuilder, ImportThunk, ImportedDll};
 pub use layout::LayoutConfig;
-pub use loadconfig::{
+pub use load_config::{
     CfgSettings, LoadConfigBuilder, LoadConfigDirectory, LoadConfigDirectory32,
-    LoadConfigDirectory64,
+    LoadConfigDirectory64, LoadConfigField,
 };
 pub use optional::{OptionalHeader, OptionalHeader32, OptionalHeader64, Subsystem};
 pub use pe::{
