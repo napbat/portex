@@ -34,6 +34,7 @@ pub use load_config::RawLoadConfigDirectory;
 pub use reloc::{RawRelocation, RawRelocationBlock, RawRelocationBlocks, RawRelocations};
 pub use resource::{RawResourceDataEntry, RawResourceDirectory, RawResourceEntry};
 
+use crate::parse_utils::{u16_at, u32_at, u64_at};
 use crate::{Error, Result};
 
 /// A field of a PE structure and its offset in the buffer.
@@ -101,38 +102,37 @@ impl<C: RawCursor> Iterator for RawIter<'_, C> {
     }
 }
 
-/// Read `N` bytes at `offset`.
-fn bytes<const N: usize>(data: &[u8], offset: usize) -> Result<[u8; N]> {
-    offset
-        .checked_add(N)
-        .and_then(|end| data.get(offset..end))
-        .and_then(|bytes| bytes.first_chunk::<N>())
-        .copied()
-        .ok_or_else(|| Error::offset_out_of_bounds(offset, data.len()))
+/// Wrap the value that `read` returns for the field at `offset` in a [`RawField`].
+///
+/// Return an `OffsetOutOfBounds` error if `data` does not hold the field.
+fn field<T>(
+    data: &[u8],
+    offset: usize,
+    read: fn(&[u8], usize) -> Option<T>,
+) -> Result<RawField<T>> {
+    let value =
+        read(data, offset).ok_or_else(|| Error::offset_out_of_bounds(offset, data.len()))?;
+    Ok(RawField { offset, value })
 }
 
 /// Read the byte at `offset`.
 pub(crate) fn read_u8(data: &[u8], offset: usize) -> Result<RawField<u8>> {
-    let [value] = bytes::<1>(data, offset)?;
-    Ok(RawField { offset, value })
+    field(data, offset, |data, offset| data.get(offset).copied())
 }
 
 /// Read the little-endian `u16` at `offset`.
 pub(crate) fn read_u16(data: &[u8], offset: usize) -> Result<RawField<u16>> {
-    let value = u16::from_le_bytes(bytes(data, offset)?);
-    Ok(RawField { offset, value })
+    field(data, offset, u16_at)
 }
 
 /// Read the little-endian `u32` at `offset`.
 pub(crate) fn read_u32(data: &[u8], offset: usize) -> Result<RawField<u32>> {
-    let value = u32::from_le_bytes(bytes(data, offset)?);
-    Ok(RawField { offset, value })
+    field(data, offset, u32_at)
 }
 
 /// Read the little-endian `u64` at `offset`.
 pub(crate) fn read_u64(data: &[u8], offset: usize) -> Result<RawField<u64>> {
-    let value = u64::from_le_bytes(bytes(data, offset)?);
-    Ok(RawField { offset, value })
+    field(data, offset, u64_at)
 }
 
 /// Return `base + delta`, or an error if the sum overflows.

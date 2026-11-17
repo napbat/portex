@@ -1,7 +1,33 @@
 //! Shared bounded parsing helpers.
 
+use nostdio::ReadLe;
+
 use crate::prelude::*;
 use crate::{Error, Result};
+
+/// Read the little-endian `u16` at `offset` of `data` with `nostdio`.
+///
+/// Return `None` if `data` does not hold the complete value.
+pub(crate) fn u16_at(data: &[u8], offset: usize) -> Option<u16> {
+    let mut rest = data.get(offset..)?;
+    rest.read_u16_le().ok()
+}
+
+/// Read the little-endian `u32` at `offset` of `data` with `nostdio`.
+///
+/// Return `None` if `data` does not hold the complete value.
+pub(crate) fn u32_at(data: &[u8], offset: usize) -> Option<u32> {
+    let mut rest = data.get(offset..)?;
+    rest.read_u32_le().ok()
+}
+
+/// Read the little-endian `u64` at `offset` of `data` with `nostdio`.
+///
+/// Return `None` if `data` does not hold the complete value.
+pub(crate) fn u64_at(data: &[u8], offset: usize) -> Option<u64> {
+    let mut rest = data.get(offset..)?;
+    rest.read_u64_le().ok()
+}
 
 /// Read exactly `len` bytes at an RVA through the `read_at_rva` callback.
 pub(crate) fn read_exact_rva<F>(
