@@ -296,7 +296,11 @@ impl RichHeader {
     #[must_use]
     pub fn calculate_key(entries: &[RichEntry], prefix: &[u8]) -> u32 {
         // The offset is a u32 in the linker. Keep the low 32 bits.
-        let mut checksum = u32::try_from(prefix.len() & 0xFFFF_FFFF).unwrap_or_default();
+        // `usize` has 32 bits on some targets, so the mask works on a `u64`.
+        let mut checksum = u64::try_from(prefix.len())
+            .ok()
+            .and_then(|len| u32::try_from(len & u64::from(u32::MAX)).ok())
+            .unwrap_or_default();
 
         for (offset, &byte) in prefix.iter().enumerate() {
             if (E_LFANEW..E_LFANEW + E_LFANEW_SIZE).contains(&offset) {

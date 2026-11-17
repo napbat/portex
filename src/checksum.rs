@@ -57,7 +57,11 @@ pub fn calculate_checksum(data: &[u8], checksum_offset: usize) -> u32 {
     };
 
     // Add the file size. The algorithm uses only the low 32 bits.
-    let size_low = u32::try_from(data.len() & 0xFFFF_FFFF).unwrap_or_default();
+    // `usize` has 32 bits on some targets, so the mask works on a `u64`.
+    let size_low = u64::try_from(data.len())
+        .ok()
+        .and_then(|len| u32::try_from(len & u64::from(u32::MAX)).ok())
+        .unwrap_or_default();
     sum.wrapping_add(size_low)
 }
 
