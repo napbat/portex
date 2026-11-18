@@ -1,4 +1,4 @@
 # Public API is linted like private code; breaking fixes ship in a new release.
 avoid-breaking-exported-api = false
 # Product and architecture names that are prose, not code identifiers.
-doc-valid-idents = ["CodeView", "SafeSEH", "LoongArch", ".."]
+doc-valid-idents = ["CodeView", "SafeSEH", "LoongArch", "PowerPC", ".."]
