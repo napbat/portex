@@ -19,7 +19,7 @@ use crate::{Error, Result};
 
 mod record;
 
-pub use record::{EpilogOpsV3, EpilogV3, ResolvedEpilogV3, UnwindInfoV3};
+pub use record::{EpilogOpsV3, EpilogV3, UnwindInfoV3};
 
 /// The layout of a WOD with a byte operand: `WOD_SET_FPREG`, `WOD_PUSH2` and
 /// `WOD_PUSH_CANONICAL_FRAME`.
@@ -64,8 +64,6 @@ pub const UNW_FLAG_LARGE: u8 = 0x08;
 
 /// The x64 unwind version that [`UnwindInfoV3`] holds.
 const VERSION: u8 = 3;
-/// The size in bytes of one stack slot.
-const STACK_SLOT: u32 = 8;
 
 /// `WOD_SET_FPREG` (8-bit opcode).
 const OP_SET_FPREG: u8 = 0x00;
@@ -344,28 +342,6 @@ impl WindOp {
             }
         }
         Ok(())
-    }
-
-    /// Return the count of bytes by which the operation lowers RSP.
-    ///
-    /// A push lowers RSP by 8 bytes for each register. An allocation lowers RSP by its size.
-    /// `SetFrameRegister` and the save operations do not change RSP. Returns `None` for
-    /// `PushCanonicalFrame`: the operating system defines the size of the frame.
-    #[must_use]
-    pub fn stack_bytes(self) -> Option<u32> {
-        match self {
-            Self::Push { .. } => Some(STACK_SLOT),
-            Self::Push2 { .. } | Self::PushConsecutive2 { .. } => Some(2 * STACK_SLOT),
-            Self::AllocSmall { size } => Some((u32::from(size) + 1) * STACK_SLOT),
-            Self::AllocLarge { size } => Some(u32::from(size) * STACK_SLOT),
-            Self::AllocHuge { size } => Some(size),
-            Self::SetFrameRegister { .. }
-            | Self::SaveNonvol { .. }
-            | Self::SaveNonvolFar { .. }
-            | Self::SaveXmm128 { .. }
-            | Self::SaveXmm128Far { .. } => Some(0),
-            Self::PushCanonicalFrame { .. } => None,
-        }
     }
 }
 

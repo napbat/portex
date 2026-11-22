@@ -137,8 +137,8 @@ pub use dynamic_reloc::{
 pub use error::{Error, ErrorContext, ErrorKind, Result};
 pub use exception::{
     EpilogOpsV3, EpilogV3, ExceptionBuilder, ExceptionDirectory, ExceptionTable,
-    PackedExceptionDirectory, PackedRuntimeFunction, ResolvedEpilogV3, RuntimeFunction, UnwindCode,
-    UnwindInfo, UnwindInfoV3, UnwindOpCode, WindOp, X64UnwindInfo,
+    PackedExceptionDirectory, PackedRuntimeFunction, RuntimeFunction, UnwindCode, UnwindInfo,
+    UnwindInfoV3, UnwindOpCode, WindOp, X64UnwindInfo,
 };
 pub use export::{
     ExportAddress, ExportDirectory, ExportTable, ExportTableBuilder, ExportedFunction,

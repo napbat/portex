@@ -38,12 +38,8 @@ fn ke_bug_check_allocates_0x28_bytes() {
         info.prolog_ops().unwrap(),
         [(0, WindOp::AllocSmall { size: 4 })]
     );
-    assert_eq!(WindOp::AllocSmall { size: 4 }.stack_bytes(), Some(0x28));
     assert_eq!(info.epilogs, [] as [EpilogV3; 0]);
-    assert_eq!(
-        info.resolved_epilogs(0x10).unwrap(),
-        [] as [ResolvedEpilogV3; 0]
-    );
+    assert!(info.epilog_fields(0).is_err());
     assert!(!info.has_exception_handler());
     assert!(!info.is_chained());
 
@@ -74,7 +70,7 @@ fn ke_bug_check_ex_has_two_small_allocations() {
 }
 
 #[test]
-fn ke_context_to_kframes_resolves_its_epilog() {
+fn ke_context_to_kframes_decodes_its_epilog() {
     let info = parse_round_trip(&KE_CONTEXT_TO_KFRAMES);
     assert_eq!(info.size_of_prolog, 0x52);
     let prolog_ips: [u16; 12] = [
@@ -90,7 +86,6 @@ fn ke_context_to_kframes_resolves_its_epilog() {
     wods.push(WindOp::Push { register: 3 });
     let prolog: Vec<_> = prolog_ips.into_iter().zip(wods.iter().copied()).collect();
     assert_eq!(info.prolog_ops().unwrap(), prolog);
-    assert_eq!(WindOp::AllocLarge { size: 0x1a }.stack_bytes(), Some(0xd0));
 
     let epilog_ips: Vec<u16> = vec![
         0x00, 0x09, 0x12, 0x1b, 0x24, 0x2d, 0x33, 0x39, 0x3f, 0x44, 0x49, 0x50,
@@ -108,59 +103,42 @@ fn ke_context_to_kframes_resolves_its_epilog() {
         }]
     );
     let expected_ops: Vec<_> = epilog_ips.into_iter().zip(wods).collect();
-    assert_eq!(
-        info.resolved_epilogs(0xec).unwrap(),
-        [ResolvedEpilogV3 {
-            start: 0x9a,
-            last_instruction: 0xeb,
-            parent_transfer: false,
-            ops: expected_ops,
-        }]
-    );
-    // The epilog starts 82 bytes before the fragment tail.
-    assert!(info.resolved_epilogs(0x40).is_err());
+    assert_eq!(info.epilog_ops(0).unwrap(), expected_ops);
+    assert_eq!(info.epilog_fields(0).unwrap().last_instruction, 0x51);
 }
 
 #[test]
-fn every_wod_kind_decodes_encodes_and_lowers_rsp() {
-    let cases: [(&[u8], WindOp, Option<u32>); 12] = [
+fn every_wod_kind_decodes_and_encodes() {
+    let cases: [(&[u8], WindOp); 12] = [
         (
             &[0x00, 0x35],
             WindOp::SetFrameRegister {
                 register: 5,
                 offset: 3,
             },
-            Some(0),
         ),
-        (&[0x78], WindOp::AllocSmall { size: 7 }, Some(64)),
-        (
-            &[0x02, 0x34, 0x12],
-            WindOp::AllocLarge { size: 0x1234 },
-            Some(0x1234 * 8),
-        ),
+        (&[0x78], WindOp::AllocSmall { size: 7 }),
+        (&[0x02, 0x34, 0x12], WindOp::AllocLarge { size: 0x1234 }),
         (
             &[0x01, 0x78, 0x56, 0x34, 0x12],
             WindOp::AllocHuge { size: 0x1234_5678 },
-            Some(0x1234_5678),
         ),
-        (&[0x03, 0x02], WindOp::PushCanonicalFrame { kind: 2 }, None),
-        (&[0xfc], WindOp::Push { register: 31 }, Some(8)),
+        (&[0x03, 0x02], WindOp::PushCanonicalFrame { kind: 2 }),
+        (&[0xfc], WindOp::Push { register: 31 }),
         (
             &[0x60, 0xb4],
             WindOp::Push2 {
                 first: 17,
                 second: 22,
             },
-            Some(16),
         ),
-        (&[0xf7], WindOp::PushConsecutive2 { register: 30 }, Some(16)),
+        (&[0xf7], WindOp::PushConsecutive2 { register: 30 }),
         (
             &[0x66, 0x02, 0x01],
             WindOp::SaveNonvol {
                 register: 12,
                 displacement: 0x0102,
             },
-            Some(0),
         ),
         (
             &[0xa5, 0x00, 0x00, 0x01, 0x00],
@@ -168,7 +146,6 @@ fn every_wod_kind_decodes_encodes_and_lowers_rsp() {
                 register: 20,
                 displacement: 0x0001_0000,
             },
-            Some(0),
         ),
         (
             &[0x9a, 0x03, 0x02],
@@ -176,7 +153,6 @@ fn every_wod_kind_decodes_encodes_and_lowers_rsp() {
                 register: 9,
                 displacement: 0x0203,
             },
-            Some(0),
         ),
         (
             &[0xe9, 0x00, 0x00, 0x02, 0x00],
@@ -184,10 +160,9 @@ fn every_wod_kind_decodes_encodes_and_lowers_rsp() {
                 register: 14,
                 displacement: 0x0002_0000,
             },
-            Some(0),
         ),
     ];
-    for (bytes, op, stack_bytes) in cases {
+    for (bytes, op) in cases {
         assert_eq!(WindOp::decode(bytes).unwrap(), (op, bytes.len()), "{op:?}");
         let mut longer = bytes.to_vec();
         longer.push(0x04);
@@ -201,7 +176,6 @@ fn every_wod_kind_decodes_encodes_and_lowers_rsp() {
         let mut encoded = Vec::new();
         op.encode(&mut encoded).expect("each field is in its range");
         assert_eq!(encoded, bytes, "{op:?}");
-        assert_eq!(op.stack_bytes(), stack_bytes, "{op:?}");
     }
 }
 
@@ -264,7 +238,7 @@ fn an_invalid_wod_is_an_error() {
 }
 
 #[test]
-fn an_inherited_epilog_resolves_to_its_source() {
+fn an_inherited_epilog_takes_the_operations_of_its_source() {
     let info = parse_round_trip(&INHERITED_EPILOG);
     assert_eq!(info.epilogs.len(), 2);
     assert_eq!(info.epilogs[1].ops, None);
@@ -283,23 +257,11 @@ fn an_inherited_epilog_resolves_to_its_source() {
         .into_iter()
         .zip(prolog.into_iter().map(|(_, op)| op))
         .collect();
-    let resolved = info.resolved_epilogs(118).unwrap();
+    assert_eq!(info.epilog_ops(0).unwrap(), ops);
+    assert_eq!(info.epilog_ops(1).unwrap(), ops);
     assert_eq!(
-        resolved,
-        [
-            ResolvedEpilogV3 {
-                start: 105,
-                last_instruction: 113,
-                parent_transfer: false,
-                ops: ops.clone(),
-            },
-            ResolvedEpilogV3 {
-                start: 92,
-                last_instruction: 100,
-                parent_transfer: false,
-                ops,
-            },
-        ]
+        info.epilog_fields(1).unwrap(),
+        info.epilog_fields(0).unwrap()
     );
 }
 
@@ -333,11 +295,7 @@ fn a_large_record_round_trips() {
     assert_eq!(bytes[5..9], [0x10, 0x01, 0x04, 0x00]);
     assert_eq!(bytes.len(), 4 + 20);
     assert_eq!(UnwindInfoV3::parse(&bytes).unwrap(), info);
-    let resolved = info.resolved_epilogs(0x400).unwrap();
-    assert_eq!(resolved[0].start, 0x200);
-    assert_eq!(resolved[0].last_instruction, 0x305);
-    // The last epilog instruction is not in a fragment of 0x300 bytes.
-    assert!(info.resolved_epilogs(0x300).is_err());
+    assert_eq!(info.epilog_fields(0).unwrap().last_instruction, 0x0105);
 
     let small = UnwindInfoV3 {
         flags: 0,
@@ -437,7 +395,7 @@ fn a_first_inherited_epilog_is_an_error() {
     let mut info = UnwindInfoV3::parse(&INHERITED_EPILOG).unwrap();
     info.epilogs.remove(0);
     assert!(info.validate().is_err());
-    assert!(info.resolved_epilogs(118).is_err());
+    assert!(info.epilog_fields(0).is_err());
 }
 
 #[test]
@@ -449,7 +407,7 @@ fn inherited_flags_must_match_their_source() {
     // Set it on both epilogs.
     bytes[8] = 0x21;
     let info = parse_round_trip(&bytes);
-    assert!(info.resolved_epilogs(118).unwrap()[1].parent_transfer);
+    assert_eq!(info.epilogs[1].flags, 0x01);
 }
 
 #[test]
@@ -460,7 +418,7 @@ fn a_sign_change_of_epilog_offsets_is_an_error() {
     // An offset of zero has no sign.
     bytes[19..21].copy_from_slice(&0_i16.to_le_bytes());
     let info = parse_round_trip(&bytes);
-    assert_eq!(info.resolved_epilogs(118).unwrap()[1].start, 105);
+    assert_eq!(info.epilogs[1].offset, 0);
 }
 
 #[test]

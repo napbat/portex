@@ -18,8 +18,7 @@
 //! - `PeHeaders::data_directory` is different from the data directory array.
 //! - A record from `X64UnwindInfo::parse` does not serialize, or its bytes parse to a
 //!   different record.
-//! - The prolog WODs of a version 3 unwind record do not decode, or a resolved epilog is not
-//!   in its fragment.
+//! - The prolog or epilog WODs of a version 3 unwind record do not decode.
 
 #![no_main]
 
@@ -356,11 +355,9 @@ fn read_u64(data: &[u8], offset: usize) -> Option<u64> {
 
 /// Parse the x64 unwind information at `offset` with `X64UnwindInfo::parse`.
 ///
-/// `fragment_len` is the size of the function that the record describes. Make sure that a
-/// parsed record serializes, and that the bytes parse to the same record. For a version 3
-/// record, make sure that the prolog WODs decode, and that each resolved epilog is in the
-/// fragment.
-fn check_x64_unwind_info(data: &[u8], offset: usize, fragment_len: u32) {
+/// Make sure that a parsed record serializes, and that the bytes parse to the same record. For
+/// a version 3 record, make sure that the prolog WODs and the WODs of each epilog decode.
+fn check_x64_unwind_info(data: &[u8], offset: usize) {
     let Some(bytes) = data.get(offset..) else {
         return;
     };
@@ -382,14 +379,14 @@ fn check_x64_unwind_info(data: &[u8], offset: usize, fragment_len: u32) {
         .prolog_ops()
         .expect("the prolog WODs of a parsed record do not decode");
     assert_eq!(prolog.len(), v3.prolog_ip_offsets.len());
-    if let Ok(epilogs) = v3.resolved_epilogs(fragment_len) {
-        assert_eq!(epilogs.len(), v3.epilogs.len());
-        for epilog in epilogs {
-            assert!(
-                epilog.start <= epilog.last_instruction && epilog.last_instruction < fragment_len,
-                "a resolved epilog is not in the fragment"
-            );
-        }
+    for index in 0..v3.epilogs.len() {
+        let fields = v3
+            .epilog_fields(index)
+            .expect("a parsed epilog has no operation fields");
+        let ops = v3
+            .epilog_ops(index)
+            .expect("the epilog WODs of a parsed record do not decode");
+        assert_eq!(ops.len(), fields.ip_offsets.len());
     }
 }
 
@@ -471,7 +468,7 @@ impl Reader<'_> {
         let (offset, size) = (self.control.offset(len), self.control.size(len));
         self.runtime_functions(offset, size);
         let offset = self.control.offset(len);
-        self.unwind_chain(offset, u32::try_from(len).unwrap_or(u32::MAX));
+        self.unwind_chain(offset);
         let (offset, is_64bit) = (self.control.offset(len), self.control.flag());
         self.load_config(offset, is_64bit);
         let offset = self.control.offset(len);
@@ -698,20 +695,17 @@ impl Reader<'_> {
                 .mapper
                 .offset(u64::from(function.unwind_info_address.value))
             {
-                self.unwind_chain(unwind, values.size());
+                self.unwind_chain(unwind);
             }
         }
     }
 
     /// Read the `UNWIND_INFO` at `offset`, and follow its chained functions.
-    ///
-    /// `fragment_len` is the size of the function that the first record describes.
-    fn unwind_chain(&self, offset: usize, fragment_len: u32) {
+    fn unwind_chain(&self, offset: usize) {
         let data = self.data;
         let mut offset = offset;
-        let mut fragment_len = fragment_len;
         for _ in 0..MAX_UNWIND_CHAIN {
-            check_x64_unwind_info(data, offset, fragment_len);
+            check_x64_unwind_info(data, offset);
             let Ok(info) = RawUnwindInfo::parse(data, offset) else {
                 return;
             };
@@ -743,7 +737,6 @@ impl Reader<'_> {
                 return;
             };
             offset = next;
-            fragment_len = chained.function().size();
         }
     }
 

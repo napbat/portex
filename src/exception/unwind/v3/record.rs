@@ -147,24 +147,6 @@ impl EpilogV3 {
     }
 }
 
-/// An x64 version 3 epilog with offsets from the fragment start and decoded operations.
-///
-/// [`UnwindInfoV3::resolved_epilogs`] makes this value. It applies the epilog offsets and the
-/// inherited operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedEpilogV3 {
-    /// The offset of the first epilog instruction from the fragment start.
-    pub start: u32,
-    /// The offset of the last epilog instruction from the fragment start.
-    pub last_instruction: u32,
-    /// `true` if the epilog transfers control to the parent fragment
-    /// (`EPILOG_INFO_PARENT_FRAGMENT_TRANSFER`).
-    pub parent_transfer: bool,
-    /// Each IP offset with its operation, in stored order. An IP offset is the offset from the
-    /// epilog start, as stored.
-    pub ops: Vec<(u16, WindOp)>,
-}
-
 /// An x64 version 3 unwind information record (`UNWIND_INFO_V3`).
 ///
 /// The record has no separate fields for `NumberOfOps`, `NumberOfEpilogs` and `PayloadWords`.
@@ -392,45 +374,38 @@ impl UnwindInfoV3 {
         decode_ops(&self.pool, 0, &self.prolog_ip_offsets)
     }
 
-    /// Resolve the epilogs of a fragment of `fragment_len` bytes.
+    /// Return the operation fields that epilog `index` uses.
     ///
-    /// The function calculates the offsets from the fragment start, applies the inherited
-    /// operations, and decodes the WOD lists.
+    /// An epilog without its own operations (`NumberOfOps` is 0) inherits the fields of the
+    /// nearest epilog before it that has operations. For such an epilog, the method returns the
+    /// inherited fields.
     ///
     /// # Errors
-    /// Returns an error in these conditions:
-    /// - The start or the last instruction of an epilog is not in the fragment.
-    /// - The first epilog inherits its operations.
-    /// - A WOD list does not decode in the WOD pool.
-    pub fn resolved_epilogs(&self, fragment_len: u32) -> Result<Vec<ResolvedEpilogV3>> {
-        let mut resolved = Vec::with_capacity(self.epilogs.len());
-        let mut source: Option<&EpilogOpsV3> = None;
-        let mut previous_start: Option<u32> = None;
-        for (index, epilog) in self.epilogs.iter().enumerate() {
-            if let Some(ops) = &epilog.ops {
-                source = Some(ops);
-            }
-            let ops = source.ok_or_else(|| no_inherit_source(index))?;
-            let base = match previous_start {
-                Some(start) => i64::from(start),
-                None if epilog.offset < 0 => i64::from(fragment_len),
-                None => 0,
-            };
-            let start = fragment_offset(base + i64::from(epilog.offset), fragment_len, index)?;
-            let last_instruction = fragment_offset(
-                i64::from(start) + i64::from(ops.last_instruction),
-                fragment_len,
-                index,
-            )?;
-            resolved.push(ResolvedEpilogV3 {
-                start,
-                last_instruction,
-                parent_transfer: epilog.flags & EPILOG_INFO_PARENT_FRAGMENT_TRANSFER != 0,
-                ops: decode_ops(&self.pool, ops.first_op, &ops.ip_offsets)?,
-            });
-            previous_start = Some(start);
-        }
-        Ok(resolved)
+    /// Returns an error if the record has no epilog `index`, or if the epilog inherits and no
+    /// epilog before it has operations.
+    pub fn epilog_fields(&self, index: usize) -> Result<&EpilogOpsV3> {
+        let epilogs = self.epilogs.get(..=index).ok_or_else(|| {
+            Error::invalid_data_directory(format!("UNWIND_INFO_V3 has no epilog {index}"))
+        })?;
+        epilogs
+            .iter()
+            .rev()
+            .find_map(|epilog| epilog.ops.as_ref())
+            .ok_or_else(|| no_inherit_source(index))
+    }
+
+    /// Decode the WODs of epilog `index`.
+    ///
+    /// The WODs start at [`EpilogOpsV3::first_op`] of the fields that the epilog uses
+    /// ([`Self::epilog_fields`]). Returns each IP offset (from the epilog start, as stored) with
+    /// its operation, in stored order.
+    ///
+    /// # Errors
+    /// Returns an error if [`Self::epilog_fields`] fails or a WOD does not decode in the WOD
+    /// pool.
+    pub fn epilog_ops(&self, index: usize) -> Result<Vec<(u16, WindOp)>> {
+        let fields = self.epilog_fields(index)?;
+        decode_ops(&self.pool, fields.first_op, &fields.ip_offsets)
     }
 
     /// Return `true` if the record has [`UNW_FLAG_LARGE`].
@@ -564,18 +539,6 @@ fn no_inherit_source(index: usize) -> Error {
     Error::invalid_data_directory(format!(
         "epilog {index} inherits its operations, but no epilog before it has operations"
     ))
-}
-
-/// Return `offset` if it is in a fragment of `fragment_len` bytes.
-fn fragment_offset(offset: i64, fragment_len: u32, index: usize) -> Result<u32> {
-    u32::try_from(offset)
-        .ok()
-        .filter(|&offset| offset < fragment_len)
-        .ok_or_else(|| {
-            Error::invalid_data_directory(format!(
-                "epilog {index} is not in the fragment of {fragment_len} bytes"
-            ))
-        })
 }
 
 /// Return the size of one IP offset: 2 bytes if `large`, else 1 byte.

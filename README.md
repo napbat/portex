@@ -19,7 +19,9 @@ a different source offset.
   address) is valid, because Windows never selects it.
 - x64 unwind information of versions 1, 2 and 3, through `X64UnwindInfo`. Version 3 is the
   format of the Microsoft "x64 Unwind Information V3" specification. `UnwindInfoV3` decodes
-  its winding operation descriptors (`WindOp`) and resolves its epilogs.
+  its winding operation descriptors (`WindOp`) and the epilog descriptors that they belong
+  to. Portex reads the structure only: it does not calculate stack changes or the position
+  of an epilog in its function.
 - Raw views for patch tools: import, export, relocation, exception, resource and load
   configuration records with the buffer offset of each field, and strict header reads.
 - A load configuration with every field of the Windows SDK 10.0.26100 layout. Its declared

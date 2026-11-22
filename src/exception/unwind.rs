@@ -11,9 +11,7 @@ use crate::{Error, Result};
 
 mod v3;
 
-pub use v3::{
-    EpilogOpsV3, EpilogV3, ResolvedEpilogV3, UNW_FLAG_LARGE, UnwindInfoV3, WindOp, X64UnwindInfo,
-};
+pub use v3::{EpilogOpsV3, EpilogV3, UNW_FLAG_LARGE, UnwindInfoV3, WindOp, X64UnwindInfo};
 
 /// The layout of the 4-byte header of the x64 `UNWIND_INFO`.
 ///
