@@ -195,8 +195,11 @@ impl ExceptionDirectory {
 
     /// Check the entries and the table size.
     ///
-    /// Each entry must be nonempty. The entries must be sorted and must not overlap. The table
-    /// size must fit in `u32`.
+    /// An entry must not be reversed: its begin address must not be above its end address. An
+    /// empty entry (begin address equal to end address) is valid. It covers no address, and
+    /// the Windows lookup (`RtlLookupFunctionEntry`) never selects it. The entries must be
+    /// sorted and must not overlap. An empty entry takes part in this check with its begin
+    /// address. The table size must fit in `u32`.
     ///
     /// # Errors
     /// Returns an error describing the first violation found.
@@ -205,9 +208,9 @@ impl ExceptionDirectory {
 
         let mut previous_end = 0u32;
         for (index, function) in self.functions.iter().enumerate() {
-            if function.begin_address >= function.end_address {
+            if function.begin_address > function.end_address {
                 return Err(Error::invalid_data_directory(format!(
-                    "exception function {index} has an empty or reversed range"
+                    "exception function {index} has a reversed range"
                 )));
             }
             if index != 0 && function.begin_address < previous_end {

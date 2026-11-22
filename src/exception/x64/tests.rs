@@ -98,3 +98,50 @@ fn a_shorter_callback_result_is_an_error() {
     let bytes = two_function_table();
     assert!(parse_with_length_change(&bytes, -1).is_err());
 }
+
+/// Parse a complete table from its own bytes.
+fn parse_table(bytes: &[u8]) -> Result<ExceptionDirectory> {
+    let size = u32::try_from(bytes.len()).unwrap();
+    ExceptionDirectory::parse(0, size, |rva, len| {
+        let start = usize::try_from(rva).ok()?;
+        bytes
+            .get(start..start.checked_add(len)?)
+            .map(<[u8]>::to_vec)
+    })
+}
+
+/// ntoskrnl.exe 10.0.26100.1 has an empty entry (begin address equal to end address) between
+/// two sorted entries. Windows never selects it. Before the fix, `validate` refused the table.
+#[test]
+fn an_empty_entry_between_sorted_entries_reads_and_round_trips() {
+    let mut dir = ExceptionDirectory::default();
+    dir.add_function(0x1000, 0x1100, 0x2000);
+    dir.add_function(0x1100, 0x1100, 0x2100);
+    dir.add_function(0x1200, 0x1300, 0x2200);
+    let bytes = dir.try_to_bytes().expect("an empty entry is valid");
+    let parsed = parse_table(&bytes).expect("an empty entry reads");
+    assert_eq!(parsed, dir);
+    assert_eq!(parsed.try_to_bytes().unwrap(), bytes);
+    assert_eq!(parsed.find_function(0x1100), None);
+}
+
+#[test]
+fn a_reversed_entry_is_an_error() {
+    let mut dir = ExceptionDirectory::default();
+    dir.add_function(0x1000, 0x1100, 0x2000);
+    dir.add_function(0x1180, 0x1170, 0x2100);
+    assert!(dir.validate().is_err());
+    let mut bytes = Vec::new();
+    for function in &dir.functions {
+        bytes.extend_from_slice(&function.to_bytes());
+    }
+    assert!(parse_table(&bytes).is_err());
+}
+
+#[test]
+fn an_empty_entry_inside_its_predecessor_is_an_error() {
+    let mut dir = ExceptionDirectory::default();
+    dir.add_function(0x1000, 0x1100, 0x2000);
+    dir.add_function(0x1080, 0x1080, 0x2100);
+    assert!(dir.validate().is_err());
+}
