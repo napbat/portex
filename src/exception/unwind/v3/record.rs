@@ -177,8 +177,10 @@ pub struct UnwindInfoV3 {
     pub size_of_prolog: u16,
     /// The offset of each prolog instruction with a WOD, from the fragment start.
     ///
-    /// The length is `NumberOfOps` (0 to 31). The first entry is the operation closest to the
-    /// function body. An offset above 255 requires [`UNW_FLAG_LARGE`].
+    /// Each offset is the start of the instruction. A version 1 or 2 unwind code gives the end
+    /// of its instruction instead ([`crate::UnwindCode::code_offset`]). The length is
+    /// `NumberOfOps` (0 to 31). The first entry is the operation closest to the function body.
+    /// An offset above 255 requires [`UNW_FLAG_LARGE`].
     pub prolog_ip_offsets: Vec<u16>,
     /// The epilog descriptors (0 to 7).
     pub epilogs: Vec<EpilogV3>,
@@ -381,7 +383,8 @@ impl UnwindInfoV3 {
     /// Decode the prolog WODs.
     ///
     /// The prolog has one WOD for each prolog IP offset. Its WODs start at byte 0 of the WOD
-    /// pool. Returns each IP offset with its operation, in stored order.
+    /// pool. Returns each IP offset (the start of its instruction) with its operation, in
+    /// stored order.
     ///
     /// # Errors
     /// Returns an error if a WOD does not decode in the WOD pool.

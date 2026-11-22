@@ -18,8 +18,8 @@ pub use crate::dynamic_reloc::{
 };
 pub use crate::exception::{
     EpilogOpsV3, EpilogV3, ExceptionBuilder, ExceptionDirectory, ExceptionTable,
-    PackedExceptionDirectory, PackedRuntimeFunction, ResolvedEpilogV3, RuntimeFunction,
-    UNW_FLAG_LARGE, UnwindCode, UnwindInfo, UnwindInfoV3, UnwindOpCode, WindOp, X64UnwindInfo,
+    PackedExceptionDirectory, PackedRuntimeFunction, ResolvedEpilogV3, RuntimeFunction, UnwindCode,
+    UnwindInfo, UnwindInfoV3, UnwindOpCode, WindOp, X64UnwindInfo,
 };
 pub use crate::export::{
     ExportAddress, ExportDirectory, ExportTable, ExportTableBuilder, ExportedFunction,

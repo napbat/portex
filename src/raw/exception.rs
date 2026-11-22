@@ -117,7 +117,10 @@ impl RawCursor for RawRuntimeFunctions {
 /// The 4-byte header of an x64 `UNWIND_INFO` and the offsets of its fields.
 ///
 /// The view does not read the unwind codes or the data after them. It only calculates their
-/// offsets.
+/// offsets. The field names are those of versions 1 and 2. In a version 3 record, byte 2 is
+/// `PayloadWords`, the count of 16-bit payload words, and byte 3 holds `NumberOfOps` (bits 0
+/// to 4) and `NumberOfEpilogs` (bits 5 to 7). Byte 2 counts 16-bit words in all versions, so
+/// the sizes and offsets of this view are correct for each version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RawUnwindInfo {
     /// The offset of the `UNWIND_INFO`.
@@ -126,9 +129,10 @@ pub struct RawUnwindInfo {
     pub version_and_flags: RawField<u8>,
     /// `SizeOfProlog`.
     pub size_of_prolog: RawField<u8>,
-    /// `CountOfCodes`: the count of 2-byte unwind code slots.
+    /// `CountOfCodes`: the count of 2-byte unwind code slots (`PayloadWords` in version 3).
     pub count_of_codes: RawField<u8>,
-    /// The frame register (bits 0 to 3) and the scaled frame offset (bits 4 to 7).
+    /// The frame register (bits 0 to 3) and the scaled frame offset (bits 4 to 7). In version
+    /// 3, `NumberOfOps` and `NumberOfEpilogs`.
     pub frame_register_and_offset: RawField<u8>,
 }
 

@@ -199,9 +199,54 @@ fn every_wod_kind_decodes_encodes_and_lowers_rsp() {
         assert!(WindOp::decode(&bytes[..bytes.len() - 1]).is_err(), "{op:?}");
         assert_eq!(op.encoded_len(), bytes.len(), "{op:?}");
         let mut encoded = Vec::new();
-        op.encode(&mut encoded);
+        op.encode(&mut encoded).expect("each field is in its range");
         assert_eq!(encoded, bytes, "{op:?}");
         assert_eq!(op.stack_bytes(), stack_bytes, "{op:?}");
+    }
+}
+
+#[test]
+fn a_wod_field_out_of_range_is_an_error() {
+    for op in [
+        WindOp::SetFrameRegister {
+            register: 16,
+            offset: 0,
+        },
+        WindOp::SetFrameRegister {
+            register: 5,
+            offset: 16,
+        },
+        WindOp::AllocSmall { size: 16 },
+        WindOp::Push { register: 32 },
+        WindOp::Push2 {
+            first: 32,
+            second: 0,
+        },
+        WindOp::Push2 {
+            first: 0,
+            second: 32,
+        },
+        WindOp::PushConsecutive2 { register: 31 },
+        WindOp::SaveNonvol {
+            register: 32,
+            displacement: 0,
+        },
+        WindOp::SaveNonvolFar {
+            register: 32,
+            displacement: 0,
+        },
+        WindOp::SaveXmm128 {
+            register: 16,
+            displacement: 0,
+        },
+        WindOp::SaveXmm128Far {
+            register: 16,
+            displacement: 0,
+        },
+    ] {
+        let mut out = vec![0xaa];
+        assert!(op.encode(&mut out).is_err(), "{op:?}");
+        assert_eq!(out, [0xaa], "{op:?}");
     }
 }
 
@@ -261,8 +306,12 @@ fn an_inherited_epilog_resolves_to_its_source() {
 #[test]
 fn a_large_record_round_trips() {
     let mut pool = Vec::new();
-    WindOp::AllocLarge { size: 0x40 }.encode(&mut pool);
-    WindOp::Push { register: 5 }.encode(&mut pool);
+    WindOp::AllocLarge { size: 0x40 }
+        .encode(&mut pool)
+        .expect("the size fits");
+    WindOp::Push { register: 5 }
+        .encode(&mut pool)
+        .expect("rbp is a register");
     let info = UnwindInfoV3 {
         flags: UNW_FLAG_LARGE,
         size_of_prolog: 0x0123,

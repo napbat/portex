@@ -283,45 +283,67 @@ impl WindOp {
 
     /// Append the encoded WOD to `out`.
     ///
-    /// Each field has a range: see the field documentation. `encode` keeps only the bits of
-    /// a field that the encoding has room for. Thus give each field a value in its range.
-    pub fn encode(self, out: &mut Vec<u8>) {
+    /// Each field has a range: see the field documentation.
+    ///
+    /// # Errors
+    /// Returns an error if a field is outside its range. Then `out` does not change.
+    pub fn encode(self, out: &mut Vec<u8>) -> Result<()> {
         match self {
             Self::SetFrameRegister { register, offset } => {
-                push_byte_operand(out, OP_SET_FPREG, (register & 0x0F) | (offset << 4));
+                let operand = field(register, 15, "frame register")?
+                    | (field(offset, 15, "frame offset")? << 4);
+                push_byte_operand(out, OP_SET_FPREG, operand);
             }
-            Self::AllocSmall { size } => out.push(OP_ALLOC_SMALL | (size << 4)),
+            Self::AllocSmall { size } => {
+                out.push(OP_ALLOC_SMALL | (field(size, 15, "small allocation size")? << 4));
+            }
             Self::AllocLarge { size } => push_word_operand(out, OP_ALLOC_LARGE, size),
             Self::AllocHuge { size } => push_dword_operand(out, OP_ALLOC_HUGE, size),
             Self::PushCanonicalFrame { kind } => {
                 push_byte_operand(out, OP_PUSH_CANONICAL_FRAME, kind);
             }
-            Self::Push { register } => out.push(OP_PUSH | (register << 3)),
-            Self::Push2 { first, second } => push_byte_operand(
-                out,
-                OP_PUSH2 | (first << 6),
-                ((first >> 2) & 0x07) | (second << 3),
-            ),
+            Self::Push { register } => {
+                out.push(OP_PUSH | (field(register, 31, "pushed register")? << 3));
+            }
+            Self::Push2 { first, second } => {
+                let first = field(first, 31, "first PUSH2 register")?;
+                let second = field(second, 31, "second PUSH2 register")?;
+                push_byte_operand(out, OP_PUSH2 | (first << 6), (first >> 2) | (second << 3));
+            }
             Self::PushConsecutive2 { register } => {
+                let register = field(register, 30, "first consecutive register")?;
                 out.push(OP_PUSH_CONSECUTIVE_2 | (register << 3));
             }
             Self::SaveNonvol {
                 register,
                 displacement,
-            } => push_word_operand(out, OP_SAVE_NONVOL | (register << 3), displacement),
+            } => {
+                let opcode = OP_SAVE_NONVOL | (field(register, 31, "saved register")? << 3);
+                push_word_operand(out, opcode, displacement);
+            }
             Self::SaveNonvolFar {
                 register,
                 displacement,
-            } => push_dword_operand(out, OP_SAVE_NONVOL_FAR | (register << 3), displacement),
+            } => {
+                let opcode = OP_SAVE_NONVOL_FAR | (field(register, 31, "saved register")? << 3);
+                push_dword_operand(out, opcode, displacement);
+            }
             Self::SaveXmm128 {
                 register,
                 displacement,
-            } => push_word_operand(out, OP_SAVE_XMM128 | (register << 4), displacement),
+            } => {
+                let opcode = OP_SAVE_XMM128 | (field(register, 15, "saved XMM register")? << 4);
+                push_word_operand(out, opcode, displacement);
+            }
             Self::SaveXmm128Far {
                 register,
                 displacement,
-            } => push_dword_operand(out, OP_SAVE_XMM128_FAR | (register << 4), displacement),
+            } => {
+                let opcode = OP_SAVE_XMM128_FAR | (field(register, 15, "saved XMM register")? << 4);
+                push_dword_operand(out, opcode, displacement);
+            }
         }
+        Ok(())
     }
 
     /// Return the count of bytes by which the operation lowers RSP.
@@ -372,6 +394,20 @@ fn dword_operand(bytes: &[u8]) -> Result<u32> {
         .first_chunk::<N>()
         .ok_or_else(|| Error::buffer_too_small(N, bytes.len()))?;
     Ok(le_u32::<N, { offset_of!(WodDwordOperand, operand) }>(raw))
+}
+
+/// Return `value` if it is at most `max`.
+///
+/// # Errors
+/// Returns an error that names the field `name` if `value` is above `max`.
+fn field(value: u8, max: u8, name: &str) -> Result<u8> {
+    if value <= max {
+        Ok(value)
+    } else {
+        Err(Error::invalid_data_directory(format!(
+            "the x64 WOD {name} {value} is above {max}"
+        )))
+    }
 }
 
 /// Append a WOD with a byte operand to `out`.
