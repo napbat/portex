@@ -15,7 +15,11 @@ a different source offset.
   checksums.
 - Imports, delay imports, bound imports, and exports (also sparse and aliased exports).
 - Resources, base relocations, TLS, debug records, and the load configuration.
-- Exception tables for x64, ARM and ARM64.
+- Exception tables for x64, ARM and ARM64. An empty x64 entry (begin address equal to end
+  address) is valid, because Windows never selects it.
+- x64 unwind information of versions 1, 2 and 3, through `X64UnwindInfo`. Version 3 is the
+  format of the Microsoft "x64 Unwind Information V3" specification. `UnwindInfoV3` decodes
+  its winding operation descriptors (`WindOp`) and resolves its epilogs.
 - Raw views for patch tools: import, export, relocation, exception, resource and load
   configuration records with the buffer offset of each field, and strict header reads.
 - A load configuration with every field of the Windows SDK 10.0.26100 layout. Its declared
@@ -25,7 +29,8 @@ a different source offset.
   records, base relocation blocks, and function override records. Portex reads the structure
   only. It does not give a meaning to the entry bits.
 - Serialization of x64 unwind data with borrowed handler data for a different language, through
-  `UnwindInfo::try_to_bytes_with_handler_data`.
+  `UnwindInfo::try_to_bytes_with_handler_data` and
+  `UnwindInfoV3::try_to_bytes_with_handler_data`.
 - Rich headers, the CLR/CLI header of the PE image, and the raw metadata blob.
 - Lossless round trips of raw files through `PeFile`. When the layout does not change, `PeFile`
   keeps noncanonical gaps, certificate bytes and overlays.

@@ -16,13 +16,17 @@
 //! - A field at an offset from `PeHeaders::header_offsets` has a value that is different from
 //!   the parsed headers.
 //! - `PeHeaders::data_directory` is different from the data directory array.
+//! - A record from `X64UnwindInfo::parse` does not serialize, or its bytes parse to a
+//!   different record.
+//! - The prolog WODs of a version 3 unwind record do not decode, or a resolved epilog is not
+//!   in its fragment.
 
 #![no_main]
 
 use std::fmt::Debug;
 
 use libfuzzer_sys::fuzz_target;
-use portex::exception::UNW_FLAG_CHAININFO;
+use portex::exception::{UNW_FLAG_CHAININFO, X64UnwindInfo};
 use portex::raw::{
     HeaderOffsets, ImportTableEnd, RawAddressTable, RawCursor, RawExportDirectory, RawImportByName,
     RawImportDescriptor, RawImportDescriptors, RawLoadConfigDirectory, RawRelocationBlock,
@@ -350,6 +354,45 @@ fn read_u64(data: &[u8], offset: usize) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.try_into().ok()?))
 }
 
+/// Parse the x64 unwind information at `offset` with `X64UnwindInfo::parse`.
+///
+/// `fragment_len` is the size of the function that the record describes. Make sure that a
+/// parsed record serializes, and that the bytes parse to the same record. For a version 3
+/// record, make sure that the prolog WODs decode, and that each resolved epilog is in the
+/// fragment.
+fn check_x64_unwind_info(data: &[u8], offset: usize, fragment_len: u32) {
+    let Some(bytes) = data.get(offset..) else {
+        return;
+    };
+    let Ok(info) = X64UnwindInfo::parse(bytes) else {
+        return;
+    };
+    let serialized = info
+        .try_to_bytes()
+        .expect("a parsed unwind record does not serialize");
+    assert_eq!(
+        X64UnwindInfo::parse(&serialized).as_ref().ok(),
+        Some(&info),
+        "the serialized unwind record parses to a different record"
+    );
+    let X64UnwindInfo::V3(v3) = &info else {
+        return;
+    };
+    let prolog = v3
+        .prolog_ops()
+        .expect("the prolog WODs of a parsed record do not decode");
+    assert_eq!(prolog.len(), v3.prolog_ip_offsets.len());
+    if let Ok(epilogs) = v3.resolved_epilogs(fragment_len) {
+        assert_eq!(epilogs.len(), v3.epilogs.len());
+        for epilog in epilogs {
+            assert!(
+                epilog.start <= epilog.last_instruction && epilog.last_instruction < fragment_len,
+                "a resolved epilog is not in the fragment"
+            );
+        }
+    }
+}
+
 /// The state that the table readers share.
 struct Reader<'a> {
     /// The buffer.
@@ -428,7 +471,7 @@ impl Reader<'_> {
         let (offset, size) = (self.control.offset(len), self.control.size(len));
         self.runtime_functions(offset, size);
         let offset = self.control.offset(len);
-        self.unwind_chain(offset);
+        self.unwind_chain(offset, u32::try_from(len).unwrap_or(u32::MAX));
         let (offset, is_64bit) = (self.control.offset(len), self.control.flag());
         self.load_config(offset, is_64bit);
         let offset = self.control.offset(len);
@@ -655,16 +698,20 @@ impl Reader<'_> {
                 .mapper
                 .offset(u64::from(function.unwind_info_address.value))
             {
-                self.unwind_chain(unwind);
+                self.unwind_chain(unwind, values.size());
             }
         }
     }
 
     /// Read the `UNWIND_INFO` at `offset`, and follow its chained functions.
-    fn unwind_chain(&self, offset: usize) {
+    ///
+    /// `fragment_len` is the size of the function that the first record describes.
+    fn unwind_chain(&self, offset: usize, fragment_len: u32) {
         let data = self.data;
         let mut offset = offset;
+        let mut fragment_len = fragment_len;
         for _ in 0..MAX_UNWIND_CHAIN {
+            check_x64_unwind_info(data, offset, fragment_len);
             let Ok(info) = RawUnwindInfo::parse(data, offset) else {
                 return;
             };
@@ -696,6 +743,7 @@ impl Reader<'_> {
                 return;
             };
             offset = next;
+            fragment_len = chained.function().size();
         }
     }
 

@@ -9,6 +9,12 @@ use crate::parse_utils::{le_u8, put_u8};
 use crate::prelude::*;
 use crate::{Error, Result};
 
+mod v3;
+
+pub use v3::{
+    EpilogOpsV3, EpilogV3, ResolvedEpilogV3, UNW_FLAG_LARGE, UnwindInfoV3, WindOp, X64UnwindInfo,
+};
+
 /// The layout of the 4-byte header of the x64 `UNWIND_INFO`.
 ///
 /// `winnt.h` does not define the structure. The Microsoft x64 exception-handling
@@ -156,11 +162,14 @@ pub const UNW_FLAG_CHAININFO: u8 = 4;
 /// Size of the exception-handler RVA that follows the unwind codes.
 const HANDLER_RVA_SIZE: usize = size_of::<u32>();
 
-/// An x64 unwind information record (`UNWIND_INFO`).
+/// An x64 unwind information record (`UNWIND_INFO`) of version 1 or version 2.
 ///
 /// The record has no separate field for `CountOfCodes`: the serializer writes the length of
 /// `unwind_codes`. The record has no separate field for the chained `RUNTIME_FUNCTION`
 /// either: `chained_function` holds it.
+///
+/// [`UnwindInfoV3`] holds a version 3 record. [`X64UnwindInfo`] holds a record of any of these
+/// versions.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UnwindInfo {
     /// Version (3 bits) and flags (5 bits).
@@ -272,39 +281,15 @@ impl UnwindInfo {
             .collect();
 
         // The handler or chain data starts after the padded unwind codes.
-        let trailer_offset = unwind_codes_end(count_of_codes);
-        let trailer = data.get(trailer_offset..).unwrap_or_default();
-        let flags = version_flags >> 3;
-
-        let mut exception_handler = None;
-        let mut chained_function = None;
-        let mut handler_data = Vec::new();
-
-        if (flags & UNW_FLAG_CHAININFO) != 0 {
-            if trailer.len() < RuntimeFunction::SIZE {
-                return Err(Error::buffer_too_small(
-                    trailer_offset + RuntimeFunction::SIZE,
-                    data.len(),
-                ));
-            }
-            chained_function = Some(RuntimeFunction::parse(trailer)?);
-        } else if (flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER)) != 0 {
-            let mut language_data = trailer;
-            let handler = language_data.read_u32_le().map_err(|_| {
-                Error::buffer_too_small(trailer_offset + HANDLER_RVA_SIZE, data.len())
-            })?;
-            exception_handler = Some(handler);
-            handler_data.extend_from_slice(language_data);
-        }
-
+        let trailer = parse_trailer(data, unwind_codes_end(count_of_codes), version_flags >> 3)?;
         let info = Self {
             version_flags,
             size_of_prolog,
             frame_reg_and_offset,
             unwind_codes,
-            exception_handler,
-            chained_function,
-            handler_data,
+            exception_handler: trailer.exception_handler,
+            chained_function: trailer.chained_function,
+            handler_data: trailer.handler_data,
         };
         info.validate()?;
         Ok(info)
@@ -345,26 +330,13 @@ impl UnwindInfo {
         const N: usize = UnwindInfo::MIN_SIZE;
         const SLOT: usize = size_of::<UnwindCodeSlot>();
         self.validate()?;
-        if !handler_data.is_empty() && self.exception_handler.is_none() {
-            return Err(Error::invalid_data_directory(
-                "borrowed exception-handler data present without a handler",
-            ));
-        }
+        let trailer_size =
+            trailer_size(self.exception_handler, self.chained_function, handler_data)?;
         let count_of_codes = u8::try_from(self.unwind_codes.len())
             .map_err(|_| Error::invalid_data_directory("more than 255 unwind-code slots"))?;
         let codes_end = unwind_codes_end(count_of_codes);
-        let chained_size = self.chained_function.map_or(0, |_| RuntimeFunction::SIZE);
-        let handler_size = self
-            .exception_handler
-            .map(|_| {
-                HANDLER_RVA_SIZE
-                    .checked_add(handler_data.len())
-                    .ok_or_else(|| Error::invalid_data_directory("unwind handler size overflow"))
-            })
-            .transpose()?
-            .unwrap_or(0);
         let total_size = codes_end
-            .checked_add(chained_size.max(handler_size))
+            .checked_add(trailer_size)
             .ok_or_else(|| Error::invalid_data_directory("unwind-info size overflow"))?;
 
         let mut buf = Vec::with_capacity(total_size);
@@ -398,13 +370,12 @@ impl UnwindInfo {
         // Pad the unwind-code array to a multiple of 4 bytes.
         buf.resize(codes_end, 0);
 
-        if let Some(chained) = self.chained_function {
-            buf.extend_from_slice(&chained.to_bytes());
-        } else if let Some(handler) = self.exception_handler {
-            buf.write_u32_le(handler)?;
-            buf.extend_from_slice(handler_data);
-        }
-
+        write_trailer(
+            &mut buf,
+            self.exception_handler,
+            self.chained_function,
+            handler_data,
+        )?;
         Ok(buf)
     }
 
@@ -422,38 +393,12 @@ impl UnwindInfo {
                 "more than 255 unwind-code slots",
             ));
         }
-
-        let chained = self.is_chained();
-        let handled = self.has_exception_handler();
-        if chained {
-            if self.chained_function.is_none() {
-                return Err(Error::invalid_data_directory(
-                    "UNW_FLAG_CHAININFO requires a complete RUNTIME_FUNCTION record",
-                ));
-            }
-            if self.exception_handler.is_some() || !self.handler_data.is_empty() {
-                return Err(Error::invalid_data_directory(
-                    "chained unwind info cannot contain exception-handler data",
-                ));
-            }
-        } else if self.chained_function.is_some() {
-            return Err(Error::invalid_data_directory(
-                "chained runtime function present without UNW_FLAG_CHAININFO",
-            ));
-        }
-
-        if handled {
-            if self.exception_handler.is_none() {
-                return Err(Error::invalid_data_directory(
-                    "unwind handler flag requires an exception-handler RVA",
-                ));
-            }
-        } else if self.exception_handler.is_some() || !self.handler_data.is_empty() {
-            return Err(Error::invalid_data_directory(
-                "exception-handler data present without a handler flag",
-            ));
-        }
-        Ok(())
+        validate_trailer(
+            self.flags(),
+            self.exception_handler,
+            self.chained_function,
+            &self.handler_data,
+        )
     }
 
     fn validate_header(version_flags: u8) -> Result<()> {
@@ -470,13 +415,142 @@ impl UnwindInfo {
                 "unsupported x64 unwind flags {flags:#x}"
             )));
         }
-        if flags & UNW_FLAG_CHAININFO != 0 && flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER) != 0 {
-            return Err(Error::invalid_data_directory(
-                "UNW_FLAG_CHAININFO cannot be combined with handler flags",
+        validate_handler_flags(flags)
+    }
+}
+
+/// The handler or the chained `RUNTIME_FUNCTION` that follows the unwind operations.
+struct Trailer {
+    exception_handler: Option<u32>,
+    chained_function: Option<RuntimeFunction>,
+    handler_data: Vec<u8>,
+}
+
+/// Read the handler or the chained `RUNTIME_FUNCTION` at `trailer_offset` of `data`.
+///
+/// `flags` are the 5 flag bits of the header. The handler data gets all bytes of `data` after
+/// the handler RVA.
+fn parse_trailer(data: &[u8], trailer_offset: usize, flags: u8) -> Result<Trailer> {
+    let trailer = data.get(trailer_offset..).unwrap_or_default();
+    let mut parsed = Trailer {
+        exception_handler: None,
+        chained_function: None,
+        handler_data: Vec::new(),
+    };
+    if (flags & UNW_FLAG_CHAININFO) != 0 {
+        if trailer.len() < RuntimeFunction::SIZE {
+            return Err(Error::buffer_too_small(
+                trailer_offset + RuntimeFunction::SIZE,
+                data.len(),
             ));
         }
-        Ok(())
+        parsed.chained_function = Some(RuntimeFunction::parse(trailer)?);
+    } else if (flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER)) != 0 {
+        let mut language_data = trailer;
+        let handler = language_data
+            .read_u32_le()
+            .map_err(|_| Error::buffer_too_small(trailer_offset + HANDLER_RVA_SIZE, data.len()))?;
+        parsed.exception_handler = Some(handler);
+        parsed.handler_data.extend_from_slice(language_data);
     }
+    Ok(parsed)
+}
+
+/// Return the size of the trailer that [`write_trailer`] writes.
+///
+/// # Errors
+/// Returns an error in these conditions:
+/// - `handler_data` is nonempty and the record has no handler.
+/// - A size calculation overflows.
+fn trailer_size(
+    exception_handler: Option<u32>,
+    chained_function: Option<RuntimeFunction>,
+    handler_data: &[u8],
+) -> Result<usize> {
+    if !handler_data.is_empty() && exception_handler.is_none() {
+        return Err(Error::invalid_data_directory(
+            "borrowed exception-handler data present without a handler",
+        ));
+    }
+    let chained_size = chained_function.map_or(0, |_| RuntimeFunction::SIZE);
+    let handler_size = exception_handler
+        .map(|_| {
+            HANDLER_RVA_SIZE
+                .checked_add(handler_data.len())
+                .ok_or_else(|| Error::invalid_data_directory("unwind handler size overflow"))
+        })
+        .transpose()?
+        .unwrap_or(0);
+    Ok(chained_size.max(handler_size))
+}
+
+/// Write the chained `RUNTIME_FUNCTION`, or the handler RVA and `handler_data`.
+fn write_trailer(
+    buf: &mut Vec<u8>,
+    exception_handler: Option<u32>,
+    chained_function: Option<RuntimeFunction>,
+    handler_data: &[u8],
+) -> Result<()> {
+    if let Some(chained) = chained_function {
+        buf.extend_from_slice(&chained.to_bytes());
+    } else if let Some(handler) = exception_handler {
+        buf.write_u32_le(handler)?;
+        buf.extend_from_slice(handler_data);
+    }
+    Ok(())
+}
+
+/// Check that the handler or chain data agrees with the 5 flag bits `flags`.
+///
+/// # Errors
+/// Returns an error if the handler or chain data does not agree with the flags.
+fn validate_trailer(
+    flags: u8,
+    exception_handler: Option<u32>,
+    chained_function: Option<RuntimeFunction>,
+    handler_data: &[u8],
+) -> Result<()> {
+    let chained = (flags & UNW_FLAG_CHAININFO) != 0;
+    let handled = (flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER)) != 0;
+    if chained {
+        if chained_function.is_none() {
+            return Err(Error::invalid_data_directory(
+                "UNW_FLAG_CHAININFO requires a complete RUNTIME_FUNCTION record",
+            ));
+        }
+        if exception_handler.is_some() || !handler_data.is_empty() {
+            return Err(Error::invalid_data_directory(
+                "chained unwind info cannot contain exception-handler data",
+            ));
+        }
+    } else if chained_function.is_some() {
+        return Err(Error::invalid_data_directory(
+            "chained runtime function present without UNW_FLAG_CHAININFO",
+        ));
+    }
+
+    if handled {
+        if exception_handler.is_none() {
+            return Err(Error::invalid_data_directory(
+                "unwind handler flag requires an exception-handler RVA",
+            ));
+        }
+    } else if exception_handler.is_some() || !handler_data.is_empty() {
+        return Err(Error::invalid_data_directory(
+            "exception-handler data present without a handler flag",
+        ));
+    }
+    Ok(())
+}
+
+/// Check that the 5 flag bits `flags` do not combine `UNW_FLAG_CHAININFO` with a handler flag.
+fn validate_handler_flags(flags: u8) -> Result<()> {
+    if flags & UNW_FLAG_CHAININFO != 0 && flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER) != 0 {
+        return Err(Error::invalid_data_directory(
+            "UNW_FLAG_CHAININFO cannot be combined with handler flags",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

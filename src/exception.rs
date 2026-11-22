@@ -13,8 +13,9 @@ pub use arm::{PackedExceptionDirectory, PackedRuntimeFunction};
 pub use builder::ExceptionBuilder;
 pub use table::ExceptionTable;
 pub use unwind::{
-    UNW_FLAG_CHAININFO, UNW_FLAG_EHANDLER, UNW_FLAG_NHANDLER, UNW_FLAG_UHANDLER, UnwindCode,
-    UnwindInfo, UnwindOpCode,
+    EpilogOpsV3, EpilogV3, ResolvedEpilogV3, UNW_FLAG_CHAININFO, UNW_FLAG_EHANDLER, UNW_FLAG_LARGE,
+    UNW_FLAG_NHANDLER, UNW_FLAG_UHANDLER, UnwindCode, UnwindInfo, UnwindInfoV3, UnwindOpCode,
+    WindOp, X64UnwindInfo,
 };
 pub(crate) use unwind::{UnwindInfoHeader, unwind_codes_end};
 pub(crate) use x64::ImageRuntimeFunctionEntry;

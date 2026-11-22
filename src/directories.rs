@@ -17,8 +17,9 @@ pub use crate::dynamic_reloc::{
     FunctionOverrideHeader, FunctionOverrides,
 };
 pub use crate::exception::{
-    ExceptionBuilder, ExceptionDirectory, ExceptionTable, PackedExceptionDirectory,
-    PackedRuntimeFunction, RuntimeFunction, UnwindCode, UnwindInfo, UnwindOpCode,
+    EpilogOpsV3, EpilogV3, ExceptionBuilder, ExceptionDirectory, ExceptionTable,
+    PackedExceptionDirectory, PackedRuntimeFunction, ResolvedEpilogV3, RuntimeFunction,
+    UNW_FLAG_LARGE, UnwindCode, UnwindInfo, UnwindInfoV3, UnwindOpCode, WindOp, X64UnwindInfo,
 };
 pub use crate::export::{
     ExportAddress, ExportDirectory, ExportTable, ExportTableBuilder, ExportedFunction,
