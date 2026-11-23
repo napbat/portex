@@ -382,3 +382,20 @@ fn image_size_covers_headers_without_sections() {
     let mapped = PeImage::parse_mapped(&image.to_mapped_image().unwrap()).unwrap();
     assert_eq!(mapped.dos_header.e_lfanew, 0x1200);
 }
+
+#[test]
+fn held_header_len_reads_when_size_of_headers_far_exceeds_the_header_data() {
+    let mut image = test_image();
+    let size = 4 << 20;
+    match &mut image.optional_header {
+        OptionalHeader::Pe32(h) => h.size_of_headers = size,
+        OptionalHeader::Pe32Plus(h) => h.size_of_headers = size,
+    }
+    let held = image.held_header_len();
+    assert!(held > 0);
+    assert!(held < 0x1000, "held header length {held:#x}");
+    assert!(image.read_rva(0, size as usize).is_none());
+    let bytes = image.read_rva(0, held).expect("the held header bytes read");
+    assert_eq!(bytes.len(), held);
+    assert_eq!(&bytes[..2], b"MZ");
+}

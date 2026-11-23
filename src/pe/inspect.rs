@@ -100,17 +100,30 @@ impl PeImage {
         )
     }
 
+    /// Return the number of header bytes that the image holds.
+    ///
+    /// The header data ends at the end of the NT headers or at the header tail after them. The
+    /// value is 0 if the image cannot find the end of the NT headers.
+    ///
+    /// `SizeOfHeaders` can be much larger than this length. A [`Self::read_rva`] call at RVA 0
+    /// for `n` bytes, with `n` at most this length, adds no zeros after the held header data.
+    /// Use this length to read all the header bytes of an image with a large `SizeOfHeaders`.
+    #[must_use]
+    pub fn held_header_len(&self) -> usize {
+        self.nt_headers_end()
+            .and_then(|end| self.header_data_end(end))
+            .unwrap_or(0)
+    }
+
     /// Return the number of bytes that the image holds: the header data and the section data.
     ///
-    /// The header data ends at the end of the NT headers or at the header tail after them.
+    /// [`Self::held_header_len`] gives the length of the header data.
     fn held_len(&self) -> usize {
-        let headers = self
-            .nt_headers_end()
-            .and_then(|end| self.header_data_end(end))
-            .unwrap_or(0);
-        self.sections.iter().fold(headers, |total, section| {
-            total.saturating_add(section.data.len())
-        })
+        self.sections
+            .iter()
+            .fold(self.held_header_len(), |total, section| {
+                total.saturating_add(section.data.len())
+            })
     }
 
     /// Check if an RVA range is in the headers or in the sections, without allocating or copying
